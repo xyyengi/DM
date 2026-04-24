@@ -1,6 +1,21 @@
 # CSDI
 This is the github repository for the NeurIPS 2021 paper "[CSDI: Conditional Score-based Diffusion Models for Probabilistic Time Series Imputation](https://arxiv.org/abs/2107.03502)".
 
+## 重要说明
+
+当前代码用于复现论文 `2023-Conditional_Diffusion_Model.pdf`（风电场景生成）。
+
+**条件c构建方式的差异：**
+
+| 论文要求 | 当前代码实现 |
+|---------|-------------|
+| c = [c_down, c_up] 基于预测误差分布的区间 | c = time_embed + feature_embed + cond_mask |
+| c_up = min(1, f + K_h(f)) | 时间嵌入 + 特征嵌入 + 条件掩码 |
+| c_down = max(0, f - K_h(f)) | CSDI NeurIPS 2021的填补任务实现 |
+
+如需正确复现论文，需要修改 `main_model.py` 中的 `get_side_info` 方法，按照论文公式9构建条件c。
+
+
 ## Requirement
 
 Please install the packages in requirements.txt

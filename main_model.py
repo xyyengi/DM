@@ -3,6 +3,22 @@ import torch
 import torch.nn as nn
 from diff_models import diff_CSDI
 
+# ============================================================================
+# 重要说明：当前代码的条件c构建方式与论文"2023-Conditional_Diffusion_Model.pdf"不同
+# 
+# 论文中的条件c构成（公式9）：
+#   c = [c_down, c_up] 是基于预测误差分布计算的区间
+#   c_up = min(1, f + K_h(f))  上界
+#   c_down = max(0, f - K_h(f))  下界
+#   其中 f 是预测值，K_h(f) 是核密度估计的预测误差期望分布
+#
+# 当前代码的条件c构成（get_side_info方法）：
+#   c = time_embed + feature_embed + cond_mask
+#   这是CSDI NeurIPS 2021论文的实现方式，用于时间序列填补任务
+#
+# 如需复现论文，需要修改条件c的构建方式
+# ============================================================================
+
 
 class CSDI_base(nn.Module):
     def __init__(self, target_dim, config, device):
