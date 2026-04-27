@@ -1,0 +1,50 @@
+# ============================================================================
+# 多变量协同条件扩散模型配置文件
+# 
+# 论文"2023-Conditional_Diffusion_Model.pdf"复现
+# 
+# 数据结构：
+# - 张量: (Batch, Channels=3, Length=168)
+# - 通道: 0=风电, 1=光伏, 2=负荷
+# ============================================================================
+
+# 训练配置
+train:
+  epochs: 200
+  batch_size: 16
+  lr: 1.0e-3
+
+# 模型配置
+model:
+  # 时间特征嵌入维度
+  d_time: 64
+  
+  # Res-UNet基础通道数
+  base_channels: 64
+  
+  # Res-UNet层数
+  num_layers: 4
+  
+  # 扩散步数
+  num_steps: 50
+  
+  # Beta schedule
+  beta_start: 0.0001
+  beta_end: 0.5
+  schedule: "quad"
+  
+  # 条件引导强度 (公式10中的γ)
+  guidance_scale: 1.0
+  
+  # KDE区间数量 (公式7中的区间划分)
+  n_intervals: 10
+
+# 数据配置
+data:
+  seq_length: 168  # 7天 * 24小时
+  n_channels: 3    # 风、光、负荷
+  
+# 评估配置
+evaluation:
+  n_samples: 10    # 每个条件生成的场景数量
+  quantiles: [0.8, 1.0]  # 评估的分位数区间

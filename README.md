@@ -1,11 +1,68 @@
 # CSDI
 This is the github repository for the NeurIPS 2021 paper "[CSDI: Conditional Score-based Diffusion Models for Probabilistic Time Series Imputation](https://arxiv.org/abs/2107.03502)".
 
-## 重要说明
+## 项目结构
+
+本项目包含两个主要模块：
+
+1. **原始CSDI模块** - 用于时间序列填补任务（PM25, Physio, Forecasting）
+2. **多变量协同条件扩散模块** - 用于风电场景生成（论文复现）
+
+---
+
+## 多变量协同条件扩散模型 (Multi-Channel CDM)
+
+### 论文复现说明
 
 当前代码用于复现论文 `2023-Conditional_Diffusion_Model.pdf`（风电场景生成）。
 
-**条件c构建方式的差异：**
+**核心改进：将单变量条件扩展为风、光、负荷三通道协同条件**
+
+### 论文公式对应
+
+| 公式 | 内容 | 代码实现位置 |
+|------|------|-------------|
+| 公式7 | 区间划分与条件概率 P(e|f) | `dataset_multivariate.py` - `MultiChannelKDE.fit()` |
+| 公式8 | 核密度估计 K_h(x) | `dataset_multivariate.py` - `MultiChannelKDE.get_conditional_interval()` |
+| 公式9 | 条件区间构造 c = [c_down, c_up] | `dataset_multivariate.py` - `MultiChannelKDE.get_conditional_interval()` |
+| 公式10 | 反向去噪梯度引导 ∇_{x_t} ||γ·x_t - c||²_F | `diff_models_multivariate.py` - `GaussianDiffusionMultivariate.compute_conditional_gradient()` |
+
+### 数据结构
+
+- **张量结构**: `(Batch, Channels=3, Length=168)`
+- **通道映射**: Channel 0=风电, 1=光伏, 2=负荷
+- **残差计算**: `Residual = Forecast (FEDformer) - Actual`
+
+### 模型架构
+
+1. **Res-UNet + 空洞卷积**: Bottleneck层使用空洞率[1,2,4,8]，感受野覆盖168点
+2. **时间特征注入**: 小时、周几、月份三个尺度的Embedding
+3. **多通道条件引导**: Frobenius范数梯度修正
+
+### 使用方法
+
+```bash
+# 训练模型并生成场景
+python exe_wind_scenario.py --config config/wind_scenario.yaml --data_path ./wind_solar_load_168_FEDformer/ --mode train --n_samples 10
+
+# 使用预训练模型生成场景
+python exe_wind_scenario.py --config config/wind_scenario.yaml --mode test --n_samples 10
+```
+
+### 文件说明
+
+| 文件 | 功能 |
+|------|------|
+| `dataset_multivariate.py` | 多通道数据集、KDE条件构造 |
+| `diff_models_multivariate.py` | Res-UNet、扩散模型、条件梯度引导 |
+| `exe_wind_scenario.py` | 训练、生成、评估脚本 |
+| `config/wind_scenario.yaml` | 模型配置文件 |
+
+---
+
+## 原始CSDI模块
+
+### 条件c构建方式的差异
 
 | 论文要求 | 当前代码实现 |
 |---------|-------------|
