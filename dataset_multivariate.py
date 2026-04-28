@@ -133,15 +133,23 @@ class MultiChannelKDE:
 class MultiChannelWindScenarioDataset(Dataset):
     """
     多变量协同条件扩散模型数据集
-    张量结构: (Batch, Channels=3, Length=168)
+    张量结构: (Batch, Channels, Length=168)
+    
+    数据文件结构 (input_4.27):
+    - train_pred.npy: (18917, 168, 11) 训练集预测值
+    - train_res.npy: (18917, 168, 11) 训练集残差
+    - val_pred.npy: (2608, 168, 11) 验证集预测值
+    - val_res.npy: (2608, 168, 11) 验证集残差
+    - test_pred.npy: (5381, 168, 11) 测试集预测值
+    - test_res.npy: (5381, 168, 11) 测试集残差
     """
     
-    def __init__(self, data_path='./wind_solar_load_168_FEDformer/', 
-                 mode='train', seq_length=168, n_intervals=10):
+    def __init__(self, data_path='./input_4.27/', 
+                 mode='train', seq_length=168, n_intervals=10, n_channels=11):
         self.data_path = data_path
         self.mode = mode
         self.seq_length = seq_length
-        self.n_channels = 3
+        self.n_channels = n_channels
         self.n_intervals = n_intervals
         
         self._load_data()
