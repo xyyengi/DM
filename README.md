@@ -29,9 +29,23 @@ This is the github repository for the NeurIPS 2021 paper "[CSDI: Conditional Sco
 
 ### 数据结构
 
-- **张量结构**: `(Batch, Channels=3, Length=168)`
-- **通道映射**: Channel 0=风电, 1=光伏, 2=负荷
-- **残差计算**: `Residual = Forecast (FEDformer) - Actual`
+**数据文件结构 (input_4.27):**
+
+| 文件 | 形状 | 说明 |
+|------|------|------|
+| train_pred.npy | (18917, 168, 11) | 训练集预测值 |
+| train_res.npy | (18917, 168, 11) | 训练集残差 |
+| val_pred.npy | (2608, 168, 11) | 验证集预测值 |
+| val_res.npy | (2608, 168, 11) | 验证集残差 |
+| test_pred.npy | (5381, 168, 11) | 测试集预测值 |
+| test_res.npy | (5381, 168, 11) | 测试集残差 |
+
+**11维特征定义:**
+- Channel [0:3]: 风、光、负荷残差 (Residuals) - 生成核心主体
+- Channel [3:11]: 8维时间周期编码 (Sin/Cos) - 环境背景条件
+
+**张量结构**: `(Batch, Channels=11, Length=168)`
+**残差计算**: `Residual = Forecast (FEDformer) - Actual`
 
 ### 模型架构
 
@@ -39,15 +53,73 @@ This is the github repository for the NeurIPS 2021 paper "[CSDI: Conditional Sco
 2. **时间特征注入**: 小时、周几、月份三个尺度的Embedding
 3. **多通道条件引导**: Frobenius范数梯度修正
 
+### 场景生成原理
+
+**整体流程：**
+```
+预测值(forecast) → KDE构建条件区间c → 扩散模型生成残差 → 最终场景 = forecast + 残差
+```
+
+**详细步骤：**
+
+1. **条件构建 (论文公式7-9)**
+   - 基于训练数据的预测值和残差，使用核密度估计(KDE)拟合误差分布
+   - 对于每个预测值f，构建条件区间 c = [c_down, c_up]
+   - c_up = min(1, f + K_h(f)), c_down = max(0, f - K_h(f))
+
+2. **扩散模型训练**
+   - 输入: residual_3ch (风、光、负荷残差, 3×168)
+   - 条件: cond_matrix (条件区间, 3×168×2)
+   - 目标: 学习从噪声到残差的去噪过程
+
+3. **场景生成 (论文公式10)**
+   - 从纯噪声开始，逐步去噪(50步)
+   - 每步去噪时，使用条件梯度引导:
+     ∇_{x_t} ||γ·x_t - c||²_F
+   - 生成多个残差场景(如10个)
+
+4. **最终场景**
+   - 生成的残差 + 预测值 = 最终风电/光伏/负荷场景
+
+**mode test 模型加载逻辑：**
+- 模型保存路径: `./save/wind_scenario/model_multivariate.pth`
+- 如果文件存在: 直接加载预训练模型
+- 如果文件不存在: 自动开始训练并保存
+
 ### 使用方法
 
+**环境激活:**
 ```bash
-# 训练模型并生成场景
-python exe_wind_scenario.py --config config/wind_scenario.yaml --data_path ./wind_solar_load_168_FEDformer/ --mode train --n_samples 10
-
-# 使用预训练模型生成场景
-python exe_wind_scenario.py --config config/wind_scenario.yaml --mode test --n_samples 10
+conda activate torch_env
 ```
+
+**训练模型:**
+```bash
+# 训练多变量协同条件扩散模型
+python exe_wind_scenario.py --config config/wind_scenario.yaml --data_path ./input_4.27/ --mode train --n_samples 10
+```
+
+**生成场景 (使用预训练模型):**
+```bash
+# 使用已训练的模型生成场景
+python exe_wind_scenario.py --config config/wind_scenario.yaml --data_path ./input_4.27/ --mode test --n_samples 10
+```
+
+**参数说明:**
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| --config | config/wind_scenario.yaml | 配置文件路径 |
+| --data_path | ./input_4.27/ | 数据目录路径 |
+| --save_path | ./save/wind_scenario/ | 模型保存路径 |
+| --mode | train | 运行模式: train(训练) 或 test(生成) |
+| --n_samples | 10 | 每个条件生成的场景数量 |
+
+**数据集分配:**
+| 数据集 | 样本数 | 用途 |
+|--------|--------|------|
+| 训练集 | 18,917 | 模型训练 + KDE拟合 |
+| 验证集 | 2,608 | 超参数调优 |
+| 测试集 | 5,381 | 场景生成与评估 |
 
 ### 文件说明
 

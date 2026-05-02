@@ -41,13 +41,16 @@ class MultiChannelKDE:
         """
         拟合多通道KDE模型
         
-        Args:
-            forecast_data: (N, L, 3) 预测值
-            residual_data: (N, L, 3) 残差值 (预测 - 真实)
-        """
-        n_channels = forecast_data.shape[2]
+        仅对前3个通道（风、光、负荷）进行KDE拟合
         
-        for c in range(n_channels):
+        Args:
+            forecast_data: (N, L, 11) 预测值
+            residual_data: (N, L, 11) 残差值 (预测 - 真实)
+        """
+        # 仅对前3个通道（风、光、负荷）进行KDE拟合
+        n_channels_kde = 3  # 风、光、负荷
+        
+        for c in range(n_channels_kde):
             channel_name = ['wind', 'solar', 'load'][c]
             
             # 获取该通道的数据
@@ -231,14 +234,16 @@ class MultiChannelWindScenarioDataset(Dataset):
         """
         返回单个样本
         
-        11维特征定义：
-        - Channel [0:3]: 风、光、负荷残差 (Residuals) - 生成核心主体
-        - Channel [3:11]: 8维时间周期编码 (Sin/Cos) - 环境背景条件
+        14通道输入结构：
+        - Channel [0:3]: Target Residuals (正在去噪的风、光、负荷残差 x_t)
+        - Channel [3:6]: Base Prediction (来自FEDformer的风、光、负荷预测趋势)
+        - Channel [6:14]: Time Encoding (8维时间周期特征)
         
         Returns:
-            forecast: (11, 168) 归一化预测值（完整11维）
-            residual: (11, 168) 归一化残差（完整11维）
-            residual_3ch: (3, 168) 仅风、光、负荷残差（用于扩散模型输出）
+            input_14ch: (14, 168) 14通道完整输入
+            residual_3ch: (3, 168) 仅风、光、负荷残差（扩散目标）
+            forecast_3ch: (3, 168) 预测趋势（用于条件）
+            time_encoding: (8, 168) 时间编码
             cond_matrix: (3, 168, 2) 条件矩阵 [c_down, c_up]（仅对前3维构建）
             timepoints: (168,) 时间点索引
         """
@@ -246,12 +251,16 @@ class MultiChannelWindScenarioDataset(Dataset):
         forecast = self.forecast_norm[index].transpose(1, 0)  # (168, 11) -> (11, 168)
         residual = self.residual_norm[index].transpose(1, 0)  # (168, 11) -> (11, 168)
         
-        # 提取前3维（风、光、负荷残差）用于扩散模型
-        residual_3ch = residual[:3, :]  # (3, 168)
-        forecast_3ch = forecast[:3, :]  # (3, 168)
+        # 提取各部分特征
+        residual_3ch = residual[:3, :]  # (3, 168) Target Residuals
+        forecast_3ch = forecast[:3, :]  # (3, 168) Base Prediction
+        time_encoding = forecast[3:11, :]  # (8, 168) Time Encoding
+        
+        # 构建14通道输入: [Target Residuals, Base Prediction, Time Encoding]
+        input_14ch = np.concatenate([residual_3ch, forecast_3ch, time_encoding], axis=0)  # (14, 168)
         
         # 论文公式9: 仅对前3维（风、光、负荷）构建条件矩阵
-        # KDE只针对残差通道构建条件区间
+        # KDE只针对Channel [0:3]（物理残差）进行概率密度建模
         cond_down = np.zeros((3, self.seq_length))
         cond_up = np.zeros((3, self.seq_length))
         
@@ -266,9 +275,10 @@ class MultiChannelWindScenarioDataset(Dataset):
         cond_matrix = np.stack([cond_down, cond_up], axis=-1)
         
         return {
-            'forecast': torch.FloatTensor(forecast),        # (11, 168) 完整输入
-            'residual': torch.FloatTensor(residual),        # (11, 168) 完整残差
+            'input_14ch': torch.FloatTensor(input_14ch),     # (14, 168) 14通道完整输入
             'residual_3ch': torch.FloatTensor(residual_3ch), # (3, 168) 扩散目标
+            'forecast_3ch': torch.FloatTensor(forecast_3ch), # (3, 168) 预测趋势
+            'time_encoding': torch.FloatTensor(time_encoding), # (8, 168) 时间编码
             'cond_matrix': torch.FloatTensor(cond_matrix),   # (3, 168, 2) 条件
             'timepoints': torch.FloatTensor(np.arange(self.seq_length)),
         }

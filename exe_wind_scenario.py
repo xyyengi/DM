@@ -20,6 +20,67 @@ from dataset_multivariate import MultiChannelWindScenarioDataset, get_dataloader
 from diff_models_multivariate import MultiChannelCSDI
 
 
+def get_next_version(save_path):
+    """
+    获取下一个模型版本编号
+    
+    Args:
+        save_path: 模型保存路径
+    Returns:
+        version: 版本编号 (从1开始)
+    """
+    os.makedirs(save_path, exist_ok=True)
+    
+    # 查找现有模型文件
+    existing_models = [f for f in os.listdir(save_path) if f.startswith('model_v') and f.endswith('.pth')]
+    
+    if not existing_models:
+        return 1
+    
+    # 提取版本号
+    versions = []
+    for f in existing_models:
+        try:
+            v = int(f.replace('model_v', '').replace('.pth', ''))
+            versions.append(v)
+        except:
+            pass
+    
+    return max(versions) + 1 if versions else 1
+
+
+def get_latest_model_path(save_path):
+    """
+    获取最新模型的路径
+    
+    Args:
+        save_path: 模型保存路径
+    Returns:
+        model_path: 最新模型路径，如果没有则返回None
+    """
+    if not os.path.exists(save_path):
+        return None
+    
+    existing_models = [f for f in os.listdir(save_path) if f.startswith('model_v') and f.endswith('.pth')]
+    
+    if not existing_models:
+        return None
+    
+    # 找到最大版本号
+    max_version = 0
+    for f in existing_models:
+        try:
+            v = int(f.replace('model_v', '').replace('.pth', ''))
+            if v > max_version:
+                max_version = v
+        except:
+            pass
+    
+    if max_version > 0:
+        return os.path.join(save_path, f'model_v{max_version}.pth')
+    return None
+
+
 def train(model, train_loader, config, device, save_path):
     """
     训练多通道CSDI模型
@@ -36,8 +97,11 @@ def train(model, train_loader, config, device, save_path):
     
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
+    # 获取版本编号
+    version = get_next_version(save_path)
+    
     print("=" * 60)
-    print("开始训练多变量协同条件扩散模型")
+    print(f"开始训练多变量协同条件扩散模型 (版本 v{version})")
     print("=" * 60)
     
     for epoch in range(epochs):
@@ -58,12 +122,17 @@ def train(model, train_loader, config, device, save_path):
         if (epoch + 1) % 10 == 0 or epoch == 0:
             print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
     
-    # 保存模型
+    # 保存模型（带版本编号）
     os.makedirs(save_path, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(save_path, 'model_multivariate.pth'))
-    print(f"模型已保存至: {save_path}")
+    model_path = os.path.join(save_path, f'model_v{version}.pth')
+    torch.save(model.state_dict(), model_path)
+    print(f"模型已保存至: {model_path}")
     
-    return model
+    # 同时保存一个latest链接
+    latest_path = os.path.join(save_path, 'model_latest.pth')
+    torch.save(model.state_dict(), latest_path)
+    
+    return model, version
 
 
 def generate_scenarios(model, test_loader, config, device, n_samples=10):
@@ -78,13 +147,13 @@ def generate_scenarios(model, test_loader, config, device, n_samples=10):
         n_samples: 每个条件生成的场景数量
     Returns:
         generated_samples: 生成的残差场景
-        forecast_data: 预测值
+        forecast_3ch: 预测值（风、光、负荷）
         actual_residual: 实际残差
     """
     model.eval()
     
     all_samples = []
-    all_forecast = []
+    all_forecast_3ch = []
     all_residual = []
     
     print("=" * 60)
@@ -97,17 +166,17 @@ def generate_scenarios(model, test_loader, config, device, n_samples=10):
             samples = model.generate(batch, n_samples=n_samples)
             
             all_samples.append(samples.cpu().numpy())
-            all_forecast.append(batch['forecast'].numpy())
-            all_residual.append(batch['residual'].numpy())
+            all_forecast_3ch.append(batch['forecast_3ch'].numpy())  # 使用forecast_3ch (3, 168)
+            all_residual.append(batch['residual_3ch'].numpy())  # 使用residual_3ch (3, 168)
     
     # 合并所有批次
     generated_samples = np.concatenate(all_samples, axis=0)  # (N_test, n_samples, 3, 168)
-    forecast_data = np.concatenate(all_forecast, axis=0)  # (N_test, 3, 168)
+    forecast_3ch = np.concatenate(all_forecast_3ch, axis=0)  # (N_test, 3, 168)
     actual_residual = np.concatenate(all_residual, axis=0)  # (N_test, 3, 168)
     
     print(f"生成完成: {generated_samples.shape}")
     
-    return generated_samples, forecast_data, actual_residual
+    return generated_samples, forecast_3ch, actual_residual
 
 
 def evaluate_scenarios(generated_samples, actual_residual, max_values):
@@ -265,16 +334,16 @@ def main(args):
     
     # 训练或加载预训练模型
     if args.mode == 'train':
-        model = train(model, train_loader, config, device, save_path)
+        model, version = train(model, train_loader, config, device, save_path)
     else:
-        # 加载预训练模型
-        model_path = os.path.join(save_path, 'model_multivariate.pth')
-        if os.path.exists(model_path):
+        # 加载预训练模型（优先加载最新版本）
+        model_path = get_latest_model_path(save_path)
+        if model_path:
             model.load_state_dict(torch.load(model_path, map_location=device))
             print(f"已加载预训练模型: {model_path}")
         else:
             print("未找到预训练模型，开始训练...")
-            model = train(model, train_loader, config, device, save_path)
+            model, version = train(model, train_loader, config, device, save_path)
     
     # 生成场景
     n_samples = args.n_samples
@@ -298,7 +367,7 @@ if __name__ == '__main__':
     
     parser.add_argument('--config', type=str, default='config/wind_scenario.yaml',
                         help='配置文件路径')
-    parser.add_argument('--data_path', type=str, default='./wind_solar_load_168_FEDformer/',
+    parser.add_argument('--data_path', type=str, default='./input_4.27/',
                         help='数据路径')
     parser.add_argument('--save_path', type=str, default='./save/wind_scenario/',
                         help='模型保存路径')

@@ -35,16 +35,21 @@ class TimeFeatureEmbedding(nn.Module):
         super().__init__()
         self.d_model = d_model
         
-        # 小时嵌入 (0-23)
-        self.hour_embed = nn.Embedding(24, d_model // 3)
+        # 计算每个嵌入维度，确保拼接后等于d_model
+        # 使用 d_model // 3 + 1 来弥补余数
+        embed_dim = d_model // 3
+        remainder = d_model - embed_dim * 3
+        
+        # 小时嵌入 (0-23) - 分配余数给第一个
+        self.hour_embed = nn.Embedding(24, embed_dim + remainder)
         
         # 周几嵌入 (0-6, 0=周一)
-        self.weekday_embed = nn.Embedding(7, d_model // 3)
+        self.weekday_embed = nn.Embedding(7, embed_dim)
         
         # 月份嵌入 (0-11)
-        self.month_embed = nn.Embedding(12, d_model // 3)
+        self.month_embed = nn.Embedding(12, embed_dim)
         
-        # 合并后的投影层
+        # 合并后的投影层（输入维度已经是d_model）
         self.proj = nn.Linear(d_model, d_model)
         
     def forward(self, hour, weekday, month):
@@ -219,85 +224,111 @@ class ResUNet(nn.Module):
     1. Encoder-Decoder结构
     2. Bottleneck使用空洞卷积
     3. 时间特征注入到每个ResBlock
-    4. 支持11维特征解耦输入
+    4. 支持14维特征解耦输入
     
-    输入维度定义 (11维张量)：
-    - Channel [0:3]: 风、光、负荷残差 (Residuals) - 生成核心主体
-    - Channel [3:11]: 8维时间周期编码 (Sin/Cos) - 环境背景条件
+    输入维度定义 (14维张量)：
+    - Channel [0:3]: Target Residuals (正在去噪的风、光、负荷残差 x_t)
+    - Channel [3:6]: Base Prediction (来自FEDformer的风、光、负荷预测趋势)
+    - Channel [6:14]: Time Encoding (8维时间周期特征)
     
     输出维度定义：
-    - Channel [0:3]: 风、光、负荷残差生成结果
+    - Channel [0:3]: 风、光、负荷残差噪声预测（只预测前3维）
     """
     
-    def __init__(self, in_channels=11, out_channels=3, d_time=64, 
-                 base_channels=128, num_layers=4):
+    def __init__(self, in_channels=14, out_channels=3, d_time=64, 
+                 base_channels=64, num_layers=3):
         super().__init__()
         
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.d_time = d_time
+        self.num_layers = num_layers
         
-        # Encoder
-        self.encoder_blocks = nn.ModuleList()
-        self.encoder_downsample = nn.ModuleList()
+        # Encoder - 简化为3层
+        # Layer 0: 14 → 64
+        # Layer 1: 64 → 128 (下采样)
+        # Layer 2: 128 → 256 (下采样)
         
-        channels = base_channels
-        for i in range(num_layers):
-            self.encoder_blocks.append(
-                ResidualBlock(in_channels if i == 0 else channels, 
-                             channels * 2 if i < num_layers - 1 else channels,
-                             d_time)
-            )
-            if i < num_layers - 1:
-                self.encoder_downsample.append(nn.Conv1d(channels * 2, channels * 2, 4, stride=2, padding=1))
-                channels *= 2
+        self.enc_conv0 = ResidualBlock(in_channels, base_channels, d_time)
+        self.enc_down1 = nn.Conv1d(base_channels, base_channels, 4, stride=2, padding=1)
+        self.enc_conv1 = ResidualBlock(base_channels, base_channels * 2, d_time)
+        self.enc_down2 = nn.Conv1d(base_channels * 2, base_channels * 2, 4, stride=2, padding=1)
+        self.enc_conv2 = ResidualBlock(base_channels * 2, base_channels * 4, d_time)
         
         # Bottleneck with Dilated Convolution
-        self.bottleneck = DilatedConvBlock(channels, channels, dilations=[1, 2, 4, 8])
+        self.bottleneck = DilatedConvBlock(base_channels * 4, base_channels * 4, dilations=[1, 2, 4, 8])
         
         # Decoder
-        self.decoder_blocks = nn.ModuleList()
-        self.decoder_upsample = nn.ModuleList()
+        # Layer 2: 256 → 128 (上采样) + skip from enc_conv1 (128)
+        # Layer 1: 128 → 64 (上采样) + skip from enc_conv0 (64)
         
-        for i in range(num_layers - 1):
-            self.decoder_upsample.append(nn.ConvTranspose1d(channels, channels // 2, 4, stride=2, padding=1))
-            channels //= 2
-            self.decoder_blocks.append(
-                ResidualBlock(channels * 2, channels, d_time)  # *2 for skip connection
-            )
+        self.dec_up2 = nn.ConvTranspose1d(base_channels * 4, base_channels * 2, 4, stride=2, padding=1)
+        self.dec_conv2 = ResidualBlock(base_channels * 4, base_channels * 2, d_time)  # 256+128=384 → 128
+        
+        self.dec_up1 = nn.ConvTranspose1d(base_channels * 2, base_channels, 4, stride=2, padding=1)
+        self.dec_conv1 = ResidualBlock(base_channels * 2, base_channels, d_time)  # 128+64=192 → 64
         
         # Output layer
-        self.output_conv = nn.Conv1d(channels, out_channels, 1)
+        self.output_conv = nn.Conv1d(base_channels, out_channels, 1)
         
     def forward(self, x, time_feat):
         """
         Args:
-            x: (B, 3, 168) 多通道输入
+            x: (B, 14, 168) 多通道输入
             time_feat: (B, 168, d_time) 时间特征
         Returns:
             out: (B, 3, 168) 多通道输出
         """
-        # Encoder
-        encoder_outputs = []
-        for i, block in enumerate(self.encoder_blocks):
-            x = block(x, time_feat)
-            encoder_outputs.append(x)
-            if i < len(self.encoder_downsample):
-                x = self.encoder_downsample[i](x)
+        # Encoder Layer 0: 14 → 64, L=168
+        enc0 = self.enc_conv0(x, time_feat)  # (B, 64, 168)
         
-        # Bottleneck
-        x = self.bottleneck(x)
+        # Encoder Layer 1: 64 → 128, L=84
+        x1 = self.enc_down1(enc0)  # (B, 64, 84)
+        time_feat1 = F.interpolate(
+            time_feat.permute(0, 2, 1),
+            scale_factor=0.5,
+            mode='linear',
+            align_corners=False
+        ).permute(0, 2, 1)  # (B, 84, d_time)
+        enc1 = self.enc_conv1(x1, time_feat1)  # (B, 128, 84)
         
-        # Decoder
-        for i, block in enumerate(self.decoder_blocks):
-            x = self.decoder_upsample[i](x)
-            # Skip connection
-            skip = encoder_outputs[-(i+2)]
-            x = torch.cat([x, skip], dim=1)
-            x = block(x, time_feat)
+        # Encoder Layer 2: 128 → 256, L=42
+        x2 = self.enc_down2(enc1)  # (B, 128, 42)
+        time_feat2 = F.interpolate(
+            time_feat1.permute(0, 2, 1),
+            scale_factor=0.5,
+            mode='linear',
+            align_corners=False
+        ).permute(0, 2, 1)  # (B, 42, d_time)
+        enc2 = self.enc_conv2(x2, time_feat2)  # (B, 256, 42)
         
-        # Output
-        out = self.output_conv(x)
+        # Bottleneck: 256 → 256, L=42
+        x = self.bottleneck(enc2)  # (B, 256, 42)
+        
+        # Decoder Layer 2: 256 → 128, L=84
+        x = self.dec_up2(x)  # (B, 128, 84)
+        time_feat_up2 = F.interpolate(
+            time_feat2.permute(0, 2, 1),
+            scale_factor=2,
+            mode='linear',
+            align_corners=False
+        ).permute(0, 2, 1)  # (B, 84, d_time)
+        x = torch.cat([x, enc1], dim=1)  # (B, 256, 84) - 128+128=256
+        x = self.dec_conv2(x, time_feat_up2)  # (B, 128, 84)
+        
+        # Decoder Layer 1: 128 → 64, L=168
+        x = self.dec_up1(x)  # (B, 64, 168)
+        time_feat_up1 = F.interpolate(
+            time_feat_up2.permute(0, 2, 1),
+            scale_factor=2,
+            mode='linear',
+            align_corners=False
+        ).permute(0, 2, 1)  # (B, 168, d_time)
+        x = torch.cat([x, enc0], dim=1)  # (B, 128, 168) - 64+64=128
+        x = self.dec_conv1(x, time_feat_up1)  # (B, 64, 168)
+        
+        # Output: 64 → 3
+        out = self.output_conv(x)  # (B, 3, 168)
         
         return out
 
@@ -389,7 +420,7 @@ class GaussianDiffusionMultivariate(nn.Module):
         
         return gradient
     
-    def denoise_step(self, x_t, t, cond_matrix, time_feat):
+    def denoise_step(self, x_t, t, cond_full, cond_matrix, time_feat):
         """
         论文公式10: 反向去噪一步
         
@@ -399,9 +430,10 @@ class GaussianDiffusionMultivariate(nn.Module):
         mean = mean - guidance_scale · ∇_{x_t} ||γ·x_t - c||²_F
         
         Args:
-            x_t: (B, 3, 168) 当前噪声数据
+            x_t: (B, 3, 168) 当前噪声数据 (Target Residuals)
             t: 时间步索引
-            cond_matrix: (B, 3, 168, 2) 条件矩阵
+            cond_full: (B, 11, 168) 条件部分 (Base Prediction + Time Encoding)
+            cond_matrix: (B, 3, 168, 2) KDE条件矩阵
             time_feat: (B, 168, d_time) 时间特征
         Returns:
             x_{t-1}: 去噪一步后的数据
@@ -409,9 +441,11 @@ class GaussianDiffusionMultivariate(nn.Module):
         B = x_t.shape[0]
         device = x_t.device
         
-        # 预测噪声
-        t_tensor = torch.full((B,), t, device=device, dtype=torch.long)
-        predicted_noise = self.model(x_t, time_feat)
+        # 构建14通道输入: [x_t (3), cond_full (11)]
+        input_14ch = torch.cat([x_t, cond_full], dim=1)  # (B, 14, 168)
+        
+        # 预测噪声（模型输出3维）
+        predicted_noise = self.model(input_14ch, time_feat)
         
         # 计算去噪均值
         alpha_t = self.alpha[t]
@@ -435,19 +469,20 @@ class GaussianDiffusionMultivariate(nn.Module):
         
         return x_prev
     
-    def sample(self, cond_matrix, time_feat, n_samples=1):
+    def sample(self, cond_full, cond_matrix, time_feat, n_samples=1):
         """
         完整采样过程：从噪声生成场景
         
         Args:
-            cond_matrix: (B, 3, 168, 2) 条件矩阵
+            cond_full: (B, 11, 168) 条件部分 (Base Prediction + Time Encoding)
+            cond_matrix: (B, 3, 168, 2) KDE条件矩阵
             time_feat: (B, 168, d_time) 时间特征
             n_samples: 生成样本数量
         Returns:
             samples: (B, n_samples, 3, 168) 生成的场景
         """
-        B = cond_matrix.shape[0]
-        device = cond_matrix.device
+        B = cond_full.shape[0]
+        device = cond_full.device
         
         # 初始化纯噪声
         samples = torch.zeros(B, n_samples, 3, 168, device=device)
@@ -457,19 +492,19 @@ class GaussianDiffusionMultivariate(nn.Module):
             
             # 逐步去噪
             for t in range(self.num_steps - 1, -1, -1):
-                x_t = self.denoise_step(x_t, t, cond_matrix, time_feat)
+                x_t = self.denoise_step(x_t, t, cond_full, cond_matrix, time_feat)
             
             samples[:, s] = x_t
         
         return samples
     
-    def forward(self, x0, cond_matrix, time_feat, t=None):
+    def forward(self, x0, cond_full, time_feat, t=None):
         """
         训练时的前向传播：计算损失
         
         Args:
-            x0: (B, 3, 168) 原始残差数据
-            cond_matrix: (B, 3, 168, 2) 条件矩阵
+            x0: (B, 3, 168) 原始残差数据 (Target Residuals)
+            cond_full: (B, 11, 168) 条件部分 (Base Prediction + Time Encoding)
             time_feat: (B, 168, d_time) 时间特征
             t: 时间步（可选，随机采样）
         Returns:
@@ -482,11 +517,14 @@ class GaussianDiffusionMultivariate(nn.Module):
         if t is None:
             t = torch.randint(0, self.num_steps, (B,), device=device)
         
-        # 添加噪声
+        # 添加噪声（只对前3维Target Residuals添加噪声）
         x_t, noise = self.add_noise(x0, t)
         
-        # 预测噪声
-        predicted_noise = self.model(x_t, time_feat)
+        # 构建14通道输入: [x_t (3), cond_full (11)]
+        input_14ch = torch.cat([x_t, cond_full], dim=1)  # (B, 14, 168)
+        
+        # 预测噪声（模型输出3维）
+        predicted_noise = self.model(input_14ch, time_feat)
         
         # 计算损失（MSE）
         loss = F.mse_loss(predicted_noise, noise)
@@ -507,12 +545,15 @@ class MultiChannelCSDI(nn.Module):
     2. Res-UNet + 空洞卷积
     3. 多通道条件引导（公式10）
     
-    输入维度定义 (11维张量)：
-    - Channel [0:3]: 风、光、负荷残差 (Residuals) - 生成核心主体
-    - Channel [3:11]: 8维时间周期编码 (Sin/Cos) - 环境背景条件
+    输入维度定义 (14维张量)：
+    - Channel [0:3]: Target Residuals (正在去噪的风、光、负荷残差 x_t)
+    - Channel [3:6]: Base Prediction (来自FEDformer的风、光、负荷预测趋势)
+    - Channel [6:14]: Time Encoding (8维时间周期特征)
     
     输出维度定义：
-    - Channel [0:3]: 风、光、负荷残差生成结果
+    - Channel [0:3]: 风、光、负荷残差噪声预测（只预测前3维）
+    
+    KDE拟合：仅对Channel [0:3]（物理残差）进行概率密度建模和梯度引导
     """
     
     def __init__(self, config, device):
@@ -521,7 +562,7 @@ class MultiChannelCSDI(nn.Module):
         self.config = config
         
         # 输入输出通道定义
-        self.in_channels = config.get('in_channels', 11)  # 11维输入
+        self.in_channels = config.get('in_channels', 14)  # 14维输入
         self.out_channels = config.get('out_channels', 3)  # 3维输出（风、光、负荷残差）
         
         # 时间特征嵌入维度
@@ -531,12 +572,12 @@ class MultiChannelCSDI(nn.Module):
         self.time_feature_embed = TimeFeatureEmbedding(self.d_time)
         self.pos_embed = SinusoidalPositionEmbedding(self.d_time)
         
-        # Res-UNet模型 - 11维输入，3维输出
+        # Res-UNet模型 - 14维输入，3维输出
         self.unet = ResUNet(
             in_channels=self.in_channels,
             out_channels=self.out_channels,
             d_time=self.d_time,
-            base_channels=config.get('base_channels', 128),  # 确保容量足够
+            base_channels=config.get('base_channels', 128),
             num_layers=config.get('num_layers', 4)
         )
         
@@ -587,20 +628,35 @@ class MultiChannelCSDI(nn.Module):
         """
         训练时的前向传播
         
+        14通道输入结构：
+        - Channel [0:3]: Target Residuals (正在去噪的风、光、负荷残差 x_t)
+        - Channel [3:6]: Base Prediction (来自FEDformer的风、光、负荷预测趋势)
+        - Channel [6:14]: Time Encoding (8维时间周期特征)
+        
         Args:
-            batch: 包含 'residual', 'cond_matrix', 'timepoints'
+            batch: 包含 'residual_3ch', 'forecast_3ch', 'time_encoding', 'cond_matrix', 'timepoints'
         Returns:
             loss: 训练损失
         """
-        residual = batch['residual'].to(self.device)  # (B, 3, 168)
+        # Target Residuals (3, 168) - 扩散目标
+        residual = batch['residual_3ch'].to(self.device)  # (B, 3, 168)
+        
+        # 条件部分: Base Prediction (3, 168) + Time Encoding (8, 168) = 11维
+        forecast_3ch = batch['forecast_3ch'].to(self.device)  # (B, 3, 168)
+        time_encoding = batch['time_encoding'].to(self.device)  # (B, 8, 168)
+        cond_full = torch.cat([forecast_3ch, time_encoding], dim=1)  # (B, 11, 168)
+        
+        # KDE条件矩阵 (仅对Channel [0:3]构建)
         cond_matrix = batch['cond_matrix'].to(self.device)  # (B, 3, 168, 2)
+        
+        # 时间点索引
         timepoints = batch['timepoints'].to(self.device)  # (B, 168)
         
         # 获取时间特征
         time_feat = self.get_time_features(timepoints)
         
         # 计算扩散损失
-        loss = self.diffusion(residual, cond_matrix, time_feat)
+        loss = self.diffusion(residual, cond_full, time_feat)
         
         return loss
     
@@ -609,17 +665,23 @@ class MultiChannelCSDI(nn.Module):
         生成场景
         
         Args:
-            batch: 包含 'cond_matrix', 'timepoints'
+            batch: 包含 'forecast_3ch', 'time_encoding', 'cond_matrix', 'timepoints'
             n_samples: 生成样本数量
         Returns:
             samples: (B, n_samples, 3, 168) 生成的残差场景
         """
-        cond_matrix = batch['cond_matrix'].to(self.device)
+        # 条件部分
+        forecast_3ch = batch['forecast_3ch'].to(self.device)  # (B, 3, 168)
+        time_encoding = batch['time_encoding'].to(self.device)  # (B, 8, 168)
+        cond_full = torch.cat([forecast_3ch, time_encoding], dim=1)  # (B, 11, 168)
+        
+        # KDE条件矩阵
+        cond_matrix = batch['cond_matrix'].to(self.device)  # (B, 3, 168, 2)
         timepoints = batch['timepoints'].to(self.device)
         
         time_feat = self.get_time_features(timepoints)
         
         with torch.no_grad():
-            samples = self.diffusion.sample(cond_matrix, time_feat, n_samples)
+            samples = self.diffusion.sample(cond_full, cond_matrix, time_feat, n_samples)
         
         return samples

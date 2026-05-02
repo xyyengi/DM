@@ -3,12 +3,15 @@
 # 
 # 论文"2023-Conditional_Diffusion_Model.pdf"复现
 # 
-# 数据结构 (11维张量)：
-# - Channel [0:3]: 风、光、负荷残差 (Residuals) - 生成核心主体
-# - Channel [3:11]: 8维时间周期编码 (Sin/Cos) - 环境背景条件
+# 输入通道 (Total Input: 14 channels)：
+# - Channel [0:3]: Target Residuals (正在去噪的风、光、负荷残差 x_t)
+# - Channel [3:6]: Base Prediction (来自FEDformer的风、光、负荷预测趋势)
+# - Channel [6:14]: Time Encoding (8维时间周期特征)
 # 
 # 输出结构 (3维张量)：
-# - Channel [0:3]: 风、光、负荷残差生成结果
+# - Channel [0:3]: 风、光、负荷残差噪声预测（只预测前3维）
+# 
+# KDE拟合：仅对Channel [0:3]（物理残差）进行概率密度建模和梯度引导
 # ============================================================================
 
 # 训练配置
@@ -20,8 +23,8 @@ train:
 # 模型配置
 model:
   # 输入输出通道
-  in_channels: 11   # 11维输入（风、光、负荷残差 + 8维时间编码）
-  out_channels: 3   # 3维输出（风、光、负荷残差）
+  in_channels: 14   # 14维输入（Target Residuals + Base Prediction + Time Encoding）
+  out_channels: 3   # 3维输出（只预测前3维的噪声）
   
   # 时间特征嵌入维度
   d_time: 64
