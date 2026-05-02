@@ -3,9 +3,12 @@
 # 
 # 论文"2023-Conditional_Diffusion_Model.pdf"复现
 # 
-# 数据结构：
-# - 张量: (Batch, Channels=3, Length=168)
-# - 通道: 0=风电, 1=光伏, 2=负荷
+# 数据结构 (11维张量)：
+# - Channel [0:3]: 风、光、负荷残差 (Residuals) - 生成核心主体
+# - Channel [3:11]: 8维时间周期编码 (Sin/Cos) - 环境背景条件
+# 
+# 输出结构 (3维张量)：
+# - Channel [0:3]: 风、光、负荷残差生成结果
 # ============================================================================
 
 # 训练配置
@@ -16,11 +19,15 @@ train:
 
 # 模型配置
 model:
+  # 输入输出通道
+  in_channels: 11   # 11维输入（风、光、负荷残差 + 8维时间编码）
+  out_channels: 3   # 3维输出（风、光、负荷残差）
+  
   # 时间特征嵌入维度
   d_time: 64
   
-  # Res-UNet基础通道数
-  base_channels: 64
+  # Res-UNet基础通道数（确保容量足够区分特征）
+  base_channels: 128
   
   # Res-UNet层数
   num_layers: 4
@@ -41,8 +48,9 @@ model:
 
 # 数据配置
 data:
+  data_path: "./input_4.27/"
   seq_length: 168  # 7天 * 24小时
-  n_channels: 3    # 风、光、负荷
+  n_channels: 11   # 11维输入特征
   
 # 评估配置
 evaluation:

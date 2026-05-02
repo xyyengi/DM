@@ -219,11 +219,18 @@ class ResUNet(nn.Module):
     1. Encoder-Decoder结构
     2. Bottleneck使用空洞卷积
     3. 时间特征注入到每个ResBlock
-    4. 支持多通道输入 (Channels=3)
+    4. 支持11维特征解耦输入
+    
+    输入维度定义 (11维张量)：
+    - Channel [0:3]: 风、光、负荷残差 (Residuals) - 生成核心主体
+    - Channel [3:11]: 8维时间周期编码 (Sin/Cos) - 环境背景条件
+    
+    输出维度定义：
+    - Channel [0:3]: 风、光、负荷残差生成结果
     """
     
-    def __init__(self, in_channels=3, out_channels=3, d_time=64, 
-                 base_channels=64, num_layers=4):
+    def __init__(self, in_channels=11, out_channels=3, d_time=64, 
+                 base_channels=128, num_layers=4):
         super().__init__()
         
         self.in_channels = in_channels
@@ -499,12 +506,23 @@ class MultiChannelCSDI(nn.Module):
     1. 时间特征注入（小时、周几、月份）
     2. Res-UNet + 空洞卷积
     3. 多通道条件引导（公式10）
+    
+    输入维度定义 (11维张量)：
+    - Channel [0:3]: 风、光、负荷残差 (Residuals) - 生成核心主体
+    - Channel [3:11]: 8维时间周期编码 (Sin/Cos) - 环境背景条件
+    
+    输出维度定义：
+    - Channel [0:3]: 风、光、负荷残差生成结果
     """
     
     def __init__(self, config, device):
         super().__init__()
         self.device = device
         self.config = config
+        
+        # 输入输出通道定义
+        self.in_channels = config.get('in_channels', 11)  # 11维输入
+        self.out_channels = config.get('out_channels', 3)  # 3维输出（风、光、负荷残差）
         
         # 时间特征嵌入维度
         self.d_time = config.get('d_time', 64)
@@ -513,12 +531,12 @@ class MultiChannelCSDI(nn.Module):
         self.time_feature_embed = TimeFeatureEmbedding(self.d_time)
         self.pos_embed = SinusoidalPositionEmbedding(self.d_time)
         
-        # Res-UNet模型
+        # Res-UNet模型 - 11维输入，3维输出
         self.unet = ResUNet(
-            in_channels=3,
-            out_channels=3,
+            in_channels=self.in_channels,
+            out_channels=self.out_channels,
             d_time=self.d_time,
-            base_channels=config.get('base_channels', 64),
+            base_channels=config.get('base_channels', 128),  # 确保容量足够
             num_layers=config.get('num_layers', 4)
         )
         

@@ -167,23 +167,54 @@ class MultiChannelWindScenarioDataset(Dataset):
                 self.kde.fit(self.forecast_norm, self.residual_norm)
     
     def _load_data(self):
-        """加载预测值和残差数据"""
-        pred_path = os.path.join(self.data_path, 'pred.npy')
+        """
+        加载预测值和残差数据
+        
+        数据文件结构 (input_4.27):
+        - train_pred.npy: (18917, 168, 11) 训练集预测值
+        - train_res.npy: (18917, 168, 11) 训练集残差
+        - val_pred.npy: (2608, 168, 11) 验证集预测值
+        - val_res.npy: (2608, 168, 11) 验证集残差
+        - test_pred.npy: (5381, 168, 11) 测试集预测值
+        - test_res.npy: (5381, 168, 11) 测试集残差
+        
+        11维特征定义：
+        - Channel [0:3]: 风、光、负荷残差 (Residuals) - 生成核心主体
+        - Channel [3:11]: 8维时间周期编码 (Sin/Cos) - 环境背景条件
+        """
+        # 加载所有数据文件
+        train_pred_path = os.path.join(self.data_path, 'train_pred.npy')
+        train_res_path = os.path.join(self.data_path, 'train_res.npy')
+        val_pred_path = os.path.join(self.data_path, 'val_pred.npy')
+        val_res_path = os.path.join(self.data_path, 'val_res.npy')
         test_pred_path = os.path.join(self.data_path, 'test_pred.npy')
         test_res_path = os.path.join(self.data_path, 'test_res.npy')
         
-        self.pred_data = np.load(pred_path) if os.path.exists(pred_path) else None
+        # 检查并加载文件
+        self.train_pred = np.load(train_pred_path) if os.path.exists(train_pred_path) else None
+        self.train_res = np.load(train_res_path) if os.path.exists(train_res_path) else None
+        self.val_pred = np.load(val_pred_path) if os.path.exists(val_pred_path) else None
+        self.val_res = np.load(val_res_path) if os.path.exists(val_res_path) else None
         self.test_pred = np.load(test_pred_path) if os.path.exists(test_pred_path) else None
         self.test_res = np.load(test_res_path) if os.path.exists(test_res_path) else None
         
+        # 根据模式选择数据
         if self.mode == 'train':
-            self.forecast_data = self.pred_data if self.pred_data is not None else self.test_pred
-            self.residual_data = self.test_res if self.test_res is not None else np.zeros_like(self.forecast_data)
-        else:
+            self.forecast_data = self.train_pred if self.train_pred is not None else self.test_pred
+            self.residual_data = self.train_res if self.train_res is not None else self.test_res
+        elif self.mode == 'val':
+            self.forecast_data = self.val_pred if self.val_pred is not None else self.test_pred
+            self.residual_data = self.val_res if self.val_res is not None else self.test_res
+        else:  # test mode
             self.forecast_data = self.test_pred
             self.residual_data = self.test_res
         
+        # 确保数据维度正确
+        if self.forecast_data is None:
+            raise FileNotFoundError(f"未找到数据文件，请检查 {self.data_path} 目录")
+        
         self.num_samples = self.forecast_data.shape[0]
+        self.n_channels = self.forecast_data.shape[2]  # 应为11
         
     def _normalize_data(self):
         """归一化数据到[0,1]范围"""
@@ -199,31 +230,46 @@ class MultiChannelWindScenarioDataset(Dataset):
     def __getitem__(self, index):
         """
         返回单个样本
-        forecast: (3, 168) 归一化预测值
-        residual: (3, 168) 归一化残差
-        cond_matrix: (3, 168, 2) 条件矩阵 [c_down, c_up]
+        
+        11维特征定义：
+        - Channel [0:3]: 风、光、负荷残差 (Residuals) - 生成核心主体
+        - Channel [3:11]: 8维时间周期编码 (Sin/Cos) - 环境背景条件
+        
+        Returns:
+            forecast: (11, 168) 归一化预测值（完整11维）
+            residual: (11, 168) 归一化残差（完整11维）
+            residual_3ch: (3, 168) 仅风、光、负荷残差（用于扩散模型输出）
+            cond_matrix: (3, 168, 2) 条件矩阵 [c_down, c_up]（仅对前3维构建）
+            timepoints: (168,) 时间点索引
         """
-        forecast = self.forecast_norm[index].transpose(1, 0)  # (168, 3) -> (3, 168)
-        residual = self.residual_norm[index].transpose(1, 0)
+        # 获取完整11维数据，转置为 (11, 168)
+        forecast = self.forecast_norm[index].transpose(1, 0)  # (168, 11) -> (11, 168)
+        residual = self.residual_norm[index].transpose(1, 0)  # (168, 11) -> (11, 168)
         
-        # 论文公式9: 构建3通道条件矩阵
-        cond_down = np.zeros((self.n_channels, self.seq_length))
-        cond_up = np.zeros((self.n_channels, self.seq_length))
+        # 提取前3维（风、光、负荷残差）用于扩散模型
+        residual_3ch = residual[:3, :]  # (3, 168)
+        forecast_3ch = forecast[:3, :]  # (3, 168)
         
-        for c in range(self.n_channels):
+        # 论文公式9: 仅对前3维（风、光、负荷）构建条件矩阵
+        # KDE只针对残差通道构建条件区间
+        cond_down = np.zeros((3, self.seq_length))
+        cond_up = np.zeros((3, self.seq_length))
+        
+        for c in range(3):  # 仅前3个通道
             for t in range(self.seq_length):
-                f_val = forecast[c, t]
+                f_val = forecast_3ch[c, t]
                 c_down, c_up = self.kde.get_conditional_interval(f_val, c)
                 cond_down[c, t] = c_down
                 cond_up[c, t] = c_up
         
-        # 条件矩阵: (3, 168, 2)
+        # 条件矩阵: (3, 168, 2) - 仅风、光、负荷
         cond_matrix = np.stack([cond_down, cond_up], axis=-1)
         
         return {
-            'forecast': torch.FloatTensor(forecast),
-            'residual': torch.FloatTensor(residual),
-            'cond_matrix': torch.FloatTensor(cond_matrix),
+            'forecast': torch.FloatTensor(forecast),        # (11, 168) 完整输入
+            'residual': torch.FloatTensor(residual),        # (11, 168) 完整残差
+            'residual_3ch': torch.FloatTensor(residual_3ch), # (3, 168) 扩散目标
+            'cond_matrix': torch.FloatTensor(cond_matrix),   # (3, 168, 2) 条件
             'timepoints': torch.FloatTensor(np.arange(self.seq_length)),
         }
 
