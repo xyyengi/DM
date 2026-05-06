@@ -364,14 +364,19 @@ class GaussianDiffusionMultivariate(nn.Module):
         self.num_steps = num_steps
         self.guidance_scale = guidance_scale
         
-        # Beta schedule
+        # Beta schedule - 使用register_buffer确保张量随模型移动到GPU
         if schedule == 'quad':
-            self.beta = torch.linspace(beta_start**0.5, beta_end**0.5, num_steps) ** 2
+            beta = torch.linspace(beta_start**0.5, beta_end**0.5, num_steps) ** 2
         elif schedule == 'linear':
-            self.beta = torch.linspace(beta_start, beta_end, num_steps)
+            beta = torch.linspace(beta_start, beta_end, num_steps)
         
-        self.alpha = 1.0 - self.beta
-        self.alpha_hat = torch.cumprod(self.alpha, dim=0)
+        alpha = 1.0 - beta
+        alpha_hat = torch.cumprod(alpha, dim=0)
+        
+        # 注册为buffer，这样会自动随模型移动到正确设备
+        self.register_buffer('beta', beta)
+        self.register_buffer('alpha', alpha)
+        self.register_buffer('alpha_hat', alpha_hat)
         
     def add_noise(self, x0, t):
         """

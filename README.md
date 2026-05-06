@@ -238,3 +238,40 @@ If you use this code for your research, please cite our paper:
   year={2021}
 }
 ```
+# 标准训练（200 epochs，默认参数）
+python exe_wind_scenario.py --mode train --exp_name wind_scenario
+
+# 自定义实验名称
+python exe_wind_scenario.py --mode train --exp_name wind_baseline_v1
+
+# 自定义参数
+python exe_wind_scenario.py --mode train --exp_name wind_scenario --n_samples 100 --save_every 20
+# 预测
+# 使用完整文件夹名
+python exe_wind_scenario.py --mode predict --exp_name run_wind_scenario_20260506_XXXX --ckpt_epoch 200 --n_samples 100
+
+# 使用关键字搜索
+python exe_wind_scenario.py --mode predict --exp_name wind_scenario --ckpt_epoch 200 --n_samples 100
+# 使用nohup后台运行
+nohup python exe_wind_scenario.py --mode train --exp_name wind_scenario > train.log 2>&1 &
+
+# 查看训练进度
+tail -f train.log
+服务器训练命令：
+
+**训练：**
+```bash
+python exe_wind_scenario.py --mode train --exp_name wind_scenario
+```
+
+**预测：**
+```bash
+python exe_wind_scenario.py --mode predict --exp_name run_wind_scenario_20260506_XXXX --ckpt_epoch 200 --n_samples 100
+```
+
+**后台运行：**
+```bash
+nohup python exe_wind_scenario.py --mode train --exp_name wind_scenario > train.log 2>&1 &
+```
+
+GPU会自动检测使用，无需手动指定。
