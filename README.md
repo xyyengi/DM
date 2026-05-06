@@ -93,16 +93,20 @@ This is the github repository for the NeurIPS 2021 paper "[CSDI: Conditional Sco
 conda activate torch_env
 ```
 
-**训练模型:**
+**训练模型 (实验留痕):**
 ```bash
 # 训练多变量协同条件扩散模型
-python exe_wind_scenario.py --config config/wind_scenario.yaml --data_path ./input_4.27/ --mode train --n_samples 10
+# 自动创建时间戳文件夹: run_wind_scenario_[YYYYMMDD_HHMM]/
+python exe_wind_scenario.py --mode train --exp_name wind_scenario --n_samples 10
 ```
 
-**生成场景 (使用预训练模型):**
+**生成场景 (精确加载指定实验):**
 ```bash
-# 使用已训练的模型生成场景
-python exe_wind_scenario.py --config config/wind_scenario.yaml --data_path ./input_4.27/ --mode test --n_samples 10
+# 方式1: 使用完整实验文件夹名
+python exe_wind_scenario.py --mode predict --exp_name run_wind_scenario_20260506_1515 --ckpt_epoch 200
+
+# 方式2: 使用关键字搜索（自动匹配第一个）
+python exe_wind_scenario.py --mode predict --exp_name wind_scenario --ckpt_epoch 100
 ```
 
 **参数说明:**
@@ -110,9 +114,41 @@ python exe_wind_scenario.py --config config/wind_scenario.yaml --data_path ./inp
 |------|--------|------|
 | --config | config/wind_scenario.yaml | 配置文件路径 |
 | --data_path | ./input_4.27/ | 数据目录路径 |
-| --save_path | ./save/wind_scenario/ | 模型保存路径 |
-| --mode | train | 运行模式: train(训练) 或 test(生成) |
+| --save_path | ./save/ | 实验保存基础路径 |
+| --exp_name | wind_scenario | 实验名称（用于文件夹命名） |
+| --mode | train | 运行模式: train(训练) 或 predict(生成) |
+| --ckpt_epoch | 200 | 加载的checkpoint epoch编号 |
 | --n_samples | 10 | 每个条件生成的场景数量 |
+| --save_every | 50 | checkpoint保存间隔(epoch) |
+
+**实验文件夹结构:**
+```
+save/
+  run_wind_scenario_20260506_1515/       # 时间戳隔离文件夹
+    checkpoints/
+      model_epoch_50.pt                  # 中间checkpoint
+      model_epoch_100.pt
+      model_epoch_200.pt                 # 最终checkpoint
+    results/
+      generated_samples.npy              # 生成结果
+      forecast_data.npy
+      metrics.txt
+      predict_20260506_1600/             # predict模式结果子文件夹
+    logs/
+      train_log.txt                      # 训练日志
+    config_used.yaml                     # 本次实验配置副本
+```
+
+**checkpoint内容:**
+```python
+{
+    'epoch': epoch,                      # 当前epoch
+    'model_state_dict': model.state_dict(),  # 模型权重
+    'optimizer_state_dict': optimizer.state_dict(),  # 优化器状态
+    'loss': avg_loss,                    # 当前loss
+    'config': config                     # 配置字典
+}
+```
 
 **数据集分配:**
 | 数据集 | 样本数 | 用途 |
