@@ -234,7 +234,18 @@ class MultiChannelWindScenarioDataset(Dataset):
         """
         预计算所有样本的条件矩阵
         将504次KDE查询从__getitem__移到初始化阶段，大幅加速训练
+        
+        支持缓存：如果已有缓存文件则直接加载，避免重复计算
         """
+        # 检查缓存文件
+        cache_path = os.path.join(self.data_path, f'cond_matrix_{self.mode}.npy')
+        
+        if os.path.exists(cache_path):
+            print(f"加载缓存的条件矩阵: {cache_path}")
+            self.cond_matrix_all = np.load(cache_path)
+            print(f"条件矩阵加载完成，形状: {self.cond_matrix_all.shape}")
+            return
+        
         print(f"预计算条件矩阵... (样本数: {self.num_samples})")
         self.cond_matrix_all = np.zeros((self.num_samples, 3, self.seq_length, 2), dtype=np.float32)
         
@@ -252,6 +263,10 @@ class MultiChannelWindScenarioDataset(Dataset):
                 print(f"  已处理 {idx + 1}/{self.num_samples} 样本")
         
         print(f"条件矩阵预计算完成，形状: {self.cond_matrix_all.shape}")
+        
+        # 保存缓存
+        np.save(cache_path, self.cond_matrix_all)
+        print(f"条件矩阵已缓存至: {cache_path}")
         
     def __len__(self):
         return self.num_samples
