@@ -168,6 +168,9 @@ class MultiChannelWindScenarioDataset(Dataset):
                 self.kde.load(kde_path)
             else:
                 self.kde.fit(self.forecast_norm, self.residual_norm)
+        
+        # 预计算条件矩阵（在KDE创建之后）
+        self._precompute_cond_matrix()
     
     def _load_data(self):
         """
@@ -226,6 +229,29 @@ class MultiChannelWindScenarioDataset(Dataset):
         
         self.forecast_norm = self.forecast_data / self.max_values
         self.residual_norm = self.residual_data / self.max_values
+    
+    def _precompute_cond_matrix(self):
+        """
+        预计算所有样本的条件矩阵
+        将504次KDE查询从__getitem__移到初始化阶段，大幅加速训练
+        """
+        print(f"预计算条件矩阵... (样本数: {self.num_samples})")
+        self.cond_matrix_all = np.zeros((self.num_samples, 3, self.seq_length, 2), dtype=np.float32)
+        
+        for idx in range(self.num_samples):
+            forecast_3ch = self.forecast_norm[idx, :, :3]  # (168, 3)
+            
+            for c in range(3):
+                for t in range(self.seq_length):
+                    f_val = forecast_3ch[t, c]
+                    c_down, c_up = self.kde.get_conditional_interval(f_val, c)
+                    self.cond_matrix_all[idx, c, t, 0] = c_down
+                    self.cond_matrix_all[idx, c, t, 1] = c_up
+            
+            if (idx + 1) % 5000 == 0:
+                print(f"  已处理 {idx + 1}/{self.num_samples} 样本")
+        
+        print(f"条件矩阵预计算完成，形状: {self.cond_matrix_all.shape}")
         
     def __len__(self):
         return self.num_samples
@@ -259,20 +285,8 @@ class MultiChannelWindScenarioDataset(Dataset):
         # 构建14通道输入: [Target Residuals, Base Prediction, Time Encoding]
         input_14ch = np.concatenate([residual_3ch, forecast_3ch, time_encoding], axis=0)  # (14, 168)
         
-        # 论文公式9: 仅对前3维（风、光、负荷）构建条件矩阵
-        # KDE只针对Channel [0:3]（物理残差）进行概率密度建模
-        cond_down = np.zeros((3, self.seq_length))
-        cond_up = np.zeros((3, self.seq_length))
-        
-        for c in range(3):  # 仅前3个通道
-            for t in range(self.seq_length):
-                f_val = forecast_3ch[c, t]
-                c_down, c_up = self.kde.get_conditional_interval(f_val, c)
-                cond_down[c, t] = c_down
-                cond_up[c, t] = c_up
-        
-        # 条件矩阵: (3, 168, 2) - 仅风、光、负荷
-        cond_matrix = np.stack([cond_down, cond_up], axis=-1)
+        # 使用预计算的条件矩阵（已移除504次KDE查询）
+        cond_matrix = self.cond_matrix_all[index]  # (3, 168, 2)
         
         return {
             'input_14ch': torch.FloatTensor(input_14ch),     # (14, 168) 14通道完整输入
@@ -285,10 +299,23 @@ class MultiChannelWindScenarioDataset(Dataset):
 
 
 def get_dataloader_multivariate(data_path='./wind_solar_load_168_FEDformer/',
-                                batch_size=16, mode='train', n_intervals=10):
-    """获取多通道数据加载器"""
+                                batch_size=16, mode='train', n_intervals=10,
+                                num_workers=4, pin_memory=True):
+    """
+    获取多通道数据加载器
+    
+    Args:
+        num_workers: 多进程数据加载（GPU训练时建议4-8）
+        pin_memory: 锁页内存，加速GPU数据传输
+    """
     dataset = MultiChannelWindScenarioDataset(
         data_path=data_path, mode=mode, n_intervals=n_intervals
     )
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=(mode=='train'))
+    loader = DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=(mode=='train'),
+        num_workers=num_workers,
+        pin_memory=pin_memory
+    )
     return loader, dataset.kde, dataset.max_values
