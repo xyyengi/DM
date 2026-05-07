@@ -20,6 +20,15 @@ train:
   batch_size: 64  # 32GB显存建议值
   lr: 1.0e-3
 
+# 学习率调度器配置 (warmup + step decay)
+lr_scheduler:
+  enabled: false  # 设为true启用，或使用 --use_lr_scheduler 参数
+  initial_lr: 1.0e-4  # warmup起始学习率
+  warmup_epochs: 10   # warmup轮数
+  decay_epochs: 50    # 衰减间隔
+  decay_factor: 0.5   # 衰减因子
+  min_lr: 1.0e-6      # 最小学习率
+
 # 模型配置
 model:
   # 输入输出通道

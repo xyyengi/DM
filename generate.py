@@ -18,6 +18,7 @@ from datetime import datetime
 
 from dataset_multivariate import get_dataloader_multivariate
 from diff_models_multivariate import MultiChannelCSDI
+from evaluation import evaluate_multichannel, print_metrics
 
 
 def find_experiment_folders(base_path, keyword=None):
@@ -29,6 +30,34 @@ def find_experiment_folders(base_path, keyword=None):
     if keyword:
         return [f for f in all_folders if keyword in f]
     return all_folders
+
+
+def list_experiments(base_path):
+    """列出所有实验及其最佳模型信息"""
+    folders = find_experiment_folders(base_path)
+    if not folders:
+        print("无实验记录")
+        return
+    
+    print("\n" + "="*70)
+    print("可用实验列表")
+    print("="*70)
+    
+    for folder in sorted(folders, reverse=True):
+        exp_path = os.path.join(base_path, folder)
+        ckpt_path = os.path.join(exp_path, 'checkpoints', 'model_best.pt')
+        
+        # 读取模型信息
+        if os.path.exists(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location='cpu')
+            epoch = ckpt.get('epoch', 'unknown')
+            val_loss = ckpt.get('val_loss', 'unknown')
+            print(f"  {folder}")
+            print(f"    最佳epoch: {epoch}, Val Loss: {val_loss:.4f}" if isinstance(val_loss, float) else f"    最佳epoch: {epoch}")
+        else:
+            print(f"  {folder} (无最佳模型)")
+    
+    print("="*70)
 
 
 def get_checkpoint_path(exp_folder, ckpt_type='best'):
@@ -55,53 +84,57 @@ def generate_scenarios(model, test_loader, device, n_samples=10):
     model.eval()
     all_samples, all_forecast, all_residual = [], [], []
     
-    print(f"生成场景 (n_samples={n_samples})...")
+    total_batches = len(test_loader)
+    print(f"生成场景 (n_samples={n_samples}, 总批次: {total_batches})...")
     
     with torch.no_grad():
-        for batch in test_loader:
+        for batch_idx, batch in enumerate(test_loader):
             samples = model.generate(batch, n_samples=n_samples)
             all_samples.append(samples.cpu().numpy())
             all_forecast.append(batch['forecast_3ch'].numpy())
             all_residual.append(batch['residual_3ch'].numpy())
+            
+            # 进度提示
+            if (batch_idx + 1) % 5 == 0 or batch_idx == 0:
+                print(f"  已完成 {batch_idx + 1}/{total_batches} 批次")
     
+    print(f"生成完成!")
     return np.concatenate(all_samples), np.concatenate(all_forecast), np.concatenate(all_residual)
 
 
 def evaluate_and_save(samples, forecast, residual, max_values, save_path):
-    """评估并保存结果"""
-    max_values_3ch = max_values[:3]
-    samples_denorm = samples * max_values_3ch.reshape(1, 1, 3, 1)
-    residual_denorm = residual * max_values_3ch.reshape(1, 3, 1)
-    
-    metrics = {}
+    """评估并保存结果（使用论文公式12-15）"""
     N, n_samples, C, L = samples.shape
     
-    # Energy Score
-    distances = np.sqrt(np.sum((samples_denorm - residual_denorm.reshape(N, 1, 3, L)) ** 2, axis=(2, 3)))
-    metrics['energy_score'] = np.mean(distances)
+    # 使用evaluation模块计算完整指标
+    metrics = evaluate_multichannel(samples, residual)
+    print_metrics(metrics)
     
-    # Coverage
-    for c, name in enumerate(['wind', 'solar', 'load']):
-        sc = samples_denorm[:, :, c, :]
-        ac = residual_denorm[:, c, :]
-        up, down = np.max(sc, axis=1), np.min(sc, axis=1)
-        metrics[f'{name}_coverage_100'] = np.mean((ac >= down) & (ac <= up))
-    
-    print(f"\n评估结果:")
-    print(f"  Energy Score: {metrics['energy_score']:.4f}")
-    for name in ['wind', 'solar', 'load']:
-        print(f"  {name.capitalize()} Coverage: {metrics[f'{name}_coverage_100']:.4f}")
-    
+    # 保存结果
     os.makedirs(save_path, exist_ok=True)
     np.save(os.path.join(save_path, 'generated_samples.npy'), samples)
     np.save(os.path.join(save_path, 'forecast_data.npy'), forecast)
     np.save(os.path.join(save_path, 'residual_data.npy'), residual)
     
+    # 保存ACF数据
+    for c, name in enumerate(['wind', 'solar', 'load']):
+        if f'{name}_acf_actual' in metrics:
+            np.save(os.path.join(save_path, f'{name}_acf.npy'), {
+                'actual': metrics[f'{name}_acf_actual'],
+                'mean': metrics[f'{name}_acf_mean'],
+                'std': metrics[f'{name}_acf_std']
+            })
+    
+    # 保存评估指标
     with open(os.path.join(save_path, 'metrics.txt'), 'w') as f:
         f.write(f"生成时间: {datetime.now()}\n")
         f.write(f"样本数: {n_samples}\n\n")
+        f.write("="*60 + "\n")
+        f.write("论文公式评估指标\n")
+        f.write("="*60 + "\n\n")
         for k, v in metrics.items():
-            f.write(f"{k}: {v}\n")
+            if isinstance(v, (int, float)):
+                f.write(f"{k}: {v}\n")
     
     print(f"\n结果保存至: {save_path}")
 
