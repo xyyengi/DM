@@ -72,19 +72,32 @@ def get_checkpoint_path(exp_folder, ckpt_epoch):
     return ckpt_path
 
 
-def train(model, train_loader, config, device, exp_folder, save_every=10):
-    """训练模型"""
+def train(model, train_loader, val_loader, config, device, exp_folder, save_every=10, patience=5):
+    """
+    训练模型（带早停机制）
+    
+    Args:
+        val_loader: 验证集DataLoader
+        patience: 早停耐心值，连续patience个epoch验证loss不下降就停止
+    """
     epochs = config['train']['epochs']
     lr = config['train']['lr']
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     log_file = os.path.join(exp_folder, 'logs', 'train_log.txt')
     
-    print(f"开始训练，总Epochs: {epochs}")
+    # 早停机制变量
+    best_val_loss = float('inf')
+    best_epoch = 0
+    patience_counter = 0
+    early_stopped = False
+    
+    print(f"开始训练，总Epochs: {epochs}, 早停patience: {patience}")
     
     with open(log_file, 'w') as f:
-        f.write(f"训练开始: {datetime.now()}\nEpochs: {epochs}\nLR: {lr}\n")
+        f.write(f"训练开始: {datetime.now()}\nEpochs: {epochs}\nLR: {lr}\nPatience: {patience}\n")
     
     for epoch in range(epochs):
+        # 训练阶段
         model.train()
         total_loss = 0
         for batch in train_loader:
@@ -94,22 +107,68 @@ def train(model, train_loader, config, device, exp_folder, save_every=10):
             optimizer.step()
             total_loss += loss.item()
         
-        avg_loss = total_loss / len(train_loader)
+        avg_train_loss = total_loss / len(train_loader)
+        
+        # 验证阶段
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                loss = model(batch)
+                val_loss += loss.item()
+        avg_val_loss = val_loss / len(val_loader)
+        
+        # 打印日志
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
+            print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
         
         with open(log_file, 'a') as f:
-            f.write(f"Epoch {epoch+1}: {avg_loss:.4f}\n")
+            f.write(f"Epoch {epoch+1}: Train={avg_train_loss:.4f}, Val={avg_val_loss:.4f}\n")
         
-        if (epoch + 1) % save_every == 0 or epoch == epochs - 1:
+        # 早停判断
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_epoch = epoch + 1
+            patience_counter = 0
+            
+            # 保存最佳模型
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
-                'loss': avg_loss,
+                'train_loss': avg_train_loss,
+                'val_loss': avg_val_loss,
+                'config': config
+            }, os.path.join(exp_folder, 'checkpoints', 'model_best.pt'))
+            print(f"  → 最佳模型已保存 (Val Loss: {best_val_loss:.4f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"早停触发! 连续{patience}个epoch验证loss未下降")
+                print(f"最佳epoch: {best_epoch}, 最佳Val Loss: {best_val_loss:.4f}")
+                early_stopped = True
+                break
+        
+        # 定期保存checkpoint
+        if (epoch + 1) % save_every == 0:
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'train_loss': avg_train_loss,
+                'val_loss': avg_val_loss,
                 'config': config
             }, os.path.join(exp_folder, 'checkpoints', f'model_epoch_{epoch+1}.pt'))
     
-    return model, epochs
+    # 如果没有早停，保存最终模型
+    if not early_stopped:
+        torch.save({
+            'epoch': epochs,
+            'model_state_dict': model.state_dict(),
+            'train_loss': avg_train_loss,
+            'val_loss': avg_val_loss,
+            'config': config
+        }, os.path.join(exp_folder, 'checkpoints', f'model_epoch_{epochs}.pt'))
+    
+    return model, best_epoch if early_stopped else epochs
 
 
 def generate_scenarios(model, test_loader, device, n_samples=10):
@@ -131,8 +190,10 @@ def generate_scenarios(model, test_loader, device, n_samples=10):
 
 def evaluate_and_save(samples, forecast, residual, max_values, save_path):
     """评估并保存结果"""
-    samples_denorm = samples * max_values.reshape(1, 1, 3, 1)
-    residual_denorm = residual * max_values.reshape(1, 3, 1)
+    # 只取前3个通道（风、光、负荷）的max_values
+    max_values_3ch = max_values[:3]
+    samples_denorm = samples * max_values_3ch.reshape(1, 1, 3, 1)
+    residual_denorm = residual * max_values_3ch.reshape(1, 3, 1)
     
     metrics = {}
     N, n_samples, C, L = samples.shape
@@ -166,6 +227,8 @@ def main(args):
     
     train_loader, kde, max_values = get_dataloader_multivariate(
         args.data_path, config['train']['batch_size'], 'train', config['model']['n_intervals'])
+    val_loader, _, _ = get_dataloader_multivariate(
+        args.data_path, config['train']['batch_size'], 'val', config['model']['n_intervals'])
     test_loader, _, _ = get_dataloader_multivariate(
         args.data_path, config['train']['batch_size'], 'test', config['model']['n_intervals'])
     
@@ -176,7 +239,7 @@ def main(args):
         with open(os.path.join(exp_folder, 'config_used.yaml'), 'w') as f:
             yaml.dump(config, f)
         
-        model, final_epoch = train(model, train_loader, config, device, exp_folder, args.save_every)
+        model, final_epoch = train(model, train_loader, val_loader, config, device, exp_folder, args.save_every, args.patience)
         samples, forecast, residual = generate_scenarios(model, test_loader, device, args.n_samples)
         evaluate_and_save(samples, forecast, residual, max_values, os.path.join(exp_folder, 'results'))
         
@@ -214,5 +277,6 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt_epoch', type=int, default=200, help='加载的epoch')
     parser.add_argument('--n_samples', type=int, default=10)
     parser.add_argument('--save_every', type=int, default=50, help='checkpoint保存间隔')
+    parser.add_argument('--patience', type=int, default=5, help='早停耐心值')
     
     main(parser.parse_args())
