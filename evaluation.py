@@ -168,7 +168,7 @@ def compute_scenario_width(samples, actual, quantile=1.0):
     return width_percent
 
 
-def compute_energy_score(samples, actual):
+def compute_energy_score(samples, actual, verbose=False):
     """
     论文公式14: Energy Score
     
@@ -177,19 +177,28 @@ def compute_energy_score(samples, actual):
     Args:
         samples: (N, n_samples, L) 生成的场景
         actual: (N, L) 实际值
+        verbose: 是否打印进度
     Returns:
         energy_score: 能量分数
     """
     N, n_samples, L = samples.shape
     T = N * L
     
+    if verbose:
+        print(f"  计算Energy Score (n_samples={n_samples})...")
+    
     # 第一项: 场景之间的距离
     term1 = 0
+    pair_count = 0
+    total_pairs = n_samples * (n_samples - 1) // 2
     for i in range(n_samples):
         for j in range(i+1, n_samples):
             diff = samples[:, i, :] - samples[:, j, :]  # (N, L)
             dist = np.sqrt(np.sum(diff ** 2, axis=1))  # (N,)
             term1 += np.mean(dist)
+            pair_count += 1
+            if verbose and pair_count % 100 == 0:
+                print(f"    场景对进度: {pair_count}/{total_pairs}")
     term1 = term1 * 2 / (n_samples * (n_samples - 1)) if n_samples > 1 else 0
     
     # 第二项: 场景与实际值的距离
@@ -202,10 +211,13 @@ def compute_energy_score(samples, actual):
     
     energy_score = term1 - term2
     
+    if verbose:
+        print(f"  Energy Score 完成: {energy_score:.4f}")
+    
     return energy_score
 
 
-def compute_acf(samples, actual, max_lag=24):
+def compute_acf(samples, actual, max_lag=24, verbose=False):
     """
     论文公式15: Autocorrelation Coefficient (ACF)
     
@@ -215,12 +227,16 @@ def compute_acf(samples, actual, max_lag=24):
         samples: (N, n_samples, L) 生成的场景
         actual: (N, L) 实际值
         max_lag: 最大滞后阶数
+        verbose: 是否打印进度
     Returns:
         acf_actual: 实际值的ACF
         acf_samples_mean: 生成场景的平均ACF
         acf_samples_std: 生成场景的ACF标准差
     """
     N, n_samples, L = samples.shape
+    
+    if verbose:
+        print(f"  计算ACF (N={N}, n_samples={n_samples}, max_lag={max_lag})...")
     
     # 计算实际值的ACF
     acf_actual = np.zeros(max_lag)
@@ -240,6 +256,9 @@ def compute_acf(samples, actual, max_lag=24):
                         acf_values.append(numerator / denominator)
             acf_actual[lag] = np.mean(acf_values) if acf_values else 0
     
+    if verbose:
+        print(f"    实际值ACF完成")
+    
     # 计算生成场景的ACF
     acf_samples = np.zeros((n_samples, max_lag))
     for s in range(n_samples):
@@ -257,9 +276,15 @@ def compute_acf(samples, actual, max_lag=24):
                         if denominator > 0:
                             acf_values.append(numerator / denominator)
                 acf_samples[s, lag] = np.mean(acf_values) if acf_values else 0
+        
+        if verbose and (s + 1) % 10 == 0:
+            print(f"    场景ACF进度: {s+1}/{n_samples}")
     
     acf_samples_mean = np.mean(acf_samples, axis=0)
     acf_samples_std = np.std(acf_samples, axis=0)
+    
+    if verbose:
+        print(f"  ACF完成, MAE: {np.mean(np.abs(acf_actual - acf_samples_mean)):.4f}")
     
     return acf_actual, acf_samples_mean, acf_samples_std
 
@@ -296,7 +321,7 @@ def evaluate_all(samples, actual, quantiles=[1.0, 0.9, 0.8]):
     return metrics
 
 
-def evaluate_multichannel(samples, actual, channel_names=['wind', 'solar', 'load'], quantiles=[1.0, 0.9, 0.8], agg_method='median'):
+def evaluate_multichannel(samples, actual, channel_names=['wind', 'solar', 'load'], quantiles=[1.0, 0.9, 0.8], agg_method='median', verbose=True):
     """
     多通道完整评估：计算回归指标 + 场景指标
     
@@ -306,32 +331,46 @@ def evaluate_multichannel(samples, actual, channel_names=['wind', 'solar', 'load
         channel_names: 通道名称
         quantiles: 分位数列表
         agg_method: 回归指标聚合方法
+        verbose: 是否打印进度
     Returns:
         metrics: 包含所有评估指标的字典
     """
     N, n_samples, C, L = samples.shape
     metrics = {}
     
+    if verbose:
+        print(f"\n开始评估 (N={N}, n_samples={n_samples}, C={C})...")
+    
     # 1. 回归指标（R²、RMSE、MAE）
+    if verbose:
+        print("  计算回归指标 (R², RMSE, MAE)...")
     reg_metrics = compute_regression_metrics_multichannel(samples, actual, channel_names, agg_method)
     metrics.update(reg_metrics)
+    if verbose:
+        print(f"  回归指标完成: R²={metrics['total_r2']:.4f}")
     
     # 2. 场景指标（论文公式）
     for c, name in enumerate(channel_names):
+        if verbose:
+            print(f"\n  【{name.capitalize()}】场景指标计算...")
         samples_c = samples[:, :, c, :]  # (N, n_samples, L)
         actual_c = actual[:, c, :]  # (N, L)
         
         # Energy Score
-        metrics[f'{name}_energy_score'] = compute_energy_score(samples_c, actual_c)
+        metrics[f'{name}_energy_score'] = compute_energy_score(samples_c, actual_c, verbose=verbose)
         
         # Coverage和Width
+        if verbose:
+            print(f"  计算Coverage和Width...")
         for q in quantiles:
             q_name = f'{int(q*100)}%'
             metrics[f'{name}_coverage_{q_name}'] = compute_coverage_rate(samples_c, actual_c, q)
             metrics[f'{name}_width_{q_name}'] = compute_scenario_width(samples_c, actual_c, q)
+        if verbose:
+            print(f"    Coverage(100%): {metrics[f'{name}_coverage_100%']:.2f}%")
         
         # ACF
-        acf_actual, acf_mean, acf_std = compute_acf(samples_c, actual_c, max_lag=24)
+        acf_actual, acf_mean, acf_std = compute_acf(samples_c, actual_c, max_lag=24, verbose=verbose)
         metrics[f'{name}_acf_actual'] = acf_actual
         metrics[f'{name}_acf_mean'] = acf_mean
         metrics[f'{name}_acf_std'] = acf_std
@@ -361,11 +400,20 @@ def print_metrics(metrics, channel_names=['wind', 'solar', 'load']):
     
     # 2. 场景指标（总体）
     print("\n【场景指标 - 总体】")
-    print(f"  Energy Score:  {metrics.get('total_energy_score', metrics.get('energy_score', 'N/A')):.4f}")
-    print(f"  Coverage (100%): {metrics.get('total_coverage_100%', metrics.get('coverage_100%', 'N/A')):.2f}%")
-    print(f"  Coverage (90%):  {metrics.get('total_coverage_90%', 'N/A'):.2f}%")
-    print(f"  Width (100%):    {metrics.get('total_width_100%', metrics.get('width_100%', 'N/A')):.2f}%")
-    print(f"  ACF MAE:         {metrics.get('total_acf_mae', metrics.get('acf_mae', 'N/A')):.4f}")
+    es = metrics.get('total_energy_score', metrics.get('energy_score'))
+    print(f"  Energy Score:  {es:.4f}" if es is not None else "  Energy Score:  N/A")
+    
+    cov100 = metrics.get('total_coverage_100%', metrics.get('coverage_100%'))
+    print(f"  Coverage (100%): {cov100:.2f}%" if cov100 is not None else "  Coverage (100%): N/A")
+    
+    cov90 = metrics.get('total_coverage_90%')
+    print(f"  Coverage (90%):  {cov90:.2f}%" if cov90 is not None else "  Coverage (90%):  N/A")
+    
+    w100 = metrics.get('total_width_100%', metrics.get('width_100%'))
+    print(f"  Width (100%):    {w100:.2f}%" if w100 is not None else "  Width (100%):    N/A")
+    
+    acf = metrics.get('total_acf_mae', metrics.get('acf_mae'))
+    print(f"  ACF MAE:         {acf:.4f}" if acf is not None else "  ACF MAE:         N/A")
     
     # 3. 各通道详细指标
     for name in channel_names:
