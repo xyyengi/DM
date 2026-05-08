@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 
 # 导入项目模块
 from dataset_multivariate import MultiChannelWindScenarioDataset, get_dataloader_multivariate
-from diff_models_multivariate import ConditionalUNet, GaussianDiffusion
+from diff_models_multivariate import ResUNet, GaussianDiffusionMultivariate, MultiChannelCSDI
 
 
 def check_data_loading(data_path='./input_4.27/'):
@@ -96,7 +96,7 @@ def check_model_generation(exp_folder, dataset, device='cuda'):
         state_dict = checkpoint
     
     # 创建模型
-    model = ConditionalUNet(
+    model = ResUNet(
         in_channels=14,
         out_channels=3,
         base_channels=128,
@@ -109,7 +109,7 @@ def check_model_generation(exp_folder, dataset, device='cuda'):
     print(f"✓ 模型加载成功")
     
     # 创建扩散模型
-    diffusion = GaussianDiffusion(
+    diffusion = GaussianDiffusionMultivariate(
         model,
         num_steps=50,
         beta_start=0.0001,
@@ -132,31 +132,19 @@ def check_model_generation(exp_folder, dataset, device='cuda'):
     print(f"  forecast_3ch: {forecast_3ch.shape}")
     print(f"  cond_matrix: {cond_matrix.shape}")
     
-    # 生成
+    # 生成 - 使用diffusion的sample方法
     with torch.no_grad():
-        # 从纯噪声开始
-        x_t = torch.randn(1, 3, 168).to(device)
+        # 准备条件
+        cond_full = torch.cat([forecast_3ch, time_encoding], dim=1)  # (1, 11, 168)
         
-        # 逐步去噪
-        for t in reversed(range(50)):
-            t_tensor = torch.tensor([t], device=device)
-            
-            # 条件引导
-            guidance_scale = 1.0
-            c_down = cond_matrix[:, :, :, 0]  # (1, 3, 168)
-            c_up = cond_matrix[:, :, :, 1]  # (1, 3, 168)
-            
-            # 预测噪声
-            noise_pred = model(x_t, t_tensor, forecast_3ch, cond_matrix)
-            
-            # 简单去噪步骤
-            alpha = 1.0 - (t / 50) * 0.9
-            x_t = (x_t - (1 - alpha) * noise_pred) / alpha
-            
-            # 条件约束
-            x_t = torch.clamp(x_t, c_down - 0.1, c_up + 0.1)
-    
-    generated = x_t.cpu().numpy()[0]  # (3, 168)
+        # 创建简单的时间特征 (使用位置编码)
+        from diff_models_multivariate import SinusoidalPositionEmbedding
+        pos_embed = SinusoidalPositionEmbedding(d_time=64).to(device)
+        time_feat = pos_embed(torch.arange(168, device=device).unsqueeze(0))  # (1, 168, 64)
+        
+        # 使用diffusion.sample生成
+        samples = diffusion.sample(cond_full, cond_matrix, time_feat, n_samples=1)
+        generated = samples[0, 0].cpu().numpy()  # (3, 168)
     
     print(f"\n生成结果:")
     print(f"  shape: {generated.shape}")
