@@ -95,27 +95,29 @@ def check_model_generation(exp_folder, dataset, device='cuda'):
     else:
         state_dict = checkpoint
     
-    # 创建模型
-    model = ResUNet(
-        in_channels=14,
-        out_channels=3,
-        base_channels=128,
-        num_layers=4,
-        d_time=64
+    # 从checkpoint的config创建完整模型
+    ckpt_config = checkpoint.get('config', {})
+    
+    # 创建完整的MultiChannelCSDI模型
+    model = MultiChannelCSDI(
+        config=ckpt_config if ckpt_config else {
+            'in_channels': 14,
+            'out_channels': 3,
+            'base_channels': 128,
+            'num_layers': 4,
+            'd_time': 64,
+            'num_steps': 50,
+            'beta_start': 0.0001,
+            'beta_end': 0.5,
+            'schedule': 'quad',
+            'guidance_scale': 1.0
+        },
+        device=device
     ).to(device)
     
     model.load_state_dict(state_dict)
     model.eval()
-    print(f"✓ 模型加载成功")
-    
-    # 创建扩散模型
-    diffusion = GaussianDiffusionMultivariate(
-        model,
-        num_steps=50,
-        beta_start=0.0001,
-        beta_end=0.5,
-        schedule='quad'
-    ).to(device)
+    print(f"✓ MultiChannelCSDI模型加载成功")
     
     # 测试生成
     print(f"\n测试生成...")
@@ -132,18 +134,18 @@ def check_model_generation(exp_folder, dataset, device='cuda'):
     print(f"  forecast_3ch: {forecast_3ch.shape}")
     print(f"  cond_matrix: {cond_matrix.shape}")
     
-    # 生成 - 使用diffusion的sample方法
+    # 生成 - 使用MultiChannelCSDI的generate方法
     with torch.no_grad():
-        # 准备条件
-        cond_full = torch.cat([forecast_3ch, time_encoding], dim=1)  # (1, 11, 168)
+        # 准备batch
+        batch = {
+            'forecast_3ch': forecast_3ch,
+            'time_encoding': time_encoding,
+            'cond_matrix': cond_matrix,
+            'timepoints': torch.arange(168, device=device).unsqueeze(0).float()
+        }
         
-        # 创建简单的时间特征 (使用位置编码)
-        from diff_models_multivariate import SinusoidalPositionEmbedding
-        pos_embed = SinusoidalPositionEmbedding(d_time=64).to(device)
-        time_feat = pos_embed(torch.arange(168, device=device).unsqueeze(0))  # (1, 168, 64)
-        
-        # 使用diffusion.sample生成
-        samples = diffusion.sample(cond_full, cond_matrix, time_feat, n_samples=1)
+        # 使用model.generate生成
+        samples = model.generate(batch, n_samples=1)
         generated = samples[0, 0].cpu().numpy()  # (3, 168)
     
     print(f"\n生成结果:")
