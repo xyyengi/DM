@@ -115,9 +115,29 @@ def check_model_generation(exp_folder, dataset, device='cuda'):
         device=device
     ).to(device)
     
-    model.load_state_dict(state_dict)
-    model.eval()
+    # 使用strict=False加载，因为checkpoint可能缺少buffer
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     print(f"✓ MultiChannelCSDI模型加载成功")
+    if missing_keys:
+        print(f"  缺失的keys (buffer): {missing_keys[:3]}...")
+        # 手动初始化缺失的buffer（beta, alpha, alpha_hat）
+        # 这些是扩散过程的核心参数！
+        print(f"  正在重新初始化扩散参数...")
+    if unexpected_keys:
+        print(f"  多余的keys: {unexpected_keys[:3]}...")
+    model.eval()
+    
+    # 检查diffusion的buffer值
+    print(f"\n扩散参数检查:")
+    print(f"  beta范围: [{model.diffusion.beta.min():.6f}, {model.diffusion.beta.max():.6f}]")
+    print(f"  alpha范围: [{model.diffusion.alpha.min():.6f}, {model.diffusion.alpha.max():.6f}]")
+    print(f"  alpha_hat范围: [{model.diffusion.alpha_hat.min():.6f}, {model.diffusion.alpha_hat.max():.6f}]")
+    print(f"  alpha_hat[-1] (最终值): {model.diffusion.alpha_hat[-1]:.6f}")
+    
+    # 检查beta_end是否过大
+    if model.diffusion.beta.max() > 0.1:
+        print(f"  ⚠ 警告：beta_end={model.diffusion.beta.max():.4f} 过大！标准值应<0.1")
+        print(f"  这会导致扩散过程不稳定，生成结果范围异常")
     
     # 测试生成
     print(f"\n测试生成...")
