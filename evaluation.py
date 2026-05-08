@@ -1,111 +1,23 @@
-#!/usr/bin/env python
+wo#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
 多变量协同条件扩散模型 - 评估模块
 
-包含两类评估指标：
-1. 回归指标：R²、RMSE、MAE（评估场景均值/中位数的预测能力）
-2. 场景指标：Coverage、Width、Energy Score、ACF（论文公式12-15）
-3. 专业场景指标：CRPS、多变量Energy Score、分位数偏差
+核心场景指标：
+1. Coverage Rate: 真实值落在预测区间内的比例
+2. Scenario Width: 预测区间宽度（不确定性范围）
+3. Energy Score: 评估概率分布整体质量
+4. CRPS: CDF与真实值的距离
+5. 多变量Energy Score: 风、光、负荷三者联合分布评估
+6. ACF: 时间序列自相关结构保留（辅助验证）
 
-专业指标说明：
-- CRPS (Continuous Ranked Probability Score): 评估CDF与真实值的距离
-- 多变量Energy Score: 评估风、光、负荷三者联合分布
-- 分位数偏差: 检查5%和95%分位数位置的准确度
+移除的指标：
+- 回归指标（R², RMSE, MAE）：场景生成不是确定性预测任务
+- 分位数偏差：与Coverage/可靠性信息重叠
 """
 
 import numpy as np
 from scipy import stats
-from scipy.integrate import trapezoid
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-
-# 尝试导入properscoring库（可选）
-try:
-    from properscoring import crps_quadrature
-    HAS_PROPERSCORING = True
-except ImportError:
-    HAS_PROPERSCORING = False
-    print("提示: 未安装properscoring库，将使用手动实现的CRPS")
-
-
-# ==================== 回归指标 ====================
-
-def compute_regression_metrics(samples, actual, agg_method='median'):
-    """
-    计算回归指标（R²、RMSE、MAE）
-    
-    将多个场景聚合为单一预测值，然后计算与实际值的回归指标
-    
-    Args:
-        samples: (N, n_samples, L) 生成的场景
-        actual: (N, L) 实际值
-        agg_method: 聚合方法 ('median', 'mean', 'mean_of_middle')
-    Returns:
-        dict: 包含R²、RMSE、MAE的字典
-    """
-    N, n_samples, L = samples.shape
-    
-    # 聚合场景为单一预测
-    if agg_method == 'median':
-        predicted = np.median(samples, axis=1)  # (N, L)
-    elif agg_method == 'mean':
-        predicted = np.mean(samples, axis=1)  # (N, L)
-    elif agg_method == 'mean_of_middle':
-        # 取中间50%的场景均值
-        sorted_samples = np.sort(samples, axis=1)
-        mid_start = int(n_samples * 0.25)
-        mid_end = int(n_samples * 0.75)
-        predicted = np.mean(sorted_samples[:, mid_start:mid_end, :], axis=1)
-    else:
-        predicted = np.median(samples, axis=1)
-    
-    # 展平为一维
-    actual_flat = actual.flatten()
-    predicted_flat = predicted.flatten()
-    
-    # 计算指标
-    r2 = r2_score(actual_flat, predicted_flat)
-    rmse = np.sqrt(mean_squared_error(actual_flat, predicted_flat))
-    mae = mean_absolute_error(actual_flat, predicted_flat)
-    
-    return {
-        'r2': r2,
-        'rmse': rmse,
-        'mae': mae,
-        'agg_method': agg_method
-    }
-
-
-def compute_regression_metrics_multichannel(samples, actual, channel_names=['wind', 'solar', 'load'], agg_method='median'):
-    """
-    多通道回归指标
-    
-    Args:
-        samples: (N, n_samples, C, L) 生成的场景
-        actual: (N, C, L) 实际值
-        channel_names: 通道名称
-        agg_method: 聚合方法
-    Returns:
-        dict: 包含所有通道回归指标的字典
-    """
-    N, n_samples, C, L = samples.shape
-    metrics = {}
-    
-    for c, name in enumerate(channel_names):
-        samples_c = samples[:, :, c, :]  # (N, n_samples, L)
-        actual_c = actual[:, c, :]  # (N, L)
-        
-        reg_metrics = compute_regression_metrics(samples_c, actual_c, agg_method)
-        metrics[f'{name}_r2'] = reg_metrics['r2']
-        metrics[f'{name}_rmse'] = reg_metrics['rmse']
-        metrics[f'{name}_mae'] = reg_metrics['mae']
-    
-    # 总体指标
-    metrics['total_r2'] = np.mean([metrics[f'{name}_r2'] for name in channel_names])
-    metrics['total_rmse'] = np.mean([metrics[f'{name}_rmse'] for name in channel_names])
-    metrics['total_mae'] = np.mean([metrics[f'{name}_mae'] for name in channel_names])
-    
-    return metrics
 
 
 # ==================== 场景指标（论文公式） ====================
@@ -336,16 +248,15 @@ def evaluate_all(samples, actual, quantiles=[1.0, 0.9, 0.8]):
     return metrics
 
 
-def evaluate_multichannel(samples, actual, channel_names=['wind', 'solar', 'load'], quantiles=[1.0, 0.9, 0.8], agg_method='median', verbose=True):
+def evaluate_multichannel(samples, actual, channel_names=['wind', 'solar', 'load'], quantiles=[1.0, 0.9, 0.8], verbose=True):
     """
-    多通道完整评估：计算回归指标 + 场景指标
+    多通道完整评估：核心场景指标
     
     Args:
         samples: (N, n_samples, C, L) 生成的场景
         actual: (N, C, L) 实际值
         channel_names: 通道名称
         quantiles: 分位数列表
-        agg_method: 回归指标聚合方法
         verbose: 是否打印进度
     Returns:
         metrics: 包含所有评估指标的字典
@@ -356,73 +267,41 @@ def evaluate_multichannel(samples, actual, channel_names=['wind', 'solar', 'load
     if verbose:
         print(f"\n开始评估 (N={N}, n_samples={n_samples}, C={C})...")
     
-    # 1. 回归指标（R²、RMSE、MAE）
+    # 1. 多变量Energy Score（联合分布 - 最重要）
     if verbose:
-        print("  计算回归指标 (R², RMSE, MAE)...")
-    reg_metrics = compute_regression_metrics_multichannel(samples, actual, channel_names, agg_method)
-    metrics.update(reg_metrics)
-    if verbose:
-        print(f"  回归指标完成: R²={metrics['total_r2']:.4f}")
+        print("  【多变量联合分布】...")
+    metrics['multivariate_es'] = compute_multivariate_energy_score(samples, actual, verbose=verbose)
     
-    # 2. 场景指标（论文公式）
+    # 2. 各通道场景指标
     for c, name in enumerate(channel_names):
         if verbose:
-            print(f"\n  【{name.capitalize()}】场景指标计算...")
+            print(f"\n  【{name.capitalize()}】...")
         samples_c = samples[:, :, c, :]  # (N, n_samples, L)
         actual_c = actual[:, c, :]  # (N, L)
         
-        # Energy Score
+        # CRPS
+        metrics[f'{name}_crps'] = compute_crps(samples_c, actual_c, verbose=verbose)
+        
+        # Energy Score (单通道)
         metrics[f'{name}_energy_score'] = compute_energy_score(samples_c, actual_c, verbose=verbose)
         
         # Coverage和Width
-        if verbose:
-            print(f"  计算Coverage和Width...")
         for q in quantiles:
             q_name = f'{int(q*100)}%'
             metrics[f'{name}_coverage_{q_name}'] = compute_coverage_rate(samples_c, actual_c, q)
             metrics[f'{name}_width_{q_name}'] = compute_scenario_width(samples_c, actual_c, q)
-        if verbose:
-            print(f"    Coverage(100%): {metrics[f'{name}_coverage_100%']:.2f}%")
         
-        # ACF
-        acf_actual, acf_mean, acf_std = compute_acf(samples_c, actual_c, max_lag=24, verbose=verbose)
-        metrics[f'{name}_acf_actual'] = acf_actual
-        metrics[f'{name}_acf_mean'] = acf_mean
-        metrics[f'{name}_acf_std'] = acf_std
-        metrics[f'{name}_acf_mae'] = np.mean(np.abs(acf_actual - acf_mean))
-    
-    # 3. 专业场景指标（CRPS、多变量ES、分位数偏差）
-    if verbose:
-        print("\n  【专业场景指标】...")
-    
-    # 多变量Energy Score（联合分布）
-    metrics['multivariate_es'] = compute_multivariate_energy_score(samples, actual, verbose=verbose)
-    
-    # 各通道CRPS
-    for c, name in enumerate(channel_names):
-        samples_c = samples[:, :, c, :]
-        actual_c = actual[:, c, :]
-        metrics[f'{name}_crps'] = compute_crps(samples_c, actual_c, verbose=verbose)
-    
-    metrics['total_crps'] = np.mean([metrics[f'{name}_crps'] for name in channel_names])
-    
-    # 分位数偏差（5%和95%）
-    for c, name in enumerate(channel_names):
-        samples_c = samples[:, :, c, :]
-        actual_c = actual[:, c, :]
-        qd_dict = compute_quantile_deviation(samples_c, actual_c, quantiles=[0.05, 0.95], verbose=verbose)
-        for k, v in qd_dict.items():
-            metrics[f'{name}_{k}'] = v
-    
-    # 可靠性检查（80%、90%、95%置信区间）
-    for c, name in enumerate(channel_names):
-        samples_c = samples[:, :, c, :]
-        actual_c = actual[:, c, :]
+        # 可靠性检查（80%、90%、95%置信区间）
         reliability_dict = compute_reliability(samples_c, actual_c, confidence_levels=[0.80, 0.90, 0.95], verbose=verbose)
         for k, v in reliability_dict.items():
             metrics[f'{name}_{k}'] = v
+        
+        # ACF（辅助验证）
+        acf_actual, acf_mean, acf_std = compute_acf(samples_c, actual_c, max_lag=24, verbose=False)
+        metrics[f'{name}_acf_mae'] = np.mean(np.abs(acf_actual - acf_mean))
     
-    # 总体场景指标
+    # 3. 总体指标
+    metrics['total_crps'] = np.mean([metrics[f'{name}_crps'] for name in channel_names])
     metrics['total_energy_score'] = np.mean([metrics[f'{name}_energy_score'] for name in channel_names])
     metrics['total_coverage_100%'] = np.mean([metrics[f'{name}_coverage_100%'] for name in channel_names])
     metrics['total_width_100%'] = np.mean([metrics[f'{name}_width_100%'] for name in channel_names])
@@ -550,55 +429,6 @@ def compute_multivariate_energy_score(samples, actual, verbose=False):
     return es_value
 
 
-def compute_quantile_deviation(samples, actual, quantiles=[0.05, 0.95], verbose=False):
-    """
-    分位数偏差 (Quantile Deviation)
-    
-    原理：检查生成场景在5%和95%分位数位置的准确度
-    
-    公式：QD_q = |quantile_q(samples) - quantile_q(actual)| / std(actual)
-    
-    Args:
-        samples: (N, n_samples, L) 生成的场景
-        actual: (N, L) 实际值
-        quantiles: 要检查的分位数列表
-        verbose: 是否打印进度
-    Returns:
-        qd_dict: 各分位数的偏差字典
-    """
-    N, n_samples, L = samples.shape
-    
-    if verbose:
-        print(f"  计算分位数偏差 (quantiles={quantiles})...")
-    
-    qd_dict = {}
-    
-    # 计算实际值的标准差（用于归一化）
-    actual_std = np.std(actual) if np.std(actual) > 0 else 1.0
-    
-    for q in quantiles:
-        # 计算生成场景的分位数
-        samples_q = np.quantile(samples, q, axis=1)  # (N, L)
-        
-        # 计算实际值的分位数（每个时间点）
-        actual_q = np.quantile(actual, q, axis=0) if N > 1 else np.quantile(actual, q)
-        
-        # 如果actual是单样本，需要特殊处理
-        if N == 1:
-            actual_q = actual  # 单点值
-        
-        # 计算偏差
-        deviation = np.abs(np.mean(samples_q) - np.mean(actual_q))
-        qd_normalized = deviation / actual_std
-        
-        qd_dict[f'qd_{int(q*100)}%'] = qd_normalized
-        
-        if verbose:
-            print(f"    {int(q*100)}%分位数偏差: {qd_normalized:.4f}")
-    
-    return qd_dict
-
-
 def compute_reliability(samples, actual, confidence_levels=[0.80, 0.90, 0.95], verbose=False):
     """
     可靠性/覆盖率检查
@@ -649,70 +479,48 @@ def compute_reliability(samples, actual, confidence_levels=[0.80, 0.90, 0.95], v
 
 
 def print_metrics(metrics, channel_names=['wind', 'solar', 'load']):
-    """打印评估指标（回归指标 + 场景指标 + 专业场景指标）"""
+    """打印核心场景指标"""
     print("\n" + "="*70)
     print("评估结果")
     print("="*70)
     
-    # 1. 回归指标（总体）
-    if 'total_r2' in metrics:
-        print("\n【回归指标 - 总体】")
-        print(f"  R²:   {metrics['total_r2']:.4f}")
-        print(f"  RMSE: {metrics['total_rmse']:.4f}")
-        print(f"  MAE:  {metrics['total_mae']:.4f}")
-    
-    # 2. 场景指标（总体）
-    print("\n【场景指标 - 总体】")
-    es = metrics.get('total_energy_score', metrics.get('energy_score'))
-    print(f"  Energy Score:  {es:.4f}" if es is not None else "  Energy Score:  N/A")
-    
-    cov100 = metrics.get('total_coverage_100%', metrics.get('coverage_100%'))
-    print(f"  Coverage (100%): {cov100:.2f}%" if cov100 is not None else "  Coverage (100%): N/A")
-    
-    cov90 = metrics.get('total_coverage_90%')
-    print(f"  Coverage (90%):  {cov90:.2f}%" if cov90 is not None else "  Coverage (90%):  N/A")
-    
-    w100 = metrics.get('total_width_100%', metrics.get('width_100%'))
-    print(f"  Width (100%):    {w100:.2f}%" if w100 is not None else "  Width (100%):    N/A")
-    
-    acf = metrics.get('total_acf_mae', metrics.get('acf_mae'))
-    print(f"  ACF MAE:         {acf:.4f}" if acf is not None else "  ACF MAE:         N/A")
-    
-    # 3. 专业场景指标（总体）
-    print("\n【专业场景指标 - 总体】")
+    # 1. 核心指标（总体）
+    print("\n【核心指标 - 总体】")
     if 'multivariate_es' in metrics:
         print(f"  多变量Energy Score (联合分布): {metrics['multivariate_es']:.4f}")
     if 'total_crps' in metrics:
         print(f"  CRPS (平均):                   {metrics['total_crps']:.4f}")
+    if 'total_energy_score' in metrics:
+        print(f"  Energy Score (单通道平均):     {metrics['total_energy_score']:.4f}")
+    if 'total_coverage_100%' in metrics:
+        print(f"  Coverage (100%):               {metrics['total_coverage_100%']:.2f}%")
+    if 'total_width_100%' in metrics:
+        print(f"  Width (100%):                  {metrics['total_width_100%']:.2f}%")
+    if 'total_acf_mae' in metrics:
+        print(f"  ACF MAE (辅助):                {metrics['total_acf_mae']:.4f}")
     
-    # 4. 各通道详细指标
+    # 2. 各通道详细指标
     for name in channel_names:
-        if f'{name}_energy_score' in metrics:
+        if f'{name}_crps' in metrics:
             print(f"\n【{name.capitalize()}】")
-            # 回归指标
-            if f'{name}_r2' in metrics:
-                print(f"  R²:   {metrics[f'{name}_r2']:.4f}")
-                print(f"  RMSE: {metrics[f'{name}_rmse']:.4f}")
-                print(f"  MAE:  {metrics[f'{name}_mae']:.4f}")
-            # 场景指标
+            print(f"  CRPS:            {metrics[f'{name}_crps']:.4f}")
             print(f"  Energy Score:    {metrics[f'{name}_energy_score']:.4f}")
             print(f"  Coverage (100%): {metrics[f'{name}_coverage_100%']:.2f}%")
             print(f"  Coverage (90%):  {metrics[f'{name}_coverage_90%']:.2f}%")
             print(f"  Width (100%):    {metrics[f'{name}_width_100%']:.2f}%")
             print(f"  ACF MAE:         {metrics[f'{name}_acf_mae']:.4f}")
-            # 专业指标
-            if f'{name}_crps' in metrics:
-                print(f"  CRPS:            {metrics[f'{name}_crps']:.4f}")
-            if f'{name}_qd_5%' in metrics:
-                print(f"  分位数偏差 (5%):  {metrics[f'{name}_qd_5%']:.4f}")
-            if f'{name}_qd_95%' in metrics:
-                print(f"  分位数偏差 (95%): {metrics[f'{name}_qd_95%']:.4f}")
             # 可靠性
             if f'{name}_coverage_80%' in metrics:
-                print(f"  可靠性 (80%区间): {metrics[f'{name}_coverage_80%']:.1f}% (理想80%)")
+                deviation = metrics.get(f'{name}_coverage_deviation_80%', 0)
+                status = "✓" if abs(deviation) < 5 else "⚠"
+                print(f"  可靠性 (80%区间): {metrics[f'{name}_coverage_80%']:.1f}% (理想80%) {status}")
             if f'{name}_coverage_90%' in metrics:
-                print(f"  可靠性 (90%区间): {metrics[f'{name}_coverage_90%']:.1f}% (理想90%)")
+                deviation = metrics.get(f'{name}_coverage_deviation_90%', 0)
+                status = "✓" if abs(deviation) < 5 else "⚠"
+                print(f"  可靠性 (90%区间): {metrics[f'{name}_coverage_90%']:.1f}% (理想90%) {status}")
             if f'{name}_coverage_95%' in metrics:
-                print(f"  可靠性 (95%区间): {metrics[f'{name}_coverage_95%']:.1f}% (理想95%)")
+                deviation = metrics.get(f'{name}_coverage_deviation_95%', 0)
+                status = "✓" if abs(deviation) < 5 else "⚠"
+                print(f"  可靠性 (95%区间): {metrics[f'{name}_coverage_95%']:.1f}% (理想95%) {status}")
     
     print("="*70)

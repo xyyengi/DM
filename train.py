@@ -16,6 +16,11 @@ from datetime import datetime
 
 from dataset_multivariate import get_dataloader_multivariate
 from diff_models_multivariate import MultiChannelCSDI
+import math
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 
 class EarlyStopping:
@@ -142,9 +147,36 @@ def train(model, train_loader, val_loader, config, device, exp_folder, save_ever
     
     print(f"开始训练: epochs={epochs}, patience={patience}")
     
-    with open(log_file, 'w') as f:
+    # 记录 loss 曲线
+    train_losses = []
+    val_losses = []
+
+    with open(log_file, 'w', encoding='utf-8') as f:
         f.write(f"训练开始: {datetime.now()}\nEpochs: {epochs}\nPatience: {patience}\n")
         f.write(f"LR: {lr}\nLR Scheduler: {use_lr_scheduler}\n\n")
+
+    # 计算并打印 alpha_hat[-1]（用于检查噪声强度）
+    mcfg = config.get('model', {})
+    T_check = mcfg.get('num_steps', 50)
+    beta_start = mcfg.get('beta_start', 0.0001)
+    beta_end = mcfg.get('beta_end', 0.02)
+    schedule = mcfg.get('schedule', 'quad')
+    if schedule == 'quad':
+        beta_vec = np.linspace(beta_start**0.5, beta_end**0.5, T_check) ** 2
+    else:
+        beta_vec = np.linspace(beta_start, beta_end, T_check)
+    alpha = 1.0 - beta_vec
+    alpha_hat = np.cumprod(alpha)
+    alpha_hat_last = float(alpha_hat[-1])
+    print(f"alpha_hat[-1] (T={T_check}, schedule={schedule}): {alpha_hat_last:.6e}")
+    with open(log_file, 'a', encoding='utf-8') as f:
+        f.write(f"alpha_hat_last: {alpha_hat_last}\n")
+    if alpha_hat_last > 0.001:
+        warn_msg = ("WARNING: alpha_hat[-1] > 0.001 — the final signal retention is large; "
+                    "noise may be too small. Consider increasing beta_end.")
+        print(warn_msg)
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(warn_msg + "\n")
     
     for epoch in range(epochs):
         # ========== 训练阶段 ==========
@@ -157,6 +189,7 @@ def train(model, train_loader, val_loader, config, device, exp_folder, save_ever
             optimizer.step()
             train_loss += loss.item()
         avg_train_loss = train_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
         
         # ========== 验证阶段 ==========
         model.eval()
@@ -166,6 +199,7 @@ def train(model, train_loader, val_loader, config, device, exp_folder, save_ever
                 loss = model(batch)
                 val_loss += loss.item()
         avg_val_loss = val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
         
         # ========== 日志记录 ==========
         current_lr = optimizer.param_groups[0]['lr']
@@ -176,7 +210,7 @@ def train(model, train_loader, val_loader, config, device, exp_folder, save_ever
             if scheduler:
                 print(f"  学习率: {current_lr:.6f}")
         
-        with open(log_file, 'a') as f:
+        with open(log_file, 'a', encoding='utf-8') as f:
             f.write(f"Epoch {epoch+1}: Train={avg_train_loss:.4f}, Val={avg_val_loss:.4f}, LR={current_lr:.6f}\n")
         
         # ========== 早停检查 ==========
@@ -209,7 +243,112 @@ def train(model, train_loader, val_loader, config, device, exp_folder, save_ever
                 'config': config
             }, os.path.join(exp_folder, 'checkpoints', f'model_epoch_{epoch+1}.pt'))
     
+    # ========== 训练结束：绘制 Loss 曲线并检查是否过拟合 ==========
+    loss_plot_path = os.path.join(exp_folder, 'logs', 'loss_curve.png')
+    try:
+        plot_loss_curve(train_losses, val_losses, loss_plot_path)
+        # 检查验证集loss是否有“不降反升”趋势
+        min_val = min(val_losses) if val_losses else float('inf')
+        final_val = val_losses[-1] if val_losses else None
+        overfit = False
+        if final_val is not None and final_val > min_val + 1e-4:
+            overfit = True
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(f"Loss plot saved: {loss_plot_path}\n")
+                f.write(f"Val min: {min_val:.6f}, Val final: {final_val:.6f}, Overfit: {overfit}\n")
+        print(f"Loss plot saved to {loss_plot_path}. Overfitting detected: {overfit}")
+    except Exception as e:
+        print('Failed to plot loss curve:', e)
+
     return early_stopping.best_epoch
+
+
+def plot_loss_curve(train_losses, val_losses, save_path):
+    plt.figure(figsize=(8, 5))
+    epochs = np.arange(1, len(train_losses) + 1)
+    plt.plot(epochs, train_losses, label='Train Loss')
+    plt.plot(epochs, val_losses, label='Val Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
+
+def visualize_sampling_progress(model, batch, device, exp_folder, record_steps=None, n_samples=1):
+    """
+    记录并绘制一次采样过程中指定时间步的 x_t 波形。
+    record_steps: list of integer timesteps to record (e.g., [499,249,99,49,0])
+    """
+    if record_steps is None:
+        record_steps = [model.diffusion.num_steps - 1, model.diffusion.num_steps // 2,
+                        max(0, model.diffusion.num_steps // 5), max(0, model.diffusion.num_steps // 10), 0]
+
+    model.eval()
+    # 准备条件
+    forecast_3ch = batch['forecast_3ch'].to(device)
+    time_encoding = batch['time_encoding'].to(device)
+    cond_full = torch.cat([forecast_3ch, time_encoding], dim=1)
+    cond_matrix = batch['cond_matrix'].to(device)
+    timepoints = batch['timepoints'].to(device)
+    time_feat = model.get_time_features(timepoints)
+
+    B = cond_full.shape[0]
+    rec = {t: [] for t in record_steps}
+
+    with torch.no_grad():
+        for s in range(n_samples):
+            x_t = torch.randn(B, 3, cond_full.shape[-1], device=device)
+            for t in range(model.diffusion.num_steps - 1, -1, -1):
+                if t in record_steps:
+                    rec[t].append(x_t.detach().cpu().numpy())
+                x_t = model.diffusion.denoise_step(x_t, t, cond_full, cond_matrix, time_feat)
+            # final
+            if 0 in record_steps:
+                rec[0].append(x_t.detach().cpu().numpy())
+
+    # 选择第一个样本的记录绘图
+    steps_sorted = sorted(record_steps, reverse=True)
+    sample0 = {t: np.squeeze(np.array(rec[t])[0], axis=0) for t in steps_sorted}
+
+    # 绘制：3行 x len(steps)列
+    n_cols = len(steps_sorted)
+    fig, axes = plt.subplots(3, n_cols, figsize=(3 * n_cols, 9))
+    for i, t in enumerate(steps_sorted):
+        data = sample0[t]  # shape (3, L)
+        L = data.shape[1]
+        for ch in range(3):
+            ax = axes[ch, i] if n_cols > 1 else axes[ch]
+            ax.plot(np.arange(L), data[ch], lw=1)
+            if ch == 0:
+                ax.set_title(f't={t}')
+            if i == 0:
+                ax.set_ylabel(f'Channel {ch}')
+            ax.grid(True)
+    plt.tight_layout()
+    out_path = os.path.join(exp_folder, 'logs', 'sampling_progress.png')
+    fig.savefig(out_path)
+    plt.close(fig)
+
+    # 统计最终生成样本的物理边界
+    final = sample0[0]  # (3, L)
+    stats = {
+        'min': float(final.min()),
+        'max': float(final.max()),
+        'mean': float(final.mean())
+    }
+    with open(os.path.join(exp_folder, 'logs', 'sampling_stats.txt'), 'w', encoding='utf-8') as f:
+        f.write(str(stats) + '\n')
+
+    print('Sampling stats:', stats)
+    # 检查是否超出物理范围 [-1, 1]
+    if stats['min'] < -1.0 or stats['max'] > 1.0:
+        msg = 'WARNING: generated residuals exceed physical range [-1,1]'
+        print(msg)
+        with open(os.path.join(exp_folder, 'logs', 'sampling_stats.txt'), 'a', encoding='utf-8') as f:
+            f.write(msg + '\n')
 
 
 def main():
@@ -227,7 +366,7 @@ def main():
     args = parser.parse_args()
     
     # 加载配置
-    with open(args.config, 'r') as f:
+    with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     
     # 命令行参数覆盖
@@ -249,7 +388,7 @@ def main():
     
     # 训练
     exp_folder = create_experiment_folder(args.save_path, args.exp_name)
-    with open(os.path.join(exp_folder, 'config_used.yaml'), 'w') as f:
+    with open(os.path.join(exp_folder, 'config_used.yaml'), 'w', encoding='utf-8') as f:
         yaml.dump(config, f)
     
     best_epoch = train(model, train_loader, val_loader, config, device, exp_folder, 
@@ -258,6 +397,17 @@ def main():
     print(f"\n训练完成! 最佳epoch: {best_epoch}")
     print(f"模型保存: {exp_folder}/checkpoints/model_best.pt")
     print(f"\n提示: 使用 generate.py 在测试集上生成场景并计算评估指标")
+
+    # 采样过程深度可视化（记录若干中间时间步波形）
+    try:
+        val_iter = iter(val_loader)
+        sample_batch = next(val_iter)
+        record_steps = [model.diffusion.num_steps - 1, model.diffusion.num_steps // 2,
+                        max(0, model.diffusion.num_steps // 5), max(0, model.diffusion.num_steps // 10), 0]
+        visualize_sampling_progress(model, sample_batch, device, exp_folder, record_steps=record_steps, n_samples=1)
+        print(f"采样进程图已保存到: {os.path.join(exp_folder, 'logs', 'sampling_progress.png')}")
+    except Exception as e:
+        print('采样可视化失败:', e)
 
 
 if __name__ == '__main__':

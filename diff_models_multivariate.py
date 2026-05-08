@@ -356,7 +356,7 @@ class GaussianDiffusionMultivariate(nn.Module):
     - ||·||_F: Frobenius范数
     """
     
-    def __init__(self, model, num_steps=50, beta_start=0.0001, beta_end=0.5,
+    def __init__(self, model, num_steps=500, beta_start=0.0001, beta_end=0.02,
                  schedule='quad', guidance_scale=1.0):
         super().__init__()
         
@@ -460,9 +460,12 @@ class GaussianDiffusionMultivariate(nn.Module):
         mean = (1 / alpha_t.sqrt()) * (x_t - (1 - alpha_t) / (1 - alpha_hat_t).sqrt() * predicted_noise)
         
         # 论文公式10: 条件梯度修正
+        # 添加时间步衰减：早期步骤梯度强度衰减，避免采样被过度约束
         if self.guidance_scale > 0:
+            # 时间步衰减系数: t 越小（越接近最后去噪），约束越强
+            t_decay = (t + 1) / self.num_steps if self.num_steps > 0 else 1.0
             cond_gradient = self.compute_conditional_gradient(x_t, cond_matrix, gamma=1.0)
-            mean = mean - self.guidance_scale * cond_gradient
+            mean = mean - self.guidance_scale * t_decay * cond_gradient
         
         # 添加噪声（除了最后一步）
         if t > 0:
@@ -503,7 +506,7 @@ class GaussianDiffusionMultivariate(nn.Module):
         
         return samples
     
-    def forward(self, x0, cond_full, time_feat, t=None):
+    def forward(self, x0, cond_full, time_feat, cond_matrix=None, t=None):
         """
         训练时的前向传播：计算损失
         
@@ -511,6 +514,7 @@ class GaussianDiffusionMultivariate(nn.Module):
             x0: (B, 3, 168) 原始残差数据 (Target Residuals)
             cond_full: (B, 11, 168) 条件部分 (Base Prediction + Time Encoding)
             time_feat: (B, 168, d_time) 时间特征
+            cond_matrix: (B, 3, 168, 2) KDE条件矩阵 (可选)
             t: 时间步（可选，随机采样）
         Returns:
             loss: 训练损失
@@ -530,6 +534,24 @@ class GaussianDiffusionMultivariate(nn.Module):
         
         # 预测噪声（模型输出3维）
         predicted_noise = self.model(input_14ch, time_feat)
+        
+        # 如果提供了条件矩阵，应用条件梯度修正（保证训练推理一致）
+        # 这样模型学到的是"在约束下的去噪"过程
+        if cond_matrix is not None:
+            # 计算去噪均值
+            alpha_t = self.alpha[t].view(-1, 1, 1)
+            alpha_hat_t = self.alpha_hat[t].view(-1, 1, 1)
+            mean = (1 / alpha_t.sqrt()) * (x_t - (1 - alpha_t) / (1 - alpha_hat_t).sqrt() * predicted_noise)
+            
+            # 应用条件梯度修正（带时间步衰减）
+            t_decay = (t.float() + 1) / self.num_steps if self.num_steps > 0 else 1.0
+            t_decay = t_decay.view(-1, 1, 1)
+            cond_gradient = self.compute_conditional_gradient(x_t, cond_matrix, gamma=1.0)
+            mean = mean - self.guidance_scale * t_decay * cond_gradient
+            
+            # 从修正后的均值反推预测噪声（用于损失计算）
+            # ε_pred = (√(1-ᾱ_t) / (1-α_t)) * (x_t - √α_t * mean)
+            predicted_noise = (1 - alpha_t) / (1 - alpha_hat_t).sqrt() * (x_t - alpha_t.sqrt() * mean)
         
         # 计算损失（MSE）
         loss = F.mse_loss(predicted_noise, noise)
@@ -591,10 +613,19 @@ class MultiChannelCSDI(nn.Module):
             model=self.unet,
             num_steps=config.get('num_steps', 50),
             beta_start=config.get('beta_start', 0.0001),
-            beta_end=config.get('beta_end', 0.5),
+            beta_end=config.get('beta_end', 0.02),
             schedule=config.get('schedule', 'quad'),
             guidance_scale=config.get('guidance_scale', 1.0)
         )
+        
+        # 保存配置用于一致性检查
+        self.diffusion_config = {
+            'num_steps': config.get('num_steps', 50),
+            'beta_start': config.get('beta_start', 0.0001),
+            'beta_end': config.get('beta_end', 0.02),
+            'schedule': config.get('schedule', 'quad'),
+            'guidance_scale': config.get('guidance_scale', 1.0)
+        }
         
     def get_time_features(self, timepoints):
         """
@@ -615,10 +646,10 @@ class MultiChannelCSDI(nn.Module):
         hour = (timepoints % 24).long()
         
         # 周几: (timepoints // 24) % 7
-        weekday = ((timepoints // 24) % 7).long()
+        weekday = (torch.div(timepoints, 24, rounding_mode='floor') % 7).long()
         
         # 月份: 假设数据跨度一年，简化处理
-        month = ((timepoints // (24 * 30)) % 12).long()
+        month = (torch.div(timepoints, 24 * 30, rounding_mode='floor') % 12).long()
         
         # 时间特征嵌入
         time_feat = self.time_feature_embed(hour, weekday, month)
@@ -660,8 +691,8 @@ class MultiChannelCSDI(nn.Module):
         # 获取时间特征
         time_feat = self.get_time_features(timepoints)
         
-        # 计算扩散损失
-        loss = self.diffusion(residual, cond_full, time_feat)
+        # 计算扩散损失（传入条件矩阵，保证训练推理一致）
+        loss = self.diffusion(residual, cond_full, time_feat, cond_matrix)
         
         return loss
     

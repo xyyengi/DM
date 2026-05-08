@@ -45,7 +45,7 @@ model:
   num_layers: 4
   
   # 扩散步数
-  num_steps: 50
+  num_steps: 500
   
   # Beta schedule
   # 注意：beta_end标准值应<0.1，过大会导致扩散过程不稳定
