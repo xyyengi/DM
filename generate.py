@@ -147,7 +147,13 @@ def main():
     parser.add_argument('--exp_name', default='wind_scenario', help='实验名称或文件夹名')
     parser.add_argument('--ckpt_epoch', type=int, default=None, help='指定epoch，默认使用最佳模型')
     parser.add_argument('--n_samples', type=int, default=10, help='生成样本数')
+    parser.add_argument('--list', action='store_true', help='列出所有可用实验')
     args = parser.parse_args()
+    
+    # 列出所有实验
+    if args.list:
+        list_experiments(args.save_path)
+        return
     
     # 查找实验文件夹
     if args.exp_name.startswith('run_'):
@@ -189,7 +195,17 @@ def main():
     # 模型
     model = MultiChannelCSDI(config['model'], device).to(device)
     checkpoint = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # 使用strict=False，因为beta/alpha/alpha_hat是buffer，已在模型初始化时创建
+    missing_keys, unexpected_keys = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    
+    if missing_keys:
+        # 过滤掉buffer相关的missing keys（这些是正常的）
+        buffer_keys = ['diffusion.beta', 'diffusion.alpha', 'diffusion.alpha_hat']
+        real_missing = [k for k in missing_keys if k not in buffer_keys]
+        if real_missing:
+            print(f"警告: 缺失关键参数 {real_missing}")
+    
     print(f"模型epoch: {checkpoint.get('epoch', 'unknown')}")
     
     # 生成
