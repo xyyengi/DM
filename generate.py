@@ -33,50 +33,93 @@ def find_experiment_folders(base_path, keyword=None):
 
 
 def list_experiments(base_path):
-    """列出所有实验及其最佳模型信息"""
+    """列出所有实验及其 checkpoint 概况（紧凑格式）"""
     folders = find_experiment_folders(base_path)
     if not folders:
         print("无实验记录")
         return
     
-    print("\n" + "="*70)
+    print("\n" + "="*110)
     print("可用实验列表")
-    print("="*70)
+    print("="*110)
+    print(f"{'实验文件夹':<48} | {'最新epoch':<14} | {'best (epoch, loss)':<35}")
+    print("-" * 110)
     
     for folder in sorted(folders, reverse=True):
         exp_path = os.path.join(base_path, folder)
-        ckpt_path = os.path.join(exp_path, 'checkpoints', 'model_best.pt')
-        
-        # 读取模型信息
-        if os.path.exists(ckpt_path):
-            ckpt = torch.load(ckpt_path, map_location='cpu')
+        ckpt_dir = os.path.join(exp_path, 'checkpoints')
+        best_path = os.path.join(ckpt_dir, 'model_best.pt')
+        epoch_ckpts = []
+
+        latest_info = "--"
+        if os.path.exists(ckpt_dir):
+            for name in os.listdir(ckpt_dir):
+                if name.startswith('model_epoch_') and name.endswith('.pt'):
+                    try:
+                        epoch = int(name.replace('model_epoch_', '').replace('.pt', ''))
+                        epoch_ckpts.append((epoch, os.path.join(ckpt_dir, name)))
+                    except ValueError:
+                        continue
+
+        if epoch_ckpts:
+            epoch_ckpts.sort(key=lambda item: item[0])
+            latest_epoch, latest_path = epoch_ckpts[-1]
+            latest_info = f"epoch {latest_epoch}"
+
+        best_info = "--"
+        if os.path.exists(best_path):
+            ckpt = torch.load(best_path, map_location='cpu')
             epoch = ckpt.get('epoch', 'unknown')
             val_loss = ckpt.get('val_loss', 'unknown')
-            print(f"  {folder}")
-            print(f"    最佳epoch: {epoch}, Val Loss: {val_loss:.4f}" if isinstance(val_loss, float) else f"    最佳epoch: {epoch}")
-        else:
-            print(f"  {folder} (无最佳模型)")
+            if isinstance(val_loss, float):
+                best_info = f"epoch {epoch}, loss {val_loss:.4f}"
+            else:
+                best_info = f"epoch {epoch}"
+
+        print(f"{folder:<48} | {latest_info:<14} | {best_info:<35}")
     
-    print("="*70)
+    print("="*110)
 
 
 def get_checkpoint_path(exp_folder, ckpt_type='best'):
-    """获取checkpoint路径"""
+    """获取checkpoint路径。
+
+    优先级：
+    1. 显式请求 best 时，优先返回 model_best.pt（如果存在）
+    2. 自动选择最新的 model_epoch_*.pt
+    3. 回退到 model_best.pt
+    4. 最后选取 checkpoints 目录中最新修改的 .pt 文件
+    """
     ckpt_path = os.path.join(exp_folder, 'checkpoints')
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"无checkpoint目录: {ckpt_path}")
+
+    epoch_ckpts = []
+    for name in os.listdir(ckpt_path):
+        if name.startswith('model_epoch_') and name.endswith('.pt'):
+            try:
+                epoch = int(name.replace('model_epoch_', '').replace('.pt', ''))
+                epoch_ckpts.append((epoch, os.path.join(ckpt_path, name)))
+            except ValueError:
+                continue
+
+    if epoch_ckpts:
+        epoch_ckpts.sort(key=lambda item: item[0])
+        latest_epoch_path = epoch_ckpts[-1][1]
+        if ckpt_type != 'best':
+            return latest_epoch_path
     
-    if ckpt_type == 'best':
-        path = os.path.join(ckpt_path, 'model_best.pt')
-        if os.path.exists(path):
-            return path
+    best_path = os.path.join(ckpt_path, 'model_best.pt')
+    if os.path.exists(best_path):
+        if ckpt_type == 'best' or not epoch_ckpts:
+            return best_path
     
-    # 选择最新的checkpoint
-    ckpts = [f for f in os.listdir(ckpt_path) if f.startswith('model_epoch_') and f.endswith('.pt')]
-    if not ckpts:
-        raise FileNotFoundError(f"无可用checkpoint")
-    ckpts.sort(key=lambda x: int(x.replace('model_epoch_', '').replace('.pt', '')))
-    return os.path.join(ckpt_path, ckpts[-1])
+    any_pt = [os.path.join(ckpt_path, f) for f in os.listdir(ckpt_path) if f.endswith('.pt')]
+    if any_pt:
+        any_pt.sort(key=lambda p: os.path.getmtime(p))
+        return any_pt[-1]
+
+    raise FileNotFoundError(f"无可用checkpoint: {ckpt_path}")
 
 
 def generate_scenarios(model, test_loader, device, n_samples=10):
@@ -170,8 +213,11 @@ def main():
     # 加载checkpoint
     if args.ckpt_epoch:
         ckpt_path = os.path.join(exp_folder, 'checkpoints', f'model_epoch_{args.ckpt_epoch}.pt')
+        if not os.path.exists(ckpt_path):
+            print(f"警告: 未找到指定 epoch checkpoint，改为自动选择最新文件: {ckpt_path}")
+            ckpt_path = get_checkpoint_path(exp_folder, 'latest')
     else:
-        ckpt_path = get_checkpoint_path(exp_folder, 'best')
+        ckpt_path = get_checkpoint_path(exp_folder, 'latest')
     
     print(f"加载模型: {ckpt_path}")
     
