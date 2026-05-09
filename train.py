@@ -353,31 +353,60 @@ def visualize_sampling_progress(model, batch, device, exp_folder, record_steps=N
 
 def main():
     parser = argparse.ArgumentParser(description='多变量协同条件扩散模型 - 训练')
+    # 基础参数
     parser.add_argument('--config', default='config/wind_scenario.yaml')
     parser.add_argument('--data_path', default='./input_4.27/')
     parser.add_argument('--save_path', default='./save/')
     parser.add_argument('--exp_name', default='wind_scenario')
-    parser.add_argument('--epochs', type=int, default=None)
-    parser.add_argument('--lr', type=float, default=None)
-    parser.add_argument('--batch_size', type=int, default=None)
-    parser.add_argument('--patience', type=int, default=5)
-    parser.add_argument('--save_every', type=int, default=50)
+    
+    # 训练参数（可命令行覆盖）
+    parser.add_argument('--epochs', type=int, default=None, help='训练轮数')
+    parser.add_argument('--lr', type=float, default=None, help='学习率')
+    parser.add_argument('--batch_size', type=int, default=None, help='批大小')
+    parser.add_argument('--patience', type=int, default=5, help='早停耐心值')
+    parser.add_argument('--save_every', type=int, default=50, help='每N轮保存模型')
     parser.add_argument('--use_lr_scheduler', action='store_true', help='启用学习率调度器')
+    
+    # 模型参数（可命令行覆盖）- 核心扩散参数
+    parser.add_argument('--beta_start', type=float, default=None, help='扩散beta起始值 (默认0.0001)')
+    parser.add_argument('--beta_end', type=float, default=None, help='扩散beta结束值 (默认0.02, 建议<0.1)')
+    parser.add_argument('--schedule', type=str, default=None, choices=['linear', 'quad', 'cosine'], help='beta调度方式')
+    parser.add_argument('--num_steps', type=int, default=None, help='扩散步数 (默认500)')
+    parser.add_argument('--base_channels', type=int, default=None, help='UNet基础通道数 (默认128)')
+    parser.add_argument('--num_layers', type=int, default=None, help='UNet层数 (默认4)')
+    parser.add_argument('--guidance_scale', type=float, default=None, help='条件引导强度 (默认1.0)')
+    parser.add_argument('--n_intervals', type=int, default=None, help='KDE区间数量 (默认10)')
+    
     args = parser.parse_args()
     
     # 加载配置
     with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     
-    # 命令行参数覆盖
+    # 命令行参数覆盖 - 训练参数
     if args.epochs: config['train']['epochs'] = args.epochs
     if args.lr: config['train']['lr'] = args.lr
     if args.batch_size: config['train']['batch_size'] = args.batch_size
+    
+    # 命令行参数覆盖 - 模型参数
+    if args.beta_start: config['model']['beta_start'] = args.beta_start
+    if args.beta_end: config['model']['beta_end'] = args.beta_end
+    if args.schedule: config['model']['schedule'] = args.schedule
+    if args.num_steps: config['model']['num_steps'] = args.num_steps
+    if args.base_channels: config['model']['base_channels'] = args.base_channels
+    if args.num_layers: config['model']['num_layers'] = args.num_layers
+    if args.guidance_scale: config['model']['guidance_scale'] = args.guidance_scale
+    if args.n_intervals: config['model']['n_intervals'] = args.n_intervals
+    
+    print(f"配置文件: {args.config}")
+    print(f"当前 beta_end: {config['model'].get('beta_end')}")
+    print(f"当前 schedule: {config['model'].get('schedule')}")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"设备: {device}")
     
     # 数据加载
+    print("正在加载数据...")
     train_loader, _, _ = get_dataloader_multivariate(
         args.data_path, config['train']['batch_size'], 'train', config['model']['n_intervals'])
     val_loader, _, _ = get_dataloader_multivariate(

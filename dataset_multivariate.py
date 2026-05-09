@@ -52,10 +52,12 @@ class MultiChannelKDE:
         
         for c in range(n_channels_kde):
             channel_name = ['wind', 'solar', 'load'][c]
+            print(f"    [KDE] fitting channel {c} ({channel_name})...")
             
             # 获取该通道的数据
             f_flat = forecast_data[:, :, c].flatten()
             e_flat = residual_data[:, :, c].flatten()
+            print(f"    [KDE] data size: {len(f_flat)} points")
             
             # 论文公式7: 按预测值划分区间
             percentiles = np.linspace(0, 100, self.n_intervals + 1)
@@ -72,14 +74,18 @@ class MultiChannelKDE:
                 
                 if len(interval_errors) > 10:
                     # 论文公式8: 核密度估计
+                    print(f"    [KDE] interval {i}: {len(interval_errors)} points, fitting...")
                     kde = stats.gaussian_kde(interval_errors)
                     self.kde_models[channel_name].append(kde)
                     self.error_stats[channel_name]['means'].append(np.mean(interval_errors))
                     self.error_stats[channel_name]['stds'].append(np.std(interval_errors))
+                    print(f"    [KDE] interval {i}: done")
                 else:
                     self.kde_models[channel_name].append(None)
                     self.error_stats[channel_name]['means'].append(0)
                     self.error_stats[channel_name]['stds'].append(1)
+            
+            print(f"    [KDE] channel {c} ({channel_name}) done")
     
     def get_interval_index(self, forecast_value, channel_idx):
         """获取预测值所属的区间索引"""
@@ -155,22 +161,30 @@ class MultiChannelWindScenarioDataset(Dataset):
         self.n_channels = n_channels
         self.n_intervals = n_intervals
         
+        print(f"  [Dataset] mode={mode}, loading data...")
         self._load_data()
+        print(f"  [Dataset] normalizing data...")
         self._normalize_data()
         
+        print(f"  [Dataset] initializing KDE...")
         self.kde = MultiChannelKDE(n_intervals=n_intervals)
-        if mode == 'train':
-            self.kde.fit(self.forecast_norm, self.residual_norm)
-            self.kde.save(os.path.join(data_path, 'kde_multivariate.pkl'))
+        kde_path = os.path.join(data_path, 'kde_multivariate.pkl')
+        
+        # 优先使用缓存，避免重复拟合（train模式也先检查缓存）
+        if os.path.exists(kde_path):
+            print(f"  [Dataset] loading KDE from cache: {kde_path}")
+            self.kde.load(kde_path)
+            print(f"  [Dataset] KDE loaded from cache.")
         else:
-            kde_path = os.path.join(data_path, 'kde_multivariate.pkl')
-            if os.path.exists(kde_path):
-                self.kde.load(kde_path)
-            else:
-                self.kde.fit(self.forecast_norm, self.residual_norm)
+            print(f"  [Dataset] fitting KDE (no cache, this may take a moment)...")
+            self.kde.fit(self.forecast_norm, self.residual_norm)
+            self.kde.save(kde_path)
+            print(f"  [Dataset] KDE saved to {kde_path}")
         
         # 预计算条件矩阵（在KDE创建之后）
+        print(f"  [Dataset] precomputing condition matrix...")
         self._precompute_cond_matrix()
+        print(f"  [Dataset] initialization complete.")
     
     def _load_data(self):
         """
@@ -315,14 +329,23 @@ class MultiChannelWindScenarioDataset(Dataset):
 
 def get_dataloader_multivariate(data_path='./wind_solar_load_168_FEDformer/',
                                 batch_size=16, mode='train', n_intervals=10,
-                                num_workers=4, pin_memory=True):
+                                num_workers=None, pin_memory=None):
     """
     获取多通道数据加载器
     
     Args:
-        num_workers: 多进程数据加载（GPU训练时建议4-8）
-        pin_memory: 锁页内存，加速GPU数据传输
+        num_workers: 多进程数据加载（None=自动检测：Windows=0, Linux=4）
+        pin_memory: 锁页内存，加速GPU数据传输（None=自动检测：GPU=True）
     """
+    import platform
+    import torch
+    
+    # 自动检测最佳配置
+    if num_workers is None:
+        num_workers = 0 if platform.system() == 'Windows' else 4
+    if pin_memory is None:
+        pin_memory = torch.cuda.is_available()
+    
     dataset = MultiChannelWindScenarioDataset(
         data_path=data_path, mode=mode, n_intervals=n_intervals
     )
