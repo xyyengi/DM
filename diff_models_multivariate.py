@@ -356,7 +356,7 @@ class GaussianDiffusionMultivariate(nn.Module):
     - ||·||_F: Frobenius范数
     """
     
-    def __init__(self, model, num_steps=500, beta_start=0.0001, beta_end=0.02,
+    def __init__(self, model, num_steps=500, beta_start=0.0001, beta_end=0.03,
                  schedule='quad', guidance_scale=1.0):
         super().__init__()
         
