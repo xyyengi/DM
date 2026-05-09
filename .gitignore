@@ -1,0 +1,24 @@
+# 大文件 - 数据和缓存（不上传到 GitHub）
+input_4.27/*.npy
+input_4.27/*.pkl
+
+# 训练结果（本地保留）
+save/run_*/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# 调试文件
+debug/
+debug_*.py
+
+# 日志和输出
+*.log
+*.txt
