@@ -1,0 +1,8 @@
+训练开始: 2026-05-08 21:53:48.825533
+Epochs: 2
+Patience: 2
+LR: 0.001
+LR Scheduler: False
+
+alpha_hat_last: 0.027041736059486978
+WARNING: alpha_hat[-1] > 0.001 — the final signal retention is large; noise may be too small. Consider increasing beta_end.

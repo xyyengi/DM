@@ -1,0 +1,32 @@
+data:
+  data_path: ./input_4.27/
+  n_channels: 11
+  seq_length: 168
+evaluation:
+  n_samples: 10
+  quantiles:
+  - 0.8
+  - 1.0
+lr_scheduler:
+  decay_epochs: 50
+  decay_factor: 0.5
+  enabled: false
+  initial_lr: 0.0001
+  min_lr: 1.0e-06
+  warmup_epochs: 10
+model:
+  base_channels: 128
+  beta_end: 0.02
+  beta_start: 0.0001
+  d_time: 64
+  guidance_scale: 1.0
+  in_channels: 14
+  n_intervals: 10
+  num_layers: 4
+  num_steps: 500
+  out_channels: 3
+  schedule: quad
+train:
+  batch_size: 16
+  epochs: 2
+  lr: 0.001
