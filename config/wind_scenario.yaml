@@ -55,7 +55,9 @@ model:
   schedule: "quad"
   
   # 条件引导强度 (公式10中的γ)
-  guidance_scale: 1.0
+  # 注意：设为0禁用显式梯度修正，条件引导通过concat输入实现
+  # 非零值会导致数值爆炸（梯度正反馈）
+  guidance_scale: 0.0
   
   # KDE区间数量 (公式7中的区间划分)
   n_intervals: 10
