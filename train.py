@@ -311,7 +311,8 @@ def visualize_sampling_progress(model, batch, device, exp_folder, record_steps=N
 
     # 选择第一个样本的记录绘图
     steps_sorted = sorted(record_steps, reverse=True)
-    sample0 = {t: np.squeeze(np.array(rec[t])[0], axis=0) for t in steps_sorted}
+    # rec[t] 形状: (n_samples, B, 3, L)，取第一个样本的第一个batch
+    sample0 = {t: np.array(rec[t])[0, 0] for t in steps_sorted}  # shape (3, L)
 
     # 绘制：3行 x len(steps)列
     n_cols = len(steps_sorted)
