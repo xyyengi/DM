@@ -484,23 +484,32 @@ class GaussianDiffusionMultivariate(nn.Module):
             # 计算条件梯度（返回梯度方向和二值掩码）
             cond_gradient, gamma_mask = self.compute_conditional_gradient(x_t, cond_matrix)
             
+            # 【关键修复】梯度裁剪：防止梯度爆炸
+            # 将梯度限制在 [-0.1, 0.1] 范围内，防止采样初期因距离过大导致的数值爆炸
+            cond_gradient = torch.clamp(cond_gradient, min=-0.1, max=0.1)
+            
             # 应用梯度修正：只在超出区间的地方修正
             # gamma_mask 已经是二值系数，这里不需要额外限制
             mean = mean - self.guidance_scale * t_decay * cond_gradient * gamma_mask
         
-        # 数值稳定性保护：限制 mean 的范围
-        mean = torch.clamp(mean, min=-100.0, max=100.0)
+        # 【关键修复】数值稳定性保护：限制在归一化范围内
+        # 归一化后的残差应该在 [-1, 1] 范围内
+        # 使用稍宽的范围 [-2, 2] 允许一定的探索空间
+        mean = torch.clamp(mean, min=-2.0, max=2.0)
         
         # 添加噪声（除了最后一步）
         if t > 0:
             sigma = self.beta[t].sqrt()
             noise = torch.randn_like(x_t)
+            # 噪声也需要限制，防止爆炸
+            noise = torch.clamp(noise, min=-1.0, max=1.0)
             x_prev = mean + sigma * noise
         else:
             x_prev = mean
         
-        # 最终保护：确保输出在合理范围内
-        x_prev = torch.clamp(x_prev, min=-100.0, max=100.0)
+        # 【关键修复】最终保护：确保输出在归一化范围内
+        # 这是 fix.md 第一阶段的核心修复
+        x_prev = torch.clamp(x_prev, min=-1.0, max=1.0)
         
         return x_prev
     
