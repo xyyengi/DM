@@ -398,32 +398,45 @@ class GaussianDiffusionMultivariate(nn.Module):
         
         return x_t, noise
     
-    def compute_conditional_gradient(self, x_t, cond_matrix, gamma):
+    def compute_conditional_gradient(self, x_t, cond_matrix):
         """
         论文公式10: 计算条件梯度
         
-        ∇_{x_t} ||γ·x_t - c||²_F
+        γ 是 0-1 二值系数：
+        - 当 x_t 在条件区间 [c_down, c_up] 内时，γ=0（不修正）
+        - 当 x_t 超出条件区间时，γ=1（修正）
         
-        其中条件c取区间中点: c_mid = (c_down + c_up) / 2
+        梯度方向：引导 x_t 向条件区间边界移动
         
         Args:
             x_t: (B, 3, 168) 当前生成值
             cond_matrix: (B, 3, 168, 2) 条件矩阵 [c_down, c_up]
-            gamma: 引导强度
         Returns:
             gradient: (B, 3, 168) 条件梯度
+            gamma_mask: (B, 3, 168) 二值系数掩码
         """
-        # 计算条件中点
         c_down = cond_matrix[..., 0]  # (B, 3, 168)
         c_up = cond_matrix[..., 1]
-        c_mid = (c_down + c_up) / 2
         
-        # Frobenius范数梯度
-        # ||γ·x_t - c||²_F = Σ(γ·x_t - c)²
-        # ∇ = 2γ(γ·x_t - c)
-        gradient = 2 * gamma * (gamma * x_t - c_mid)
+        # 计算二值系数 γ
+        # 当 x_t < c_down 或 x_t > c_up 时，γ=1
+        # 当 x_t 在 [c_down, c_up] 内时，γ=0
+        gamma_mask = ((x_t < c_down) | (x_t > c_up)).float()
         
-        return gradient
+        # 计算梯度方向
+        # 如果 x_t < c_down，梯度指向 c_down（向上）
+        # 如果 x_t > c_up，梯度指向 c_up（向下）
+        gradient = torch.zeros_like(x_t)
+        
+        # x_t < c_down: 梯度 = c_down - x_t（向上推）
+        below_mask = (x_t < c_down).float()
+        gradient = gradient + below_mask * (c_down - x_t)
+        
+        # x_t > c_up: 梯度 = c_up - x_t（向下推）
+        above_mask = (x_t > c_up).float()
+        gradient = gradient + above_mask * (c_up - x_t)
+        
+        return gradient, gamma_mask
     
     def denoise_step(self, x_t, t, cond_full, cond_matrix, time_feat):
         """
@@ -463,20 +476,17 @@ class GaussianDiffusionMultivariate(nn.Module):
         mean = (1 / alpha_t.sqrt()) * (x_t - coef * predicted_noise)
         
         # 论文公式10: 条件梯度修正
-        # 添加时间步衰减：早期步骤梯度强度衰减，避免采样被过度约束
+        # γ 是 0-1 二值系数：超出条件区间时才修正
         if self.guidance_scale > 0:
             # 时间步衰减系数: t 越小（越接近最后去噪），约束越强
             t_decay = (t + 1) / self.num_steps if self.num_steps > 0 else 1.0
-            cond_gradient = self.compute_conditional_gradient(x_t, cond_matrix, gamma=1.0)
             
-            # 数值稳定性保护：限制梯度幅度
-            # 如果梯度太大，可能导致 mean 爆炸
-            grad_norm = cond_gradient.abs().max()
-            max_grad = 10.0  # 限制最大梯度幅度
-            if grad_norm > max_grad:
-                cond_gradient = cond_gradient * (max_grad / grad_norm)
+            # 计算条件梯度（返回梯度方向和二值掩码）
+            cond_gradient, gamma_mask = self.compute_conditional_gradient(x_t, cond_matrix)
             
-            mean = mean - self.guidance_scale * t_decay * cond_gradient
+            # 应用梯度修正：只在超出区间的地方修正
+            # gamma_mask 已经是二值系数，这里不需要额外限制
+            mean = mean - self.guidance_scale * t_decay * cond_gradient * gamma_mask
         
         # 数值稳定性保护：限制 mean 的范围
         mean = torch.clamp(mean, min=-100.0, max=100.0)
@@ -554,7 +564,7 @@ class GaussianDiffusionMultivariate(nn.Module):
         
         # 如果提供了条件矩阵，应用条件梯度修正（保证训练推理一致）
         # 这样模型学到的是"在约束下的去噪"过程
-        if cond_matrix is not None:
+        if cond_matrix is not None and self.guidance_scale > 0:
             # 计算去噪均值
             alpha_t = self.alpha[t].view(-1, 1, 1)
             alpha_hat_t = self.alpha_hat[t].view(-1, 1, 1)
@@ -563,8 +573,10 @@ class GaussianDiffusionMultivariate(nn.Module):
             # 应用条件梯度修正（带时间步衰减）
             t_decay = (t.float() + 1) / self.num_steps if self.num_steps > 0 else 1.0
             t_decay = t_decay.view(-1, 1, 1)
-            cond_gradient = self.compute_conditional_gradient(x_t, cond_matrix, gamma=1.0)
-            mean = mean - self.guidance_scale * t_decay * cond_gradient
+            
+            # 计算条件梯度（返回梯度方向和二值掩码）
+            cond_gradient, gamma_mask = self.compute_conditional_gradient(x_t, cond_matrix)
+            mean = mean - self.guidance_scale * t_decay * cond_gradient * gamma_mask
             
             # 从修正后的均值反推预测噪声（用于损失计算）
             # ε_pred = (√(1-ᾱ_t) / (1-α_t)) * (x_t - √α_t * mean)
