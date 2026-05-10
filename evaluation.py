@@ -59,20 +59,21 @@ def compute_coverage_rate(samples, actual, quantile=1.0):
     return coverage_rate
 
 
-def compute_scenario_width(samples, actual, quantile=1.0):
+def compute_scenario_width(samples, actual, quantile=1.0, global_range=None):
     """
     论文公式13: Scenario Width (PIAW)
     
     PIAW_α = Σ(P_up - P_down) / T
     
-    【修复】避免 actual≈0 时 Width 爆炸：
-    - 使用样本标准差作为归一化基准
-    - 当 actual 接近 0 时（如 Solar 夜间），使用绝对宽度
+    【关键修复】使用全局极差归一化，避免 actual≈0 时 Width 爆炸：
+    - 禁止使用 width / actual，因为残差趋于 0 时会导致数值无效
+    - 改用测试集中该通道的全局极差 (Max - Min) 作为分母
     
     Args:
         samples: (N, n_samples, L) 生成的场景
-        actual: (N, L) 实际值 (用于归一化)
+        actual: (N, L) 实际值
         quantile: 分位数
+        global_range: 该通道的全局极差 (Max - Min)，用于归一化
     Returns:
         width_percent: 平均区间宽度百分比
     """
@@ -89,16 +90,19 @@ def compute_scenario_width(samples, actual, quantile=1.0):
     # 计算区间宽度
     width = upper_bound - lower_bound  # (N, L)
     
-    # 【修复】稳健归一化：使用 actual 和样本标准差的组合
-    # 当 actual≈0 时（如 Solar 夜间），使用样本标准差作为基准
-    sample_std = np.std(samples, axis=1)  # (N, L)
-    
-    # 归一化基准：max(|actual|, sample_std, 1e-6)
-    # 这样当 actual≈0 但样本有波动时，不会爆炸
-    norm_base = np.maximum(np.abs(actual), sample_std)
-    norm_base = np.maximum(norm_base, 1e-6)
-    
-    width_normalized = width / norm_base
+    # 【关键修复】使用全局极差归一化
+    if global_range is not None and global_range > 0:
+        # 使用测试集该通道的全局极差作为归一化基准
+        width_normalized = width / global_range
+    else:
+        # 回退：如果没有提供全局极差，使用 actual 的全局极差
+        actual_range = np.max(actual) - np.min(actual)
+        if actual_range > 0:
+            width_normalized = width / actual_range
+        else:
+            # 最后回退：使用样本自身的极差
+            sample_range = np.max(width)
+            width_normalized = width / max(sample_range, 1e-6)
     
     # 平均宽度百分比
     width_percent = np.mean(width_normalized) * 100
@@ -278,6 +282,15 @@ def evaluate_multichannel(samples, actual, channel_names=['wind', 'solar', 'load
     if verbose:
         print(f"\n开始评估 (N={N}, n_samples={n_samples}, C={C})...")
     
+    # 【关键修复】计算各通道的全局极差，用于 Width 归一化
+    global_ranges = []
+    for c in range(C):
+        actual_c = actual[:, c, :]  # (N, L)
+        global_range = np.max(actual_c) - np.min(actual_c)
+        global_ranges.append(global_range)
+        if verbose:
+            print(f"  通道 {channel_names[c]} 全局极差: {global_range:.4f}")
+    
     # 1. 多变量Energy Score（联合分布 - 最重要）
     if verbose:
         print("  【多变量联合分布】...")
@@ -296,11 +309,11 @@ def evaluate_multichannel(samples, actual, channel_names=['wind', 'solar', 'load
         # Energy Score (单通道)
         metrics[f'{name}_energy_score'] = compute_energy_score(samples_c, actual_c, verbose=verbose)
         
-        # Coverage和Width
+        # Coverage和Width - 使用全局极差归一化
         for q in quantiles:
             q_name = f'{int(q*100)}%'
             metrics[f'{name}_coverage_{q_name}'] = compute_coverage_rate(samples_c, actual_c, q)
-            metrics[f'{name}_width_{q_name}'] = compute_scenario_width(samples_c, actual_c, q)
+            metrics[f'{name}_width_{q_name}'] = compute_scenario_width(samples_c, actual_c, q, global_range=global_ranges[c])
         
         # 可靠性检查（80%、90%、95%置信区间）
         reliability_dict = compute_reliability(samples_c, actual_c, confidence_levels=[0.80, 0.90, 0.95], verbose=verbose)
