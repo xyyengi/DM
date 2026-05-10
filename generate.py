@@ -217,14 +217,16 @@ def main():
     
     print(f"实验文件夹: {exp_folder}")
     
-    # 加载checkpoint
+    # 加载checkpoint（默认使用最佳模型 model_best.pt）
     if args.ckpt_epoch:
         ckpt_path = os.path.join(exp_folder, 'checkpoints', f'model_epoch_{args.ckpt_epoch}.pt')
         if not os.path.exists(ckpt_path):
-            print(f"警告: 未找到指定 epoch checkpoint，改为自动选择最新文件: {ckpt_path}")
-            ckpt_path = get_checkpoint_path(exp_folder, 'latest')
+            print(f"警告: 未找到指定 epoch checkpoint: {ckpt_path}")
+            print(f"改为使用最佳模型...")
+            ckpt_path = get_checkpoint_path(exp_folder, 'best')
     else:
-        ckpt_path = get_checkpoint_path(exp_folder, 'latest')
+        # 默认使用最佳模型（model_best.pt）
+        ckpt_path = get_checkpoint_path(exp_folder, 'best')
     
     print(f"加载模型: {ckpt_path}")
     
