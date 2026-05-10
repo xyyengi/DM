@@ -214,7 +214,9 @@ def train(model, train_loader, val_loader, config, device, exp_folder, save_ever
             f.write(f"Epoch {epoch+1}: Train={avg_train_loss:.4f}, Val={avg_val_loss:.4f}, LR={current_lr:.6f}\n")
         
         # ========== 早停检查 ==========
-        if not early_stopping(avg_val_loss, epoch + 1):
+        # 先检查是否是最佳模型（val_loss 有改善）
+        is_best = avg_val_loss < early_stopping.best_loss - early_stopping.min_delta
+        if is_best:
             # 保存最佳模型
             torch.save({
                 'epoch': epoch + 1,
@@ -224,8 +226,11 @@ def train(model, train_loader, val_loader, config, device, exp_folder, save_ever
                 'config': config
             }, os.path.join(exp_folder, 'checkpoints', 'model_best.pt'))
             if (epoch + 1) % 10 == 0 or epoch == 0:
-                print(f"  → 最佳模型已保存 (Val Loss: {early_stopping.best_loss:.4f})")
-        else:
+                print(f"  → 最佳模型已保存 (Val Loss: {avg_val_loss:.4f})")
+        
+        # 然后检查是否应该早停
+        should_stop = early_stopping(avg_val_loss, epoch + 1)
+        if should_stop:
             print(f"\n早停触发! 最佳epoch: {early_stopping.best_epoch}, 最佳Val Loss: {early_stopping.best_loss:.4f}")
             break
         
@@ -311,7 +316,8 @@ def visualize_sampling_progress(model, batch, device, exp_folder, record_steps=N
 
     # 选择第一个样本的记录绘图
     steps_sorted = sorted(record_steps, reverse=True)
-    sample0 = {t: np.squeeze(np.array(rec[t])[0], axis=0) for t in steps_sorted}
+    # rec[t] 形状: (n_samples, B, 3, L)，取第一个样本的第一个batch
+    sample0 = {t: np.array(rec[t])[0, 0] for t in steps_sorted}  # shape (3, L)
 
     # 绘制：3行 x len(steps)列
     n_cols = len(steps_sorted)

@@ -84,16 +84,22 @@ def list_experiments(base_path):
 def get_checkpoint_path(exp_folder, ckpt_type='best'):
     """获取checkpoint路径。
 
-    优先级：
-    1. 显式请求 best 时，优先返回 model_best.pt（如果存在）
-    2. 自动选择最新的 model_epoch_*.pt
-    3. 回退到 model_best.pt
+    优先级（默认使用最佳模型）：
+    1. 默认优先返回 model_best.pt（最佳验证损失模型）
+    2. 如果指定 ckpt_type='latest'，选择最新的 model_epoch_*.pt
+    3. 如果没有 model_best.pt，回退到最新的 epoch checkpoint
     4. 最后选取 checkpoints 目录中最新修改的 .pt 文件
     """
     ckpt_path = os.path.join(exp_folder, 'checkpoints')
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"无checkpoint目录: {ckpt_path}")
 
+    # 优先查找 model_best.pt
+    best_path = os.path.join(ckpt_path, 'model_best.pt')
+    if os.path.exists(best_path) and ckpt_type == 'best':
+        return best_path
+
+    # 查找所有 epoch checkpoint
     epoch_ckpts = []
     for name in os.listdir(ckpt_path):
         if name.startswith('model_epoch_') and name.endswith('.pt'):
@@ -106,14 +112,15 @@ def get_checkpoint_path(exp_folder, ckpt_type='best'):
     if epoch_ckpts:
         epoch_ckpts.sort(key=lambda item: item[0])
         latest_epoch_path = epoch_ckpts[-1][1]
-        if ckpt_type != 'best':
+        # 如果请求 latest，或者没有 best，使用最新的 epoch
+        if ckpt_type == 'latest' or not os.path.exists(best_path):
             return latest_epoch_path
     
-    best_path = os.path.join(ckpt_path, 'model_best.pt')
+    # 回退到 model_best.pt（即使 ckpt_type 不是 'best'）
     if os.path.exists(best_path):
-        if ckpt_type == 'best' or not epoch_ckpts:
-            return best_path
+        return best_path
     
+    # 最后尝试任意 .pt 文件
     any_pt = [os.path.join(ckpt_path, f) for f in os.listdir(ckpt_path) if f.endswith('.pt')]
     if any_pt:
         any_pt.sort(key=lambda p: os.path.getmtime(p))
@@ -210,14 +217,16 @@ def main():
     
     print(f"实验文件夹: {exp_folder}")
     
-    # 加载checkpoint
+    # 加载checkpoint（默认使用最佳模型 model_best.pt）
     if args.ckpt_epoch:
         ckpt_path = os.path.join(exp_folder, 'checkpoints', f'model_epoch_{args.ckpt_epoch}.pt')
         if not os.path.exists(ckpt_path):
-            print(f"警告: 未找到指定 epoch checkpoint，改为自动选择最新文件: {ckpt_path}")
-            ckpt_path = get_checkpoint_path(exp_folder, 'latest')
+            print(f"警告: 未找到指定 epoch checkpoint: {ckpt_path}")
+            print(f"改为使用最佳模型...")
+            ckpt_path = get_checkpoint_path(exp_folder, 'best')
     else:
-        ckpt_path = get_checkpoint_path(exp_folder, 'latest')
+        # 默认使用最佳模型（model_best.pt）
+        ckpt_path = get_checkpoint_path(exp_folder, 'best')
     
     print(f"加载模型: {ckpt_path}")
     
