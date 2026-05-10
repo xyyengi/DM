@@ -109,14 +109,32 @@ class MultiChannelKDE:
     def get_conditional_interval(self, forecast_value, channel_idx):
         """
         论文公式9: 构建条件区间 c = [c_down, c_up]
-        c_up = min(1, f + K_h(f))
-        c_down = max(0, f - K_h(f))
-        """
-        error_exp = self.get_error_expectation(forecast_value, channel_idx)
-        k_h = abs(error_exp)
         
-        c_up = min(1.0, forecast_value + k_h)
-        c_down = max(0.0, forecast_value - k_h)
+        【关键修复】条件区间应该是残差的置信区间，而不是预测值的置信区间！
+        
+        原问题：
+        - forecast_value 是归一化的预测值（范围 [0, 1]）
+        - 但模型生成的是归一化的残差（范围 [-1, 1]）
+        - 两者不在同一个坐标系，导致 Coverage=0%
+        
+        修复：
+        - 条件区间直接基于残差的统计量（均值 ± 标差）
+        - 这样生成的残差才能落在正确的区间内
+        """
+        interval_idx = self.get_interval_index(forecast_value, channel_idx)
+        channel_name = ['wind', 'solar', 'load'][channel_idx]
+        
+        # 获取该区间的残差统计量
+        error_mean = self.error_stats[channel_name]['means'][interval_idx]
+        error_std = self.error_stats[channel_name]['stds'][interval_idx]
+        
+        # 【关键修复】条件区间是残差的置信区间
+        # 使用 2倍标准差作为区间宽度（约95%置信区间）
+        k_h = 2.0 * error_std
+        
+        c_down = error_mean - k_h  # 残差下界（可以是负数）
+        c_up = error_mean + k_h    # 残差上界
+        
         return c_down, c_up
     
     def save(self, path):
