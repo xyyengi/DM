@@ -84,16 +84,29 @@ def debug_inference(exp_folder, data_path='./input_4.27/'):
     
     with torch.no_grad():
         for t in range(model.diffusion.num_steps - 1, -1, -1):
-            # 检查去噪前
+            # 检查去噪前 - nan 和 inf
             if torch.isnan(x_t).any():
                 nan_first_step = t + 1
                 print(f"⚠ nan 出现在 step {t+1} (去噪前)")
+                break
+            if torch.isinf(x_t).any():
+                nan_first_step = t + 1
+                print(f"⚠ inf 出现在 step {t+1} (去噪前)")
+                print(f"  x_t inf 数量: {torch.isinf(x_t).sum()}")
+                # 检查前一步的详细信息
                 break
             
             # 执行去噪
             x_prev = model.diffusion.denoise_step(x_t, t, cond_full, cond_matrix, time_feat)
             
-            # 检查去噪后
+            # 检查去噪后 - nan 和 inf
+            if torch.isinf(x_prev).any():
+                nan_first_step = t
+                print(f"⚠ inf 出现在 step {t} (去噪后)")
+                print(f"  x_prev inf 数量: {torch.isinf(x_prev).sum()}")
+                print(f"  alpha_t={model.diffusion.alpha[t]:.6f}, alpha_hat_t={model.diffusion.alpha_hat[t]:.6f}")
+                break
+            
             if torch.isnan(x_prev).any():
                 nan_first_step = t
                 print(f"⚠ nan 出现在 step {t} (去噪后)")

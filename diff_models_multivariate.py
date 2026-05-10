@@ -456,8 +456,11 @@ class GaussianDiffusionMultivariate(nn.Module):
         alpha_t = self.alpha[t]
         alpha_hat_t = self.alpha_hat[t]
         
-        # 基础去噪公式
-        mean = (1 / alpha_t.sqrt()) * (x_t - (1 - alpha_t) / (1 - alpha_hat_t).sqrt() * predicted_noise)
+        # 基础去噪公式 - 添加数值稳定性保护
+        # 当 alpha_hat_t 很小时，(1 - alpha_hat_t).sqrt() 接近 1，应该没问题
+        # 但需要防止 predicted_noise 过大导致 mean 爆炸
+        coef = (1 - alpha_t) / (1 - alpha_hat_t).sqrt()
+        mean = (1 / alpha_t.sqrt()) * (x_t - coef * predicted_noise)
         
         # 论文公式10: 条件梯度修正
         # 添加时间步衰减：早期步骤梯度强度衰减，避免采样被过度约束
@@ -465,7 +468,18 @@ class GaussianDiffusionMultivariate(nn.Module):
             # 时间步衰减系数: t 越小（越接近最后去噪），约束越强
             t_decay = (t + 1) / self.num_steps if self.num_steps > 0 else 1.0
             cond_gradient = self.compute_conditional_gradient(x_t, cond_matrix, gamma=1.0)
+            
+            # 数值稳定性保护：限制梯度幅度
+            # 如果梯度太大，可能导致 mean 爆炸
+            grad_norm = cond_gradient.abs().max()
+            max_grad = 10.0  # 限制最大梯度幅度
+            if grad_norm > max_grad:
+                cond_gradient = cond_gradient * (max_grad / grad_norm)
+            
             mean = mean - self.guidance_scale * t_decay * cond_gradient
+        
+        # 数值稳定性保护：限制 mean 的范围
+        mean = torch.clamp(mean, min=-100.0, max=100.0)
         
         # 添加噪声（除了最后一步）
         if t > 0:
@@ -474,6 +488,9 @@ class GaussianDiffusionMultivariate(nn.Module):
             x_prev = mean + sigma * noise
         else:
             x_prev = mean
+        
+        # 最终保护：确保输出在合理范围内
+        x_prev = torch.clamp(x_prev, min=-100.0, max=100.0)
         
         return x_prev
     
