@@ -107,6 +107,30 @@ def debug_inference(exp_folder, data_path='./input_4.27/'):
                 input_14ch = torch.cat([x_t, cond_full], dim=1)
                 predicted_noise = model.unet(input_14ch, time_feat)
                 print(f"  predicted_noise: nan={torch.isnan(predicted_noise).any()}")
+                print(f"  predicted_noise range: [{predicted_noise.min():.4f}, {predicted_noise.max():.4f}]")
+                
+                # 检查 input_14ch
+                print(f"  input_14ch: nan={torch.isnan(input_14ch).any()}, range=[{input_14ch.min():.4f}, {input_14ch.max():.4f}]")
+                
+                # 检查 time_feat
+                print(f"  time_feat: nan={torch.isnan(time_feat).any()}")
+                
+                # 检查模型权重是否有 nan
+                for name, param in model.unet.named_parameters():
+                    if torch.isnan(param).any():
+                        print(f"  ⚠ 模型权重 nan: {name}")
+                
+                # 检查去噪公式各部分
+                print(f"\n  === 去噪公式分解 ===")
+                print(f"  x_t range: [{x_t.min():.4f}, {x_t.max():.4f}]")
+                print(f"  (1 - alpha_t) = {1 - alpha_t:.6f}")
+                print(f"  (1 - alpha_hat_t).sqrt() = {(1 - alpha_hat_t).sqrt():.6f}")
+                coef = (1 - alpha_t) / (1 - alpha_hat_t).sqrt()
+                print(f"  噪声系数 = {coef:.6f}")
+                
+                # 手动计算 mean
+                mean_part = x_t - coef * predicted_noise
+                print(f"  x_t - coef*predicted_noise: nan={torch.isnan(mean_part).any()}")
                 
                 break
             
