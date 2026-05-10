@@ -1,4 +1,4 @@
-wo#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
 多变量协同条件扩散模型 - 评估模块
