@@ -65,6 +65,10 @@ def compute_scenario_width(samples, actual, quantile=1.0):
     
     PIAW_α = Σ(P_up - P_down) / T
     
+    【修复】避免 actual≈0 时 Width 爆炸：
+    - 使用样本标准差作为归一化基准
+    - 当 actual 接近 0 时（如 Solar 夜间），使用绝对宽度
+    
     Args:
         samples: (N, n_samples, L) 生成的场景
         actual: (N, L) 实际值 (用于归一化)
@@ -85,9 +89,16 @@ def compute_scenario_width(samples, actual, quantile=1.0):
     # 计算区间宽度
     width = upper_bound - lower_bound  # (N, L)
     
-    # 归一化（相对于实际值的百分比）
-    max_val = np.maximum(np.abs(actual), 1e-6)
-    width_normalized = width / max_val
+    # 【修复】稳健归一化：使用 actual 和样本标准差的组合
+    # 当 actual≈0 时（如 Solar 夜间），使用样本标准差作为基准
+    sample_std = np.std(samples, axis=1)  # (N, L)
+    
+    # 归一化基准：max(|actual|, sample_std, 1e-6)
+    # 这样当 actual≈0 但样本有波动时，不会爆炸
+    norm_base = np.maximum(np.abs(actual), sample_std)
+    norm_base = np.maximum(norm_base, 1e-6)
+    
+    width_normalized = width / norm_base
     
     # 平均宽度百分比
     width_percent = np.mean(width_normalized) * 100
