@@ -13,13 +13,28 @@ from dataset_multivariate import get_dataloader_multivariate
 from diff_models_multivariate import MultiChannelCSDI
 
 
-def debug_inference(exp_folder, data_path='./input_4.27/', debug_steps=[499, 400, 300, 200, 100, 50, 0]):
-    """诊断推理过程中的 nan 来源 + 梯度监控"""
+def debug_inference(exp_folder, data_path='./input_4.27/', debug_steps=[499, 400, 300, 200, 100, 50, 0],
+                   guidance_scale=None, config_path=None):
+    """诊断推理过程中的 nan 来源 + 梯度监控
+    
+    Args:
+        exp_folder: 实验目录路径
+        data_path: 数据路径
+        debug_steps: 调试步骤列表
+        guidance_scale: 覆盖配置中的 guidance_scale（可选）
+        config_path: 指定配置文件路径（可选，默认使用 exp_folder/config_used.yaml）
+    """
     
     # 加载配置
-    config_path = os.path.join(exp_folder, 'config_used.yaml')
+    if config_path is None:
+        config_path = os.path.join(exp_folder, 'config_used.yaml')
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
+    
+    # 覆盖 guidance_scale（如果指定）
+    if guidance_scale is not None:
+        print(f"⚠ 覆盖 guidance_scale: {config['model']['guidance_scale']} -> {guidance_scale}")
+        config['model']['guidance_scale'] = guidance_scale
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"设备: {device}")
@@ -206,9 +221,13 @@ if __name__ == '__main__':
     parser.add_argument('--exp_folder', default='./save/run_beta04_lrsched_20260510_1656')
     parser.add_argument('--data_path', default='./input_4.27/')
     parser.add_argument('--check_kde', action='store_true', help='仅检查 KDE 一致性')
+    parser.add_argument('--guidance_scale', type=float, default=None, help='覆盖配置中的 guidance_scale')
+    parser.add_argument('--config', default=None, help='指定配置文件路径（默认使用 exp_folder/config_used.yaml）')
     args = parser.parse_args()
     
     if args.check_kde:
         check_kde_consistency(args.data_path)
     else:
-        debug_inference(args.exp_folder, args.data_path)
+        debug_inference(args.exp_folder, args.data_path, 
+                       guidance_scale=args.guidance_scale, 
+                       config_path=args.config)

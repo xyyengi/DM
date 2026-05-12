@@ -55,9 +55,9 @@ model:
   schedule: "quad"
   
   # 条件引导强度 (公式10中的γ)
-  # 【修复】启用微量引导提升 Coverage
-  # 0.05 是保守值，配合梯度裁剪防止数值爆炸
-  guidance_scale: 1
+  # 【修复】增大引导强度使梯度引导生效
+  # 0.05 太弱，改为 1.0 使条件约束真正起作用
+  guidance_scale: 1.0
   
   # KDE区间数量 (公式7中的区间划分)
   n_intervals: 10
