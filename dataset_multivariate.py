@@ -36,6 +36,7 @@ class MultiChannelKDE:
         self.kde_models = {}  # 存储每个通道、每个区间的KDE模型
         self.interval_bounds = {}  # 存储区间边界
         self.error_stats = {}  # 存储误差统计量
+        self.precomputed_quantiles = {}  # 预计算的分位数 {channel: {interval: (c_down, c_up)}
         
     def fit(self, forecast_data, residual_data):
         """
@@ -85,6 +86,35 @@ class MultiChannelKDE:
                     self.error_stats[channel_name]['means'].append(0)
                     self.error_stats[channel_name]['stds'].append(1)
             
+            # 预计算该通道所有区间的分位数（避免每次调用都计算CDF）
+            print(f"    [KDE] precomputing quantiles for {channel_name}...")
+            self.precomputed_quantiles[channel_name] = {}
+            for i in range(self.n_intervals):
+                kde = self.kde_models[channel_name][i]
+                if kde is not None:
+                    # 预计算第10和第90分位数
+                    residual_min = -1.0
+                    residual_max = 1.0
+                    n_points = 1000
+                    x_grid = np.linspace(residual_min, residual_max, n_points)
+                    pdf_values = kde(x_grid)
+                    cdf_values = np.cumsum(pdf_values) * (x_grid[1] - x_grid[0])
+                    cdf_values = cdf_values / cdf_values[-1]
+                    
+                    c_down_idx = max(0, min(np.searchsorted(cdf_values, 0.10), n_points - 1))
+                    c_up_idx = max(0, min(np.searchsorted(cdf_values, 0.90), n_points - 1))
+                    
+                    self.precomputed_quantiles[channel_name][i] = (
+                        x_grid[c_down_idx], x_grid[c_up_idx]
+                    )
+                else:
+                    # 使用统计量作为后备
+                    error_mean = self.error_stats[channel_name]['means'][i]
+                    error_std = self.error_stats[channel_name]['stds'][i]
+                    self.precomputed_quantiles[channel_name][i] = (
+                        error_mean - 1.28 * error_std,
+                        error_mean + 1.28 * error_std
+                    )
             print(f"    [KDE] channel {c} ({channel_name}) done")
     
     def get_interval_index(self, forecast_value, channel_idx):
@@ -110,11 +140,7 @@ class MultiChannelKDE:
         """
         论文公式9: 构建条件区间 c = [c_down, c_up]
         
-        【严格按照论文实现】
-        1. 基于预测功率 f 条件下的残差 KDE 模型
-        2. 从条件 KDE 分布中提取第 lower_percentile 和 upper_percentile 分位数
-        3. 确保坐标系一致：c 边界处于残差空间（[-1, 1]）
-        4. 物理一致性：c_down 和 c_up 随预测功率变化而动态波动（异方差特性）
+        【优化版本】直接使用预计算的分位数，避免每次调用都计算CDF
         
         Args:
             forecast_value: 归一化的预测功率值（范围 [0, 1]）
@@ -129,85 +155,37 @@ class MultiChannelKDE:
         interval_idx = self.get_interval_index(forecast_value, channel_idx)
         channel_name = ['wind', 'solar', 'load'][channel_idx]
         
-        # 获取该区间的KDE模型
-        kde = self.kde_models[channel_name][interval_idx]
+        # 【优化】直接使用预计算的分位数
+        if channel_name in self.precomputed_quantiles and interval_idx in self.precomputed_quantiles[channel_name]:
+            return self.precomputed_quantiles[channel_name][interval_idx]
         
-        if kde is not None:
-            # 【严格按照论文】从KDE分布中提取分位数
-            # 使用 scipy.stats.gaussian_kde 的 inverse CDF (ppf)
-            # 注意：scipy的kde没有直接的ppf方法，需要通过积分计算
-            
-            # 方法：使用数值积分求分位数
-            # c_down = P_10: 满足 P(e <= c_down | f) = 0.10
-            # c_up = P_90: 满足 P(e <= c_up | f) = 0.90
-            
-            # 获取KDE支持的残差范围
-            # 残差数据范围通常在 [-1, 1]（归一化后）
-            residual_min = -1.0
-            residual_max = 1.0
-            
-            # 创建评估点
-            n_points = 1000
-            x_grid = np.linspace(residual_min, residual_max, n_points)
-            
-            # 计算累积分布函数 (CDF)
-            pdf_values = kde(x_grid)
-            cdf_values = np.cumsum(pdf_values) * (x_grid[1] - x_grid[0])  # 积分
-            cdf_values = cdf_values / cdf_values[-1]  # 归一化到 [0, 1]
-            
-            # 提取分位数
-            # 找到 CDF = lower_percentile/100 和 CDF = upper_percentile/100 对应的 x 值
-            c_down_idx = np.searchsorted(cdf_values, lower_percentile / 100)
-            c_up_idx = np.searchsorted(cdf_values, upper_percentile / 100)
-            
-            # 确保索引在有效范围内
-            c_down_idx = max(0, min(c_down_idx, n_points - 1))
-            c_up_idx = max(0, min(c_up_idx, n_points - 1))
-            
-            c_down = x_grid[c_down_idx]
-            c_up = x_grid[c_up_idx]
-            
-            # 【物理一致性检查】确保区间宽度合理
-            # 如果区间太窄（可能因为数据太少），使用统计量作为后备
-            interval_width = c_up - c_down
-            error_std = self.error_stats[channel_name]['stds'][interval_idx]
-            min_width = 0.5 * error_std  # 最小宽度
-            
-            if interval_width < min_width:
-                # 后备方案：使用均值 ± 分位数对应的标准差倍数
-                error_mean = self.error_stats[channel_name]['means'][interval_idx]
-                # 对于80%置信区间，使用1.28倍标准差
-                z_score = 1.28 if (upper_percentile - lower_percentile) == 80 else 1.64
-                c_down = error_mean - z_score * error_std
-                c_up = error_mean + z_score * error_std
-        else:
-            # 如果KDE模型不存在，使用统计量作为后备
-            error_mean = self.error_stats[channel_name]['means'][interval_idx]
-            error_std = self.error_stats[channel_name]['stds'][interval_idx]
-            z_score = 1.28 if (upper_percentile - lower_percentile) == 80 else 1.64
-            c_down = error_mean - z_score * error_std
-            c_up = error_mean + z_score * error_std
-        
-        return c_down, c_up
+        # 后备方案：如果预计算不存在，使用统计量
+        error_mean = self.error_stats[channel_name]['means'][interval_idx]
+        error_std = self.error_stats[channel_name]['stds'][interval_idx]
+        z_score = 1.28 if (upper_percentile - lower_percentile) == 80 else 1.64
+        return error_mean - z_score * error_std, error_mean + z_score * error_std
     
     def save(self, path):
-        """保存KDE模型"""
+        """保存KDE模型（包括预计算的分位数）"""
         with open(path, 'wb') as f:
             pickle.dump({
                 'kde_models': self.kde_models,
                 'interval_bounds': self.interval_bounds,
                 'error_stats': self.error_stats,
-                'n_intervals': self.n_intervals
+                'n_intervals': self.n_intervals,
+                'precomputed_quantiles': self.precomputed_quantiles
             }, f)
     
     def load(self, path):
-        """加载KDE模型"""
+        """加载KDE模型（包括预计算的分位数）"""
         with open(path, 'rb') as f:
             data = pickle.load(f)
             self.kde_models = data['kde_models']
             self.interval_bounds = data['interval_bounds']
             self.error_stats = data['error_stats']
             self.n_intervals = data['n_intervals']
+            # 兼容旧版本：如果没有预计算分位数，标记为空
+            self.precomputed_quantiles = data.get('precomputed_quantiles', {})
 
 
 class MultiChannelWindScenarioDataset(Dataset):
