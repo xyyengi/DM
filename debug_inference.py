@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-推理过程诊断脚本 - 定位 nan 来源
+推理过程诊断脚本 - 定位 nan 来源 + 梯度监控
 """
 
 import torch
@@ -13,8 +13,8 @@ from dataset_multivariate import get_dataloader_multivariate
 from diff_models_multivariate import MultiChannelCSDI
 
 
-def debug_inference(exp_folder, data_path='./input_4.27/'):
-    """诊断推理过程中的 nan 来源"""
+def debug_inference(exp_folder, data_path='./input_4.27/', debug_steps=[499, 400, 300, 200, 100, 50, 0]):
+    """诊断推理过程中的 nan 来源 + 梯度监控"""
     
     # 加载配置
     config_path = os.path.join(exp_folder, 'config_used.yaml')
@@ -39,6 +39,7 @@ def debug_inference(exp_folder, data_path='./input_4.27/'):
     print(f"beta 范围: [{model.diffusion.beta.min():.6f}, {model.diffusion.beta.max():.6f}]")
     print(f"alpha_hat[0]: {model.diffusion.alpha_hat[0]:.6f}")
     print(f"alpha_hat[-1]: {model.diffusion.alpha_hat[-1]:.6f}")
+    print(f"guidance_scale: {model.diffusion.guidance_scale}")
     
     # 检查是否有 nan
     print(f"beta 有 nan: {torch.isnan(model.diffusion.beta).any()}")
@@ -60,6 +61,32 @@ def debug_inference(exp_folder, data_path='./input_4.27/'):
     cond_matrix = batch['cond_matrix'].numpy()
     print(f"cond_matrix 范围: [{np.nanmin(cond_matrix):.4f}, {np.nanmax(cond_matrix):.4f}]")
     
+    # 检查 residual_3ch 的值范围（与 cond_matrix 对比）
+    residual_3ch = batch['residual_3ch'].numpy()
+    print(f"residual_3ch 范围: [{np.nanmin(residual_3ch):.4f}, {np.nanmax(residual_3ch):.4f}]")
+    
+    # 【关键检查】坐标系一致性
+    print(f"\n=== 坐标系一致性检查 ===")
+    # 检查 cond_matrix 是否覆盖 residual_3ch 的范围
+    c_down_min = np.min(cond_matrix[..., 0])
+    c_up_max = np.max(cond_matrix[..., 1])
+    res_min = np.min(residual_3ch)
+    res_max = np.max(residual_3ch)
+    
+    print(f"cond_matrix 下界范围: [{np.min(cond_matrix[..., 0]):.4f}, {np.max(cond_matrix[..., 0]):.4f}]")
+    print(f"cond_matrix 上界范围: [{np.min(cond_matrix[..., 1]):.4f}, {np.max(cond_matrix[..., 1]):.4f}]")
+    print(f"residual_3ch 范围: [{res_min:.4f}, {res_max:.4f}]")
+    
+    # 计算覆盖率（residual 在 cond_matrix 区间内的比例）
+    c_down = cond_matrix[..., 0]
+    c_up = cond_matrix[..., 1]
+    in_range = (residual_3ch >= c_down) & (residual_3ch <= c_up)
+    coverage_ratio = np.mean(in_range)
+    print(f"residual 在 cond_matrix 区间内的比例: {coverage_ratio:.2%}")
+    
+    if coverage_ratio < 0.5:
+        print(f"⚠ 警告: residual 与 cond_matrix 坐标系可能不一致！")
+    
     # 移动到设备
     forecast_3ch = batch['forecast_3ch'].to(device)
     time_encoding = batch['time_encoding'].to(device)
@@ -78,88 +105,99 @@ def debug_inference(exp_folder, data_path='./input_4.27/'):
     print(f"\n=== 初始噪声 ===")
     print(f"x_t: nan={torch.isnan(x_t).any()}, range=[{x_t.min():.4f}, {x_t.max():.4f}]")
     
-    # 逐步去噪，检查每一步
-    print(f"\n=== 逐步去噪检查 ===")
-    nan_first_step = None
+    # 使用带调试的采样
+    print(f"\n=== 逐步去噪检查（带梯度监控）===")
     
     with torch.no_grad():
-        for t in range(model.diffusion.num_steps - 1, -1, -1):
-            # 检查去噪前 - nan 和 inf
-            if torch.isnan(x_t).any():
-                nan_first_step = t + 1
-                print(f"⚠ nan 出现在 step {t+1} (去噪前)")
-                break
-            if torch.isinf(x_t).any():
-                nan_first_step = t + 1
-                print(f"⚠ inf 出现在 step {t+1} (去噪前)")
-                print(f"  x_t inf 数量: {torch.isinf(x_t).sum()}")
-                # 检查前一步的详细信息
-                break
-            
-            # 执行去噪
-            x_prev = model.diffusion.denoise_step(x_t, t, cond_full, cond_matrix, time_feat)
-            
-            # 检查去噪后 - nan 和 inf
-            if torch.isinf(x_prev).any():
-                nan_first_step = t
-                print(f"⚠ inf 出现在 step {t} (去噪后)")
-                print(f"  x_prev inf 数量: {torch.isinf(x_prev).sum()}")
-                print(f"  alpha_t={model.diffusion.alpha[t]:.6f}, alpha_hat_t={model.diffusion.alpha_hat[t]:.6f}")
-                break
-            
-            if torch.isnan(x_prev).any():
-                nan_first_step = t
-                print(f"⚠ nan 出现在 step {t} (去噪后)")
-                
-                # 详细检查
-                alpha_t = model.diffusion.alpha[t]
-                alpha_hat_t = model.diffusion.alpha_hat[t]
-                print(f"  alpha_t={alpha_t:.6f}, alpha_hat_t={alpha_hat_t:.6f}")
-                
-                # 检查模型输出
-                input_14ch = torch.cat([x_t, cond_full], dim=1)
-                predicted_noise = model.unet(input_14ch, time_feat)
-                print(f"  predicted_noise: nan={torch.isnan(predicted_noise).any()}")
-                print(f"  predicted_noise range: [{predicted_noise.min():.4f}, {predicted_noise.max():.4f}]")
-                
-                # 检查 input_14ch
-                print(f"  input_14ch: nan={torch.isnan(input_14ch).any()}, range=[{input_14ch.min():.4f}, {input_14ch.max():.4f}]")
-                
-                # 检查 time_feat
-                print(f"  time_feat: nan={torch.isnan(time_feat).any()}")
-                
-                # 检查模型权重是否有 nan
-                for name, param in model.unet.named_parameters():
-                    if torch.isnan(param).any():
-                        print(f"  ⚠ 模型权重 nan: {name}")
-                
-                # 检查去噪公式各部分
-                print(f"\n  === 去噪公式分解 ===")
-                print(f"  x_t range: [{x_t.min():.4f}, {x_t.max():.4f}]")
-                print(f"  (1 - alpha_t) = {1 - alpha_t:.6f}")
-                print(f"  (1 - alpha_hat_t).sqrt() = {(1 - alpha_hat_t).sqrt():.6f}")
-                coef = (1 - alpha_t) / (1 - alpha_hat_t).sqrt()
-                print(f"  噪声系数 = {coef:.6f}")
-                
-                # 手动计算 mean
-                mean_part = x_t - coef * predicted_noise
-                print(f"  x_t - coef*predicted_noise: nan={torch.isnan(mean_part).any()}")
-                
-                break
-            
-            x_t = x_prev
-            
-            # 每 100 步打印一次
-            if t % 100 == 0:
-                print(f"step {t}: x_t range=[{x_t.min():.4f}, {x_t.max():.4f}]")
+        samples, debug_log = model.diffusion.sample(
+            cond_full, cond_matrix, time_feat, n_samples=1, 
+            debug=True, debug_steps=debug_steps
+        )
     
-    if nan_first_step is None:
-        print(f"\n✓ 去噪完成，无 nan")
-        print(f"最终 x_0: range=[{x_t.min():.4f}, {x_t.max():.4f}]")
-    else:
-        print(f"\n✗ nan 首次出现在 step {nan_first_step}")
+    # 打印调试日志
+    print(f"\n=== 梯度监控日志 ===")
+    for info in debug_log:
+        print(f"\nStep {info['step']}:")
+        print(f"  alpha_t={info['alpha_t']:.6f}, alpha_hat_t={info['alpha_hat_t']:.6f}")
+        print(f"  t_decay={info['t_decay']:.4f}, guidance_applied={info['guidance_applied']:.4f}")
+        print(f"  x_t range: [{info['x_t_range'][0]:.4f}, {info['x_t_range'][1]:.4f}]")
+        print(f"  c_down range: [{info['c_down_range'][0]:.4f}, {info['c_down_range'][1]:.4f}]")
+        print(f"  c_up range: [{info['c_up_range'][0]:.4f}, {info['c_up_range'][1]:.4f}]")
+        print(f"  gamma_ratio (超出区间比例): {info['gamma_ratio']:.2%}")
+        print(f"  below_ratio (低于下界比例): {info['below_ratio']:.2%}")
+        print(f"  above_ratio (高于上界比例): {info['above_ratio']:.2%}")
+        print(f"  gradient range: [{info['gradient_range'][0]:.4f}, {info['gradient_range'][1]:.4f}]")
+        print(f"  gradient mean: {info['gradient_mean']:.4f}")
+        print(f"  x_prev range: [{info['x_prev_range'][0]:.4f}, {info['x_prev_range'][1]:.4f}]")
+        print(f"  has_nan: {info['has_nan']}, has_inf: {info['has_inf']}")
     
-    return nan_first_step
+    # 最终结果检查
+    print(f"\n=== 最终结果 ===")
+    final_sample = samples[0, 0].cpu().numpy()  # (3, 168)
+    print(f"生成样本范围: [{final_sample.min():.4f}, {final_sample.max():.4f}]")
+    print(f"生成样本有 nan: {np.isnan(final_sample).any()}")
+    print(f"生成样本有 inf: {np.isinf(final_sample).any()}")
+    
+    # 计算最终覆盖率
+    c_down_np = cond_matrix[0].cpu().numpy()  # (3, 168, 2)
+    c_up_np = c_down_np[..., 1]
+    c_down_np = c_down_np[..., 0]
+    final_in_range = (final_sample >= c_down_np) & (final_sample <= c_up_np)
+    final_coverage = np.mean(final_in_range)
+    print(f"生成样本在 cond_matrix 区间内的比例: {final_coverage:.2%}")
+    
+    return debug_log
+
+
+def check_kde_consistency(data_path='./input_4.27/'):
+    """检查 KDE 条件矩阵与残差数据的一致性"""
+    
+    import pickle
+    
+    print(f"\n=== KDE 一致性检查 ===")
+    
+    # 加载 KDE 模型
+    kde_path = os.path.join(data_path, 'kde_multivariate.pkl')
+    if not os.path.exists(kde_path):
+        print(f"KDE 模型不存在: {kde_path}")
+        return
+    
+    with open(kde_path, 'rb') as f:
+        kde_data = pickle.load(f)
+    
+    # 加载残差数据
+    test_res = np.load(os.path.join(data_path, 'test_res.npy'))
+    test_pred = np.load(os.path.join(data_path, 'test_pred.npy'))
+    
+    print(f"test_res shape: {test_res.shape}")
+    print(f"test_pred shape: {test_pred.shape}")
+    
+    # 检查 error_stats
+    for channel_name in ['wind', 'solar', 'load']:
+        if channel_name in kde_data['error_stats']:
+            means = kde_data['error_stats'][channel_name]['means']
+            stds = kde_data['error_stats'][channel_name]['stds']
+            print(f"\n{channel_name} error_stats:")
+            print(f"  means: {means}")
+            print(f"  stds: {stds}")
+            
+            # 计算条件区间宽度
+            interval_widths = [2 * s for s in stds]  # k_h = 2.0 * std
+            print(f"  interval widths (k_h=2.0*std): {interval_widths}")
+    
+    # 检查条件矩阵缓存
+    for mode in ['train', 'val', 'test']:
+        cache_path = os.path.join(data_path, f'cond_matrix_{mode}.npy')
+        if os.path.exists(cache_path):
+            cond_matrix = np.load(cache_path)
+            print(f"\ncond_matrix_{mode} shape: {cond_matrix.shape}")
+            print(f"  下界范围: [{cond_matrix[..., 0].min():.4f}, {cond_matrix[..., 0].max():.4f}]")
+            print(f"  上界范围: [{cond_matrix[..., 1].min():.4f}, {cond_matrix[..., 1].max():.4f}]")
+            
+            # 计算区间宽度
+            widths = cond_matrix[..., 1] - cond_matrix[..., 0]
+            print(f"  区间宽度范围: [{widths.min():.4f}, {widths.max():.4f}]")
+            print(f"  区间宽度均值: {widths.mean():.4f}")
 
 
 if __name__ == '__main__':
@@ -167,6 +205,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_folder', default='./save/run_beta04_lrsched_20260510_1656')
     parser.add_argument('--data_path', default='./input_4.27/')
+    parser.add_argument('--check_kde', action='store_true', help='仅检查 KDE 一致性')
     args = parser.parse_args()
     
-    debug_inference(args.exp_folder, args.data_path)
+    if args.check_kde:
+        check_kde_consistency(args.data_path)
+    else:
+        debug_inference(args.exp_folder, args.data_path)

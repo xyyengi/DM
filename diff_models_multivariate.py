@@ -398,7 +398,7 @@ class GaussianDiffusionMultivariate(nn.Module):
         
         return x_t, noise
     
-    def compute_conditional_gradient(self, x_t, cond_matrix):
+    def compute_conditional_gradient(self, x_t, cond_matrix, debug=False):
         """
         论文公式10: 计算条件梯度
         
@@ -411,9 +411,11 @@ class GaussianDiffusionMultivariate(nn.Module):
         Args:
             x_t: (B, 3, 168) 当前生成值
             cond_matrix: (B, 3, 168, 2) 条件矩阵 [c_down, c_up]
+            debug: 是否打印调试信息
         Returns:
             gradient: (B, 3, 168) 条件梯度
             gamma_mask: (B, 3, 168) 二值系数掩码
+            debug_info: dict 调试信息（仅当 debug=True）
         """
         c_down = cond_matrix[..., 0]  # (B, 3, 168)
         c_up = cond_matrix[..., 1]
@@ -436,9 +438,23 @@ class GaussianDiffusionMultivariate(nn.Module):
         above_mask = (x_t > c_up).float()
         gradient = gradient + above_mask * (c_up - x_t)
         
-        return gradient, gamma_mask
+        # 调试信息
+        debug_info = None
+        if debug:
+            debug_info = {
+                'x_t_range': (x_t.min().item(), x_t.max().item()),
+                'c_down_range': (c_down.min().item(), c_down.max().item()),
+                'c_up_range': (c_up.min().item(), c_up.max().item()),
+                'gamma_ratio': gamma_mask.mean().item(),  # 超出区间的比例
+                'below_ratio': below_mask.mean().item(),  # 低于下界的比例
+                'above_ratio': above_mask.mean().item(),  # 高于上界的比例
+                'gradient_range': (gradient.min().item(), gradient.max().item()),
+                'gradient_mean': gradient.mean().item(),
+            }
+        
+        return gradient, gamma_mask, debug_info
     
-    def denoise_step(self, x_t, t, cond_full, cond_matrix, time_feat):
+    def denoise_step(self, x_t, t, cond_full, cond_matrix, time_feat, debug=False):
         """
         论文公式10: 反向去噪一步
         
@@ -453,11 +469,14 @@ class GaussianDiffusionMultivariate(nn.Module):
             cond_full: (B, 11, 168) 条件部分 (Base Prediction + Time Encoding)
             cond_matrix: (B, 3, 168, 2) KDE条件矩阵
             time_feat: (B, 168, d_time) 时间特征
+            debug: 是否返回调试信息
         Returns:
             x_{t-1}: 去噪一步后的数据
+            debug_info: dict 调试信息（仅当 debug=True）
         """
         B = x_t.shape[0]
         device = x_t.device
+        debug_info = None
         
         # 构建14通道输入: [x_t (3), cond_full (11)]
         input_14ch = torch.cat([x_t, cond_full], dim=1)  # (B, 14, 168)
@@ -470,8 +489,6 @@ class GaussianDiffusionMultivariate(nn.Module):
         alpha_hat_t = self.alpha_hat[t]
         
         # 基础去噪公式 - 添加数值稳定性保护
-        # 当 alpha_hat_t 很小时，(1 - alpha_hat_t).sqrt() 接近 1，应该没问题
-        # 但需要防止 predicted_noise 过大导致 mean 爆炸
         coef = (1 - alpha_t) / (1 - alpha_hat_t).sqrt()
         mean = (1 / alpha_t.sqrt()) * (x_t - coef * predicted_noise)
         
@@ -482,38 +499,50 @@ class GaussianDiffusionMultivariate(nn.Module):
             t_decay = (t + 1) / self.num_steps if self.num_steps > 0 else 1.0
             
             # 计算条件梯度（返回梯度方向和二值掩码）
-            cond_gradient, gamma_mask = self.compute_conditional_gradient(x_t, cond_matrix)
+            cond_gradient, gamma_mask, grad_debug = self.compute_conditional_gradient(x_t, cond_matrix, debug=debug)
             
             # 【关键修复】梯度裁剪：防止梯度爆炸
             # 将梯度限制在 [-0.1, 0.1] 范围内，防止采样初期因距离过大导致的数值爆炸
-            cond_gradient = torch.clamp(cond_gradient, min=-0.1, max=0.1)
+            cond_gradient_clamped = torch.clamp(cond_gradient, min=-0.1, max=0.1)
             
             # 应用梯度修正：只在超出区间的地方修正
-            # gamma_mask 已经是二值系数，这里不需要额外限制
-            mean = mean - self.guidance_scale * t_decay * cond_gradient * gamma_mask
+            mean = mean - self.guidance_scale * t_decay * cond_gradient_clamped * gamma_mask
+            
+            if debug:
+                debug_info = {
+                    'step': t,
+                    'alpha_t': alpha_t.item(),
+                    'alpha_hat_t': alpha_hat_t.item(),
+                    't_decay': t_decay,
+                    'predicted_noise_range': (predicted_noise.min().item(), predicted_noise.max().item()),
+                    'mean_before_guidance_range': (mean.min().item(), mean.max().item()),
+                    'guidance_applied': self.guidance_scale * t_decay,
+                    **grad_debug
+                }
         
         # 【关键修复】数值稳定性保护：限制在归一化范围内
-        # 归一化后的残差应该在 [-1, 1] 范围内
-        # 使用稍宽的范围 [-2, 2] 允许一定的探索空间
         mean = torch.clamp(mean, min=-2.0, max=2.0)
         
         # 添加噪声（除了最后一步）
         if t > 0:
             sigma = self.beta[t].sqrt()
             noise = torch.randn_like(x_t)
-            # 噪声也需要限制，防止爆炸
             noise = torch.clamp(noise, min=-1.0, max=1.0)
             x_prev = mean + sigma * noise
         else:
             x_prev = mean
         
         # 【关键修复】最终保护：确保输出在归一化范围内
-        # 这是 fix.md 第一阶段的核心修复
         x_prev = torch.clamp(x_prev, min=-1.0, max=1.0)
         
-        return x_prev
+        if debug and debug_info:
+            debug_info['x_prev_range'] = (x_prev.min().item(), x_prev.max().item())
+            debug_info['has_nan'] = torch.isnan(x_prev).any().item()
+            debug_info['has_inf'] = torch.isinf(x_prev).any().item()
+        
+        return x_prev, debug_info
     
-    def sample(self, cond_full, cond_matrix, time_feat, n_samples=1):
+    def sample(self, cond_full, cond_matrix, time_feat, n_samples=1, debug=False, debug_steps=None):
         """
         完整采样过程：从噪声生成场景
         
@@ -522,24 +551,35 @@ class GaussianDiffusionMultivariate(nn.Module):
             cond_matrix: (B, 3, 168, 2) KDE条件矩阵
             time_feat: (B, 168, d_time) 时间特征
             n_samples: 生成样本数量
+            debug: 是否启用调试模式
+            debug_steps: 调试信息收集的步骤列表（如 [499, 400, 300, 200, 100, 50, 0]）
         Returns:
             samples: (B, n_samples, 3, 168) 生成的场景
+            debug_log: list 调试日志（仅当 debug=True）
         """
         B = cond_full.shape[0]
         device = cond_full.device
         
         # 初始化纯噪声
         samples = torch.zeros(B, n_samples, 3, 168, device=device)
+        debug_log = []
         
         for s in range(n_samples):
             x_t = torch.randn(B, 3, 168, device=device)
             
             # 逐步去噪
             for t in range(self.num_steps - 1, -1, -1):
-                x_t = self.denoise_step(x_t, t, cond_full, cond_matrix, time_feat)
+                # 判断是否需要收集调试信息
+                need_debug = debug and (debug_steps is None or t in debug_steps)
+                x_t, step_debug = self.denoise_step(x_t, t, cond_full, cond_matrix, time_feat, debug=need_debug)
+                
+                if need_debug and step_debug:
+                    debug_log.append(step_debug)
             
             samples[:, s] = x_t
         
+        if debug:
+            return samples, debug_log
         return samples
     
     def forward(self, x0, cond_full, time_feat, cond_matrix=None, t=None):

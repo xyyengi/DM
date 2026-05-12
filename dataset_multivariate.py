@@ -106,34 +106,87 @@ class MultiChannelKDE:
         channel_name = ['wind', 'solar', 'load'][channel_idx]
         return self.error_stats[channel_name]['means'][interval_idx]
     
-    def get_conditional_interval(self, forecast_value, channel_idx):
+    def get_conditional_interval(self, forecast_value, channel_idx, lower_percentile=10, upper_percentile=90):
         """
         论文公式9: 构建条件区间 c = [c_down, c_up]
         
-        【关键修复】条件区间应该是残差的置信区间，而不是预测值的置信区间！
+        【严格按照论文实现】
+        1. 基于预测功率 f 条件下的残差 KDE 模型
+        2. 从条件 KDE 分布中提取第 lower_percentile 和 upper_percentile 分位数
+        3. 确保坐标系一致：c 边界处于残差空间（[-1, 1]）
+        4. 物理一致性：c_down 和 c_up 随预测功率变化而动态波动（异方差特性）
         
-        原问题：
-        - forecast_value 是归一化的预测值（范围 [0, 1]）
-        - 但模型生成的是归一化的残差（范围 [-1, 1]）
-        - 两者不在同一个坐标系，导致 Coverage=0%
+        Args:
+            forecast_value: 归一化的预测功率值（范围 [0, 1]）
+            channel_idx: 通道索引（0=风电, 1=光伏, 2=负荷）
+            lower_percentile: 下分位数（默认10，对应80%置信区间下界）
+            upper_percentile: 上分位数（默认90，对应80%置信区间上界）
         
-        修复：
-        - 条件区间直接基于残差的统计量（均值 ± 标差）
-        - 这样生成的残差才能落在正确的区间内
+        Returns:
+            c_down: 残差下界（残差空间，可以是负数）
+            c_up: 残差上界（残差空间）
         """
         interval_idx = self.get_interval_index(forecast_value, channel_idx)
         channel_name = ['wind', 'solar', 'load'][channel_idx]
         
-        # 获取该区间的残差统计量
-        error_mean = self.error_stats[channel_name]['means'][interval_idx]
-        error_std = self.error_stats[channel_name]['stds'][interval_idx]
+        # 获取该区间的KDE模型
+        kde = self.kde_models[channel_name][interval_idx]
         
-        # 【关键修复】条件区间是残差的置信区间
-        # 使用 2倍标准差作为区间宽度（约95%置信区间）
-        k_h = 2.0 * error_std
-        
-        c_down = error_mean - k_h  # 残差下界（可以是负数）
-        c_up = error_mean + k_h    # 残差上界
+        if kde is not None:
+            # 【严格按照论文】从KDE分布中提取分位数
+            # 使用 scipy.stats.gaussian_kde 的 inverse CDF (ppf)
+            # 注意：scipy的kde没有直接的ppf方法，需要通过积分计算
+            
+            # 方法：使用数值积分求分位数
+            # c_down = P_10: 满足 P(e <= c_down | f) = 0.10
+            # c_up = P_90: 满足 P(e <= c_up | f) = 0.90
+            
+            # 获取KDE支持的残差范围
+            # 残差数据范围通常在 [-1, 1]（归一化后）
+            residual_min = -1.0
+            residual_max = 1.0
+            
+            # 创建评估点
+            n_points = 1000
+            x_grid = np.linspace(residual_min, residual_max, n_points)
+            
+            # 计算累积分布函数 (CDF)
+            pdf_values = kde(x_grid)
+            cdf_values = np.cumsum(pdf_values) * (x_grid[1] - x_grid[0])  # 积分
+            cdf_values = cdf_values / cdf_values[-1]  # 归一化到 [0, 1]
+            
+            # 提取分位数
+            # 找到 CDF = lower_percentile/100 和 CDF = upper_percentile/100 对应的 x 值
+            c_down_idx = np.searchsorted(cdf_values, lower_percentile / 100)
+            c_up_idx = np.searchsorted(cdf_values, upper_percentile / 100)
+            
+            # 确保索引在有效范围内
+            c_down_idx = max(0, min(c_down_idx, n_points - 1))
+            c_up_idx = max(0, min(c_up_idx, n_points - 1))
+            
+            c_down = x_grid[c_down_idx]
+            c_up = x_grid[c_up_idx]
+            
+            # 【物理一致性检查】确保区间宽度合理
+            # 如果区间太窄（可能因为数据太少），使用统计量作为后备
+            interval_width = c_up - c_down
+            error_std = self.error_stats[channel_name]['stds'][interval_idx]
+            min_width = 0.5 * error_std  # 最小宽度
+            
+            if interval_width < min_width:
+                # 后备方案：使用均值 ± 分位数对应的标准差倍数
+                error_mean = self.error_stats[channel_name]['means'][interval_idx]
+                # 对于80%置信区间，使用1.28倍标准差
+                z_score = 1.28 if (upper_percentile - lower_percentile) == 80 else 1.64
+                c_down = error_mean - z_score * error_std
+                c_up = error_mean + z_score * error_std
+        else:
+            # 如果KDE模型不存在，使用统计量作为后备
+            error_mean = self.error_stats[channel_name]['means'][interval_idx]
+            error_std = self.error_stats[channel_name]['stds'][interval_idx]
+            z_score = 1.28 if (upper_percentile - lower_percentile) == 80 else 1.64
+            c_down = error_mean - z_score * error_std
+            c_up = error_mean + z_score * error_std
         
         return c_down, c_up
     
