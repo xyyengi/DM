@@ -495,8 +495,10 @@ class GaussianDiffusionMultivariate(nn.Module):
         # 论文公式10: 条件梯度修正
         # γ 是 0-1 二值系数：超出条件区间时才修正
         if self.guidance_scale > 0:
-            # 时间步衰减系数: t 越小（越接近最后去噪），约束越强
-            t_decay = (t + 1) / self.num_steps if self.num_steps > 0 else 1.0
+            # 【修复】时间步衰减系数: t 越小（越接近最后去噪），约束越强
+            # 原来: t_decay = (t + 1) / num_steps，导致 t=0 时只有 0.002
+            # 改成: t_decay = 1 - t / num_steps，t=0 时为 1.0，t=499 时为 0.002
+            t_decay = 1.0 - t / self.num_steps if self.num_steps > 0 else 1.0
             
             # 计算条件梯度（返回梯度方向和二值掩码）
             cond_gradient, gamma_mask, grad_debug = self.compute_conditional_gradient(x_t, cond_matrix, debug=debug)
