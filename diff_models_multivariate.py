@@ -623,8 +623,8 @@ class GaussianDiffusionMultivariate(nn.Module):
             t_decay = (t.float() + 1) / self.num_steps if self.num_steps > 0 else 1.0
             t_decay = t_decay.view(-1, 1, 1)
             
-            # 计算条件梯度（返回梯度方向和二值掩码）
-            cond_gradient, gamma_mask = self.compute_conditional_gradient(x_t, cond_matrix)
+            # 计算条件梯度（返回梯度方向和二值掩码，忽略debug_info）
+            cond_gradient, gamma_mask, _ = self.compute_conditional_gradient(x_t, cond_matrix)
             mean = mean - self.guidance_scale * t_decay * cond_gradient * gamma_mask
             
             # 从修正后的均值反推预测噪声（用于损失计算）
