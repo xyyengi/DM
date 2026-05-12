@@ -504,12 +504,11 @@ class GaussianDiffusionMultivariate(nn.Module):
             cond_gradient, gamma_mask, grad_debug = self.compute_conditional_gradient(x_t, cond_matrix, debug=debug)
             
             # 【修复】放宽梯度裁剪范围
-            # 原来的 [-0.1, 0.1] 太弱，无法推动 x_t 回到窄区间
-            # 改为 [-1.0, 1.0]，让梯度能有效引导
             cond_gradient_clamped = torch.clamp(cond_gradient, min=-1.0, max=1.0)
             
             # 应用梯度修正：只在超出区间的地方修正
-            mean = mean - self.guidance_scale * t_decay * cond_gradient_clamped * gamma_mask
+            # 【关键修复】gradient 已经是(目标 - 当前)的向量，代表更新的正确方向，应当是加上而不是减去！
+            mean = mean + self.guidance_scale * t_decay * cond_gradient_clamped * gamma_mask
             
             if debug:
                 debug_info = {
@@ -523,20 +522,14 @@ class GaussianDiffusionMultivariate(nn.Module):
                     **grad_debug
                 }
         
-        # 【关键修复】数值稳定性保护：限制在归一化范围内
-        mean = torch.clamp(mean, min=-2.0, max=2.0)
-        
         # 添加噪声（除了最后一步）
         if t > 0:
             sigma = self.beta[t].sqrt()
             noise = torch.randn_like(x_t)
-            noise = torch.clamp(noise, min=-1.0, max=1.0)
+            # 移除错误限制: noise = torch.clamp(noise, min=-1.0, max=1.0)
             x_prev = mean + sigma * noise
         else:
             x_prev = mean
-        
-        # 【关键修复】最终保护：确保输出在归一化范围内
-        x_prev = torch.clamp(x_prev, min=-1.0, max=1.0)
         
         if debug and debug_info:
             debug_info['x_prev_range'] = (x_prev.min().item(), x_prev.max().item())
@@ -614,27 +607,8 @@ class GaussianDiffusionMultivariate(nn.Module):
         # 预测噪声（模型输出3维）
         predicted_noise = self.model(input_14ch, time_feat)
         
-        # 如果提供了条件矩阵，应用条件梯度修正（保证训练推理一致）
-        # 这样模型学到的是"在约束下的去噪"过程
-        if cond_matrix is not None and self.guidance_scale > 0:
-            # 计算去噪均值
-            alpha_t = self.alpha[t].view(-1, 1, 1)
-            alpha_hat_t = self.alpha_hat[t].view(-1, 1, 1)
-            mean = (1 / alpha_t.sqrt()) * (x_t - (1 - alpha_t) / (1 - alpha_hat_t).sqrt() * predicted_noise)
-            
-            # 应用条件梯度修正（带时间步衰减）
-            t_decay = (t.float() + 1) / self.num_steps if self.num_steps > 0 else 1.0
-            t_decay = t_decay.view(-1, 1, 1)
-            
-            # 计算条件梯度（返回梯度方向和二值掩码，忽略debug_info）
-            cond_gradient, gamma_mask, _ = self.compute_conditional_gradient(x_t, cond_matrix)
-            mean = mean - self.guidance_scale * t_decay * cond_gradient * gamma_mask
-            
-            # 从修正后的均值反推预测噪声（用于损失计算）
-            # ε_pred = (√(1-ᾱ_t) / (1-α_t)) * (x_t - √α_t * mean)
-            predicted_noise = (1 - alpha_t) / (1 - alpha_hat_t).sqrt() * (x_t - alpha_t.sqrt() * mean)
-        
-        # 计算损失（MSE）
+        # 【修改】干干净净，只算噪声的基准 MSE 损失
+        # 移除训练时的条件梯度纠缠，把约束释放到纯推理阶段
         loss = F.mse_loss(predicted_noise, noise)
         
         return loss
