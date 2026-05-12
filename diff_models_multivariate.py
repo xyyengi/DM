@@ -501,9 +501,10 @@ class GaussianDiffusionMultivariate(nn.Module):
             # 计算条件梯度（返回梯度方向和二值掩码）
             cond_gradient, gamma_mask, grad_debug = self.compute_conditional_gradient(x_t, cond_matrix, debug=debug)
             
-            # 【关键修复】梯度裁剪：防止梯度爆炸
-            # 将梯度限制在 [-0.1, 0.1] 范围内，防止采样初期因距离过大导致的数值爆炸
-            cond_gradient_clamped = torch.clamp(cond_gradient, min=-0.1, max=0.1)
+            # 【修复】放宽梯度裁剪范围
+            # 原来的 [-0.1, 0.1] 太弱，无法推动 x_t 回到窄区间
+            # 改为 [-1.0, 1.0]，让梯度能有效引导
+            cond_gradient_clamped = torch.clamp(cond_gradient, min=-1.0, max=1.0)
             
             # 应用梯度修正：只在超出区间的地方修正
             mean = mean - self.guidance_scale * t_decay * cond_gradient_clamped * gamma_mask
