@@ -18,7 +18,7 @@
 train:
   epochs: 200
   batch_size: 64  # 32GB显存建议值
-  lr: 1.0e-3
+  lr: 5.0e-4  # 修复：从 1.0e-3 降低到 5.0e-4，缓解扩散模型高学习率震荡
 
 # 学习率调度器配置 (warmup + step decay)
 lr_scheduler:
