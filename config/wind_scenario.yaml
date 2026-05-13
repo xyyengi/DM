@@ -38,8 +38,8 @@ model:
   # 时间特征嵌入维度
   d_time: 64
   
-  # Res-UNet基础通道数（确保容量足够区分特征）
-  base_channels: 128
+  # Res-UNet基础通道数（之前128太大导致参数过剩严重过拟合）
+  base_channels: 64
   
   # Res-UNet层数
   num_layers: 4

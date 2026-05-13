@@ -133,10 +133,12 @@ def train(model, train_loader, val_loader, config, device, exp_folder, save_ever
     # 学习率配置
     if use_lr_scheduler and config.get('lr_scheduler', {}).get('enabled', False):
         initial_lr = config['lr_scheduler'].get('initial_lr', 1e-4)
-        optimizer = torch.optim.Adam(model.parameters(), lr=initial_lr)
+        # 添加 weight_decay (L2 正则化) 防止过拟合
+        optimizer = torch.optim.Adam(model.parameters(), lr=initial_lr, weight_decay=1e-4)
         scheduler = create_lr_scheduler(optimizer, config)
     else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        # 添加 weight_decay (L2 正则化) 防止过拟合
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
         scheduler = None
         print(f"使用固定学习率: {lr}")
     
