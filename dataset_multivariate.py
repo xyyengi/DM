@@ -31,12 +31,90 @@ class MultiChannelKDE:
     并考虑光伏夜间、负荷周末的特殊性。
     """
     
+    CACHE_VERSION = 2
+
     def __init__(self, n_intervals=10):
         self.n_intervals = n_intervals
+        self.cache_version = self.CACHE_VERSION
         self.kde_models = {}  # 存储每个通道、每个区间的KDE模型
         self.interval_bounds = {}  # 存储区间边界
         self.error_stats = {}  # 存储误差统计量
         self.precomputed_quantiles = {}  # 预计算的分位数 {channel: {interval: (c_down, c_up)}
+        self.interval_counts = {}  # 存储每个区间的样本数
+
+    def _get_neighbor_fallback_stats(self, channel_name, interval_idx, dense_threshold=5):
+        """Use nearby dense bins to estimate fallback mean/std for sparse intervals."""
+        counts = self.interval_counts.get(channel_name, [])
+        means = self.error_stats.get(channel_name, {}).get('means', [])
+        stds = self.error_stats.get(channel_name, {}).get('stds', [])
+
+        candidates = []
+        max_radius = max(interval_idx, len(counts) - 1 - interval_idx)
+        for radius in range(1, max_radius + 1):
+            left = interval_idx - radius
+            right = interval_idx + radius
+            if 0 <= left < len(counts) and counts[left] > dense_threshold:
+                candidates.append((left, radius))
+            if 0 <= right < len(counts) and counts[right] > dense_threshold:
+                candidates.append((right, radius))
+            if candidates:
+                break
+
+        if candidates:
+            weights = []
+            candidate_means = []
+            candidate_vars = []
+            for neighbor_idx, radius in candidates:
+                count = max(counts[neighbor_idx], 1)
+                weight = count / float(radius)
+                weights.append(weight)
+                candidate_means.append(means[neighbor_idx])
+                candidate_vars.append(stds[neighbor_idx] ** 2)
+
+            weights = np.asarray(weights, dtype=np.float64)
+            candidate_means = np.asarray(candidate_means, dtype=np.float64)
+            candidate_vars = np.asarray(candidate_vars, dtype=np.float64)
+            weight_sum = np.sum(weights)
+            if weight_sum > 0:
+                fallback_mean = float(np.sum(weights * candidate_means) / weight_sum)
+                second_moment = float(np.sum(weights * (candidate_vars + candidate_means ** 2)) / weight_sum)
+                fallback_var = max(second_moment - fallback_mean ** 2, 1e-6)
+                return fallback_mean, float(np.sqrt(fallback_var))
+
+        # 如果周围没有足够密集的箱，则退回到通道全局统计
+        finite_means = np.asarray([m for m in means if np.isfinite(m)], dtype=np.float64)
+        finite_stds = np.asarray([s for s in stds if np.isfinite(s)], dtype=np.float64)
+        global_mean = float(np.mean(finite_means)) if len(finite_means) > 0 else 0.0
+        global_std = float(np.sqrt(np.mean(finite_stds ** 2))) if len(finite_stds) > 0 else 1.0
+        return global_mean, max(global_std, 1e-6)
+
+    def _build_dynamic_grid(self, center_mean, center_std, interval_errors=None, channel_mean=None, channel_std=None, n_points=1000):
+        """Build a KDE integration grid that adapts to the local error scale."""
+        local_std = max(float(center_std), 1e-6)
+        span = max(4.0 * local_std, 1e-3)
+
+        if channel_std is not None:
+            span = max(span, 2.0 * float(channel_std))
+
+        residual_min = center_mean - span
+        residual_max = center_mean + span
+
+        if interval_errors is not None and len(interval_errors) > 0:
+            sample_min = float(np.min(interval_errors))
+            sample_max = float(np.max(interval_errors))
+            residual_min = min(residual_min, sample_min)
+            residual_max = max(residual_max, sample_max)
+
+        if channel_mean is not None and channel_std is not None:
+            channel_span = max(4.0 * float(channel_std), 1e-3)
+            residual_min = min(residual_min, float(channel_mean) - channel_span)
+            residual_max = max(residual_max, float(channel_mean) + channel_span)
+
+        if not np.isfinite(residual_min) or not np.isfinite(residual_max) or residual_max <= residual_min:
+            residual_min = center_mean - 1.0
+            residual_max = center_mean + 1.0
+
+        return np.linspace(residual_min, residual_max, n_points)
         
     def fit(self, forecast_data, residual_data):
         """
@@ -50,6 +128,8 @@ class MultiChannelKDE:
         """
         # 仅对前3个通道（风、光、负荷）进行KDE拟合
         n_channels_kde = 3  # 风、光、负荷
+        rng = np.random.default_rng(42)
+        max_kde_samples = 50000  # 每个区间最多使用的样本数，避免 gaussian_kde 在超大数据上过慢/过耗内存
         
         for c in range(n_channels_kde):
             channel_name = ['wind', 'solar', 'load'][c]
@@ -65,26 +145,52 @@ class MultiChannelKDE:
             bounds = np.percentile(f_flat, percentiles)
             self.interval_bounds[channel_name] = bounds
             
-            # 存储每个区间的KDE模型
-            self.kde_models[channel_name] = []
-            self.error_stats[channel_name] = {'means': [], 'stds': []}
-            
+            interval_errors_list = []
+            interval_counts = []
+            interval_means = []
+            interval_stds = []
+
             for i in range(self.n_intervals):
                 mask = (f_flat >= bounds[i]) & (f_flat < bounds[i+1])
                 interval_errors = e_flat[mask]
-                
-                if len(interval_errors) > 10:
+                count = len(interval_errors)
+                interval_errors_list.append(interval_errors)
+                interval_counts.append(count)
+                interval_means.append(float(np.mean(interval_errors)) if count > 0 else np.nan)
+                interval_stds.append(float(np.std(interval_errors)) if count > 0 else np.nan)
+
+            self.interval_counts[channel_name] = interval_counts
+
+            # 存储每个区间的KDE模型
+            self.kde_models[channel_name] = []
+            self.error_stats[channel_name] = {'means': [], 'stds': []}
+
+            for i in range(self.n_intervals):
+                interval_errors = interval_errors_list[i]
+                count = interval_counts[i]
+
+                # 如果样本数过少，使用邻近密集箱的统计量作为后备
+                if count > 5:
                     # 论文公式8: 核密度估计
-                    print(f"    [KDE] interval {i}: {len(interval_errors)} points, fitting...")
-                    kde = stats.gaussian_kde(interval_errors)
+                    if count > max_kde_samples:
+                        sample_idx = rng.choice(count, size=max_kde_samples, replace=False)
+                        kde_errors = interval_errors[sample_idx]
+                        print(f"    [KDE] interval {i}: {count} points, subsample {max_kde_samples}, fitting...")
+                    else:
+                        kde_errors = interval_errors
+                        print(f"    [KDE] interval {i}: {count} points, fitting...")
+                    kde = stats.gaussian_kde(kde_errors)
                     self.kde_models[channel_name].append(kde)
-                    self.error_stats[channel_name]['means'].append(np.mean(interval_errors))
-                    self.error_stats[channel_name]['stds'].append(np.std(interval_errors))
+                    interval_mean = interval_means[i]
+                    interval_std = max(interval_stds[i], 1e-6)
+                    self.error_stats[channel_name]['means'].append(interval_mean)
+                    self.error_stats[channel_name]['stds'].append(interval_std)
                     print(f"    [KDE] interval {i}: done")
                 else:
                     self.kde_models[channel_name].append(None)
-                    self.error_stats[channel_name]['means'].append(0)
-                    self.error_stats[channel_name]['stds'].append(1)
+                    fallback_mean, fallback_std = self._get_neighbor_fallback_stats(channel_name, i)
+                    self.error_stats[channel_name]['means'].append(fallback_mean)
+                    self.error_stats[channel_name]['stds'].append(fallback_std)
             
             # 预计算该通道所有区间的分位数（避免每次调用都计算CDF）
             print(f"    [KDE] precomputing quantiles for {channel_name}...")
@@ -92,17 +198,29 @@ class MultiChannelKDE:
             for i in range(self.n_intervals):
                 kde = self.kde_models[channel_name][i]
                 if kde is not None:
-                    # 预计算第10和第90分位数
-                    residual_min = -1.0
-                    residual_max = 1.0
-                    n_points = 1000
-                    x_grid = np.linspace(residual_min, residual_max, n_points)
+                    # 预计算第10和第90分位数，网格范围随该区间误差分布自适应
+                    error_mean = self.error_stats[channel_name]['means'][i]
+                    error_std = self.error_stats[channel_name]['stds'][i]
+                    x_grid = self._build_dynamic_grid(
+                        error_mean,
+                        error_std,
+                        interval_errors=interval_errors_list[i],
+                        channel_mean=float(np.mean(e_flat)) if len(e_flat) > 0 else None,
+                        channel_std=float(np.std(e_flat)) if len(e_flat) > 0 else None,
+                        n_points=1000,
+                    )
                     pdf_values = kde(x_grid)
                     cdf_values = np.cumsum(pdf_values) * (x_grid[1] - x_grid[0])
+                    if cdf_values[-1] <= 0 or not np.isfinite(cdf_values[-1]):
+                        self.precomputed_quantiles[channel_name][i] = (
+                            error_mean - 1.28 * error_std,
+                            error_mean + 1.28 * error_std
+                        )
+                        continue
                     cdf_values = cdf_values / cdf_values[-1]
                     
-                    c_down_idx = max(0, min(np.searchsorted(cdf_values, 0.10), n_points - 1))
-                    c_up_idx = max(0, min(np.searchsorted(cdf_values, 0.90), n_points - 1))
+                    c_down_idx = max(0, min(np.searchsorted(cdf_values, 0.10), len(x_grid) - 1))
+                    c_up_idx = max(0, min(np.searchsorted(cdf_values, 0.90), len(x_grid) - 1))
                     
                     self.precomputed_quantiles[channel_name][i] = (
                         x_grid[c_down_idx], x_grid[c_up_idx]
@@ -169,9 +287,11 @@ class MultiChannelKDE:
         """保存KDE模型（包括预计算的分位数）"""
         with open(path, 'wb') as f:
             pickle.dump({
+                'cache_version': self.cache_version,
                 'kde_models': self.kde_models,
                 'interval_bounds': self.interval_bounds,
                 'error_stats': self.error_stats,
+                'interval_counts': self.interval_counts,
                 'n_intervals': self.n_intervals,
                 'precomputed_quantiles': self.precomputed_quantiles
             }, f)
@@ -180,9 +300,13 @@ class MultiChannelKDE:
         """加载KDE模型（包括预计算的分位数）"""
         with open(path, 'rb') as f:
             data = pickle.load(f)
+            cache_version = data.get('cache_version', 1)
+            if cache_version != self.CACHE_VERSION:
+                raise ValueError(f"KDE cache version mismatch: {cache_version} != {self.CACHE_VERSION}")
             self.kde_models = data['kde_models']
             self.interval_bounds = data['interval_bounds']
             self.error_stats = data['error_stats']
+            self.interval_counts = data.get('interval_counts', {})
             self.n_intervals = data['n_intervals']
             # 兼容旧版本：如果没有预计算分位数，标记为空
             self.precomputed_quantiles = data.get('precomputed_quantiles', {})
@@ -222,8 +346,17 @@ class MultiChannelWindScenarioDataset(Dataset):
         # 优先使用缓存，避免重复拟合（train模式也先检查缓存）
         if os.path.exists(kde_path):
             print(f"  [Dataset] loading KDE from cache: {kde_path}")
-            self.kde.load(kde_path)
-            print(f"  [Dataset] KDE loaded from cache.")
+            try:
+                self.kde.load(kde_path)
+                if self.kde.n_intervals != n_intervals:
+                    raise ValueError(f"KDE n_intervals mismatch: {self.kde.n_intervals} != {n_intervals}")
+                print(f"  [Dataset] KDE loaded from cache.")
+            except (ValueError, KeyError, EOFError, pickle.UnpicklingError) as exc:
+                print(f"  [Dataset] KDE cache invalid, refitting: {exc}")
+                self.kde = MultiChannelKDE(n_intervals=n_intervals)
+                self.kde.fit(self.forecast_norm, self.residual_norm)
+                self.kde.save(kde_path)
+                print(f"  [Dataset] KDE rebuilt and saved to {kde_path}")
         else:
             print(f"  [Dataset] fitting KDE (no cache, this may take a moment)...")
             self.kde.fit(self.forecast_norm, self.residual_norm)

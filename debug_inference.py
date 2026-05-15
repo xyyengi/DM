@@ -186,6 +186,20 @@ def check_kde_consistency(data_path='./input_4.27/'):
     
     print(f"test_res shape: {test_res.shape}")
     print(f"test_pred shape: {test_pred.shape}")
+    # 预加载所有预测数据以便统计每箱样本数并用于反归一化
+    pred_files = ['train_pred.npy', 'val_pred.npy', 'test_pred.npy']
+    preds = []
+    for fn in pred_files:
+        p = os.path.join(data_path, fn)
+        if os.path.exists(p):
+            preds.append(np.load(p))
+    if len(preds) > 0:
+        all_preds = np.concatenate(preds, axis=0)
+        max_values = np.max(np.abs(all_preds), axis=(0,1))
+    else:
+        all_preds = None
+        max_values = np.ones(11)
+    max_values = np.maximum(max_values, 1e-6)
     
     # 检查 error_stats
     for channel_name in ['wind', 'solar', 'load']:
@@ -199,6 +213,24 @@ def check_kde_consistency(data_path='./input_4.27/'):
             # 计算条件区间宽度
             interval_widths = [2 * s for s in stds]  # k_h = 2.0 * std
             print(f"  interval widths (k_h=2.0*std): {interval_widths}")
+
+            # 打印每个区间的样本数（如果保存了），否则用预测数据和区间边界统计样本数
+            interval_counts = kde_data.get('interval_counts', {}).get(channel_name, None)
+            if interval_counts is None:
+                # 尝试用 all_preds 和 interval_bounds 统计
+                bounds = kde_data.get('interval_bounds', {}).get(channel_name, None)
+                if bounds is not None and 'all_preds' in locals():
+                    channel_idx = ['wind','solar','load'].index(channel_name)
+                    f_flat = (all_preds[:, :, channel_idx] / max_values[channel_idx]).flatten()
+                    computed = []
+                    for i in range(len(bounds)-1):
+                        mask = (f_flat >= bounds[i]) & (f_flat < bounds[i+1])
+                        computed.append(int(np.sum(mask)))
+                    interval_counts = computed
+            if interval_counts is not None:
+                print(f"  interval counts: {interval_counts}")
+                low_bins = [i for i,c in enumerate(interval_counts) if c <= 5]
+                print(f"  bins with <=5 samples: {low_bins}")
     
     # 检查条件矩阵缓存
     for mode in ['train', 'val', 'test']:
@@ -213,6 +245,31 @@ def check_kde_consistency(data_path='./input_4.27/'):
             widths = cond_matrix[..., 1] - cond_matrix[..., 0]
             print(f"  区间宽度范围: [{widths.min():.4f}, {widths.max():.4f}]")
             print(f"  区间宽度均值: {widths.mean():.4f}")
+
+            # 计算并打印反归一化后的物理宽度（仅前三通道）
+            widths_np = widths  # shape (N,3,168)
+            widths_phys = widths_np * max_values[:3].reshape(1,3,1)
+            for c_idx, cname in enumerate(['wind','solar','load']):
+                w_c = widths_phys[:, c_idx, :]
+                print(f"  {cname} physical width (min/mean/max): [{w_c.min():.4f}, {w_c.mean():.4f}, {w_c.max():.4f}]")
+
+            # 计算覆盖率（使用归一化残差和 cond_matrix）
+            res_map = {'train':'train_res.npy', 'val':'val_res.npy', 'test':'test_res.npy'}
+            res_path = os.path.join(data_path, res_map[mode])
+            if os.path.exists(res_path):
+                residuals = np.load(res_path)
+                # residuals shape (N,168,11), cond_matrix shape (N,3,168,2)
+                # 先归一化残差（与构建 cond_matrix 时相同的归一化）
+                residuals_norm = residuals / max_values.reshape(1, 1, -1)
+                for c in range(3):
+                    c_down = cond_matrix[:, c, :, 0]
+                    c_up = cond_matrix[:, c, :, 1]
+                    res_c = residuals_norm[..., c]
+                    in_range = (res_c >= c_down) & (res_c <= c_up)
+                    coverage = np.mean(in_range)
+                    print(f"  {mode} {['wind','solar','load'][c]} coverage: {coverage:.2%}")
+            else:
+                print(f"  residual file not found for mode {mode}: {res_path}")
 
 
 if __name__ == '__main__':

@@ -321,30 +321,62 @@ def visualize_sampling_progress(model, batch, device, exp_folder, record_steps=N
             for t in range(model.diffusion.num_steps - 1, -1, -1):
                 if t in record_steps:
                     rec[t].append(x_t.detach().cpu().numpy())
-                x_t = model.diffusion.denoise_step(x_t, t, cond_full, cond_matrix, time_feat)
+                # denoise_step returns (x_prev, debug_info), unpack it
+                x_t, _ = model.diffusion.denoise_step(x_t, t, cond_full, cond_matrix, time_feat)
             # final
             if 0 in record_steps:
                 rec[0].append(x_t.detach().cpu().numpy())
 
-    # 选择第一个样本的记录绘图
+    # 选择第一个样本的记录绘图（更健壮的处理，避免不同记录导致的 dtype=object / tuple 错误）
     steps_sorted = sorted(record_steps, reverse=True)
-    # rec[t] 形状: (n_samples, B, 3, L)，取第一个样本的第一个batch
-    sample0 = {t: np.array(rec[t])[0, 0] for t in steps_sorted}  # shape (3, L)
+    sample0 = {}
+    for t in steps_sorted:
+        entries = rec.get(t, [])
+        if len(entries) == 0:
+            continue
+        # 将每个 entry 转为 ndarray，尽量堆叠
+        arrays = []
+        for e in entries:
+            try:
+                arrays.append(np.asarray(e))
+            except Exception:
+                # 跳过无法转换的 entry
+                continue
+        if len(arrays) == 0:
+            continue
+        try:
+            stacked = np.stack(arrays, axis=0)  # (n_samples, B, 3, L)
+            sample0[t] = stacked[0, 0]
+        except Exception:
+            # 回退：尽量从第一个可用 entry 抽取 (B,3,L) 并取第一个batch
+            first = arrays[0]
+            if first.ndim == 3:
+                sample0[t] = first[0]
+            elif first.ndim == 2:
+                # 直接是 (3, L)
+                sample0[t] = first
+            else:
+                # 不可用，跳过
+                continue
 
-    # 绘制：3行 x len(steps)列
-    n_cols = len(steps_sorted)
-    fig, axes = plt.subplots(3, n_cols, figsize=(3 * n_cols, 9))
-    for i, t in enumerate(steps_sorted):
-        data = sample0[t]  # shape (3, L)
-        L = data.shape[1]
-        for ch in range(3):
-            ax = axes[ch, i] if n_cols > 1 else axes[ch]
-            ax.plot(np.arange(L), data[ch], lw=1)
-            if ch == 0:
-                ax.set_title(f't={t}')
-            if i == 0:
-                ax.set_ylabel(f'Channel {ch}')
-            ax.grid(True)
+    # 绘制：3行 x len(available_steps)列
+    available_steps = [t for t in steps_sorted if t in sample0]
+    if len(available_steps) == 0:
+        print('No sampling records available to plot.')
+    else:
+        n_cols = len(available_steps)
+        fig, axes = plt.subplots(3, n_cols, figsize=(3 * n_cols, 9))
+        for i, t in enumerate(available_steps):
+            data = sample0[t]
+            L = data.shape[1]
+            for ch in range(3):
+                ax = axes[ch, i] if n_cols > 1 else axes[ch]
+                ax.plot(np.arange(L), data[ch], lw=1)
+                if ch == 0:
+                    ax.set_title(f't={t}')
+                if i == 0:
+                    ax.set_ylabel(f'Channel {ch}')
+                ax.grid(True)
     plt.tight_layout()
     out_path = os.path.join(exp_folder, 'logs', 'sampling_progress.png')
     fig.savefig(out_path)
