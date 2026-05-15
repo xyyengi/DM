@@ -16,7 +16,7 @@
 
 # 训练配置
 train:
-  epochs: 60
+  epochs: 200
   batch_size: 64  # 32GB显存建议值
   lr: 5.0e-4  # 修复：从 1.0e-3 降低到 5.0e-4，缓解扩散模型高学习率震荡
   weight_decay: 1.0e-3  # L2正则化，防止过拟合
