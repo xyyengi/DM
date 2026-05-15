@@ -79,50 +79,51 @@ def create_experiment_folder(base_path, exp_name):
 
 def create_lr_scheduler(optimizer, config):
     """
-    创建学习率调度器 (warmup + step decay)
+    创建学习率调度器 (warmup + cosine annealing)
     
     Args:
         optimizer: 优化器
         config: 配置字典
     Returns:
-        学习率调度器
+        warmup_scheduler: 用于warmup阶段的调度器
+        cosine_scheduler: 用于cosine annealing阶段的调度器
     """
     lr_config = config.get('lr_scheduler', {})
     
     if not lr_config.get('enabled', False):
-        return None
+        return None, None
     
     initial_lr = lr_config.get('initial_lr', 1e-4)
     target_lr = config['train']['lr']
     warmup_epochs = lr_config.get('warmup_epochs', 10)
-    decay_epochs = lr_config.get('decay_epochs', 50)
-    decay_factor = lr_config.get('decay_factor', 0.5)
     min_lr = lr_config.get('min_lr', 1e-6)
     
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            # Warmup阶段: 线性增长
-            warmup_factor = (epoch + 1) / warmup_epochs
-            return target_lr / initial_lr * warmup_factor
-        else:
-            # 衰减阶段
-            decay_times = (epoch - warmup_epochs) // decay_epochs
-            decay_factor_total = decay_factor ** decay_times
-            final_lr = target_lr / initial_lr * decay_factor_total
-            min_lr_ratio = min_lr / initial_lr
-            return max(final_lr, min_lr_ratio)
+    # Warmup阶段: 线性增长
+    def warmup_lambda(epoch):
+        warmup_factor = (epoch + 1) / warmup_epochs
+        return target_lr / initial_lr * warmup_factor
     
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, warmup_lambda)
     
-    print(f"学习率调度策略:")
+    # Cosine Annealing阶段: 从第warmup_epochs轮开始，共T_max轮
+    # T_max = 总epoch数 - warmup_epochs
+    total_epochs = config['train']['epochs']
+    T_max = total_epochs - warmup_epochs
+    
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=T_max,
+        eta_min=min_lr
+    )
+    
+    print(f"学习率调度策略 (Cosine Annealing):")
     print(f"  - 初始学习率: {initial_lr}")
     print(f"  - 目标学习率: {target_lr}")
     print(f"  - Warmup轮数: {warmup_epochs}")
-    print(f"  - 衰减间隔: {decay_epochs}轮")
-    print(f"  - 衰减因子: {decay_factor}")
+    print(f"  - Cosine Annealing轮数: {T_max}")
     print(f"  - 最小学习率: {min_lr}")
     
-    return scheduler
+    return warmup_scheduler, cosine_scheduler
 
 
 def train(model, train_loader, val_loader, config, device, exp_folder, save_every=50, patience=5, use_lr_scheduler=False):
@@ -133,12 +134,15 @@ def train(model, train_loader, val_loader, config, device, exp_folder, save_ever
     # 学习率配置
     if use_lr_scheduler and config.get('lr_scheduler', {}).get('enabled', False):
         initial_lr = config['lr_scheduler'].get('initial_lr', 1e-4)
+        weight_decay = config['train'].get('weight_decay', 1e-3)
         # 添加 weight_decay (L2 正则化) 防止过拟合
-        optimizer = torch.optim.Adam(model.parameters(), lr=initial_lr, weight_decay=1e-4)
-        scheduler = create_lr_scheduler(optimizer, config)
+        optimizer = torch.optim.Adam(model.parameters(), lr=initial_lr, weight_decay=weight_decay)
+        warmup_scheduler, cosine_scheduler = create_lr_scheduler(optimizer, config)
+        scheduler = (warmup_scheduler, cosine_scheduler)
     else:
+        weight_decay = config['train'].get('weight_decay', 1e-3)
         # 添加 weight_decay (L2 正则化) 防止过拟合
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
         scheduler = None
         print(f"使用固定学习率: {lr}")
     
@@ -238,7 +242,13 @@ def train(model, train_loader, val_loader, config, device, exp_folder, save_ever
         
         # ========== 学习率调度 ==========
         if scheduler is not None:
-            scheduler.step()
+            warmup_scheduler, cosine_scheduler = scheduler
+            if epoch < config['lr_scheduler']['warmup_epochs']:
+                # Warmup阶段
+                warmup_scheduler.step()
+            else:
+                # Cosine Annealing阶段
+                cosine_scheduler.step()
         
         # ========== 定期保存 ==========
         if (epoch + 1) % save_every == 0:

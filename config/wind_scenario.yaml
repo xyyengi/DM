@@ -16,17 +16,17 @@
 
 # 训练配置
 train:
-  epochs: 200
+  epochs: 60
   batch_size: 64  # 32GB显存建议值
   lr: 5.0e-4  # 修复：从 1.0e-3 降低到 5.0e-4，缓解扩散模型高学习率震荡
+  weight_decay: 1.0e-3  # L2正则化，防止过拟合
+  patience: 20  # 早停耐心值
 
-# 学习率调度器配置 (warmup + step decay)
+# 学习率调度器配置 (warmup + cosine annealing)
 lr_scheduler:
   enabled: true  # 设为true启用，或使用 --use_lr_scheduler 参数
   initial_lr: 1.0e-4  # warmup起始学习率
   warmup_epochs: 10   # warmup轮数
-  decay_epochs: 50    # 衰减间隔
-  decay_factor: 0.5   # 衰减因子
   min_lr: 1.0e-6      # 最小学习率
 
 # 模型配置
@@ -52,12 +52,12 @@ model:
   # DDPM原论文使用 beta_end=0.02 (linear) 或 0.012 (cosine)
   beta_start: 0.0001
   beta_end: 0.04  # 修复：从0.5改为0.02，标准DDPM值
-  schedule: "quad"
+  schedule: "linear"  # 从quad改为linear，更稳定的扩散过程
   
   # 条件引导强度 (公式10中的γ)
   # 【修复】增大引导强度使梯度引导生效
   # 0.05 太弱，改为 1.0 使条件约束真正起作用
-  guidance_scale: 1.0
+  guidance_scale: 0.5  # 修复：从0.05增大到0.5，增强条件引导效果
   
   # KDE区间数量 (公式7中的区间划分)
   n_intervals: 10

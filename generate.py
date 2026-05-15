@@ -198,6 +198,7 @@ def main():
     parser.add_argument('--ckpt_epoch', type=int, default=None, help='指定epoch，默认使用最佳模型')
     parser.add_argument('--n_samples', type=int, default=10, help='生成样本数')
     parser.add_argument('--list', action='store_true', help='列出所有可用实验')
+    parser.add_argument('--guidance_scale', type=float, default=None, help='覆盖配置中的guidance_scale')
     args = parser.parse_args()
     
     # 列出所有实验
@@ -262,6 +263,12 @@ def main():
             print(f"警告: 缺失关键参数 {real_missing}")
     
     print(f"模型epoch: {checkpoint.get('epoch', 'unknown')}")
+    
+    # 覆盖guidance_scale（如果命令行指定）
+    if args.guidance_scale is not None:
+        original_gs = model.diffusion.guidance_scale
+        model.diffusion.guidance_scale = args.guidance_scale
+        print(f"覆盖guidance_scale: {original_gs} -> {args.guidance_scale}")
     
     # 生成
     samples, forecast, residual = generate_scenarios(model, test_loader, device, args.n_samples)

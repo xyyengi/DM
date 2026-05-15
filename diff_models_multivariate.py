@@ -166,7 +166,7 @@ class ResidualBlock(nn.Module):
     Residual Block with time embedding injection
     """
     
-    def __init__(self, in_channels, out_channels, d_time=64, kernel_size=3):
+    def __init__(self, in_channels, out_channels, d_time=64, kernel_size=3, dropout=0.1):
         super().__init__()
         
         # 主卷积路径
@@ -179,6 +179,9 @@ class ResidualBlock(nn.Module):
         # 批归一化
         self.bn1 = nn.BatchNorm1d(out_channels)
         self.bn2 = nn.BatchNorm1d(out_channels)
+        
+        # Dropout正则化
+        self.dropout = nn.Dropout(dropout)
         
         # 残差连接
         self.residual = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
@@ -200,11 +203,13 @@ class ResidualBlock(nn.Module):
         h = self.bn1(h)
         h = h + time_emb  # 注入时间特征
         h = F.relu(h)
+        h = self.dropout(h)  # Dropout正则化
         
         h = self.conv2(h)
         h = self.bn2(h)
         h = h + time_emb
         h = F.relu(h)
+        h = self.dropout(h)  # Dropout正则化
         
         # 残差连接
         res = self.residual(x)
