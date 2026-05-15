@@ -1,9 +1,0 @@
-训练开始: 2026-05-09 15:33:14.926257
-Epochs: 2
-Patience: 2
-LR: 0.001
-LR Scheduler: False
-
-alpha_hat_last: 0.0008178855392353213
-Epoch 1: Train=0.5992, Val=0.5949, LR=0.001000
-Epoch 2: Train=0.4983, Val=0.3608, LR=0.001000
