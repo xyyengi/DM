@@ -437,6 +437,10 @@ class MultiChannelWindScenarioDataset(Dataset):
         预计算所有样本的条件矩阵
         将504次KDE查询从__getitem__移到初始化阶段，大幅加速训练
         
+        【修复】条件区间从残差区间改为功率值区间（符合论文公式9）
+        论文公式9: c = [c_down, c_up] = [f - K_h(f), f + K_h(f)]
+        即功率值区间 = 预测值 ± 残差范围
+        
         支持缓存：如果已有缓存文件则直接加载，避免重复计算
         """
         # 检查缓存文件
@@ -449,6 +453,7 @@ class MultiChannelWindScenarioDataset(Dataset):
             return
         
         print(f"预计算条件矩阵... (样本数: {self.num_samples})")
+        print(f"  【修复】条件区间改为功率值区间（预测值±残差范围）")
         self.cond_matrix_all = np.zeros((self.num_samples, 3, self.seq_length, 2), dtype=np.float32)
         
         for idx in range(self.num_samples):
@@ -457,7 +462,11 @@ class MultiChannelWindScenarioDataset(Dataset):
             for c in range(3):
                 for t in range(self.seq_length):
                     f_val = forecast_3ch[t, c]
-                    c_down, c_up = self.kde.get_conditional_interval(f_val, c)
+                    # 【修复】获取残差区间后转换为功率值区间
+                    residual_down, residual_up = self.kde.get_conditional_interval(f_val, c)
+                    # 论文公式9: c = [f - K_h(f), f + K_h(f)]
+                    c_down = f_val + residual_down  # 功率值下界 = 预测值 + 残差下界
+                    c_up = f_val + residual_up      # 功率值上界 = 预测值 + 残差上界
                     self.cond_matrix_all[idx, c, t, 0] = c_down
                     self.cond_matrix_all[idx, c, t, 1] = c_up
             

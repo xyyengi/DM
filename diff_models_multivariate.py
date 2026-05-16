@@ -403,51 +403,63 @@ class GaussianDiffusionMultivariate(nn.Module):
         
         return x_t, noise
     
-    def compute_conditional_gradient(self, x_t, cond_matrix, debug=False):
+    def compute_conditional_gradient(self, x_t, cond_matrix, forecast=None, debug=False):
         """
         论文公式10: 计算条件梯度
         
-        γ 是 0-1 二值系数：
-        - 当 x_t 在条件区间 [c_down, c_up] 内时，γ=0（不修正）
-        - 当 x_t 超出条件区间时，γ=1（修正）
+        【修复】条件区间现在是功率值区间，需要将x_t（残差）+ forecast（预测值）得到功率值后比较
         
-        梯度方向：引导 x_t 向条件区间边界移动
+        γ 是 0-1 二值系数：
+        - 当 power_t 在条件区间 [c_down, c_up] 内时，γ=0（不修正）
+        - 当 power_t 超出条件区间时，γ=1（修正）
+        
+        梯度方向：引导 power_t 向条件区间边界移动
         
         Args:
-            x_t: (B, 3, 168) 当前生成值
-            cond_matrix: (B, 3, 168, 2) 条件矩阵 [c_down, c_up]
+            x_t: (B, 3, 168) 当前生成值（残差）
+            cond_matrix: (B, 3, 168, 2) 条件矩阵 [c_down, c_up]（功率值区间）
+            forecast: (B, 3, 168) 预测值（用于计算功率值 = forecast + x_t）
             debug: 是否打印调试信息
         Returns:
-            gradient: (B, 3, 168) 条件梯度
+            gradient: (B, 3, 168) 条件梯度（作用于残差空间）
             gamma_mask: (B, 3, 168) 二值系数掩码
             debug_info: dict 调试信息（仅当 debug=True）
         """
-        c_down = cond_matrix[..., 0]  # (B, 3, 168)
-        c_up = cond_matrix[..., 1]
+        c_down = cond_matrix[..., 0]  # (B, 3, 168) 功率值下界
+        c_up = cond_matrix[..., 1]    # (B, 3, 168) 功率值上界
+        
+        # 【修复】计算功率值 = 预测值 + 残差
+        if forecast is not None:
+            power_t = forecast + x_t  # (B, 3, 168) 当前功率值
+        else:
+            # 如果没有提供forecast，退回到旧行为（用于兼容性）
+            power_t = x_t
+            print("[Warning] compute_conditional_gradient: forecast is None, using x_t as power_t")
         
         # 计算二值系数 γ
-        # 当 x_t < c_down 或 x_t > c_up 时，γ=1
-        # 当 x_t 在 [c_down, c_up] 内时，γ=0
-        gamma_mask = ((x_t < c_down) | (x_t > c_up)).float()
+        # 当 power_t < c_down 或 power_t > c_up 时，γ=1
+        # 当 power_t 在 [c_down, c_up] 内时，γ=0
+        gamma_mask = ((power_t < c_down) | (power_t > c_up)).float()
         
-        # 计算梯度方向
-        # 如果 x_t < c_down，梯度指向 c_down（向上）
-        # 如果 x_t > c_up，梯度指向 c_up（向下）
+        # 计算梯度方向（在功率值空间计算，但梯度作用于残差空间）
+        # 如果 power_t < c_down，梯度指向 c_down（向上）
+        # 如果 power_t > c_up，梯度指向 c_up（向下）
         gradient = torch.zeros_like(x_t)
         
-        # x_t < c_down: 梯度 = c_down - x_t（向上推）
-        below_mask = (x_t < c_down).float()
-        gradient = gradient + below_mask * (c_down - x_t)
+        # power_t < c_down: 梯度 = c_down - power_t（向上推）
+        below_mask = (power_t < c_down).float()
+        gradient = gradient + below_mask * (c_down - power_t)
         
-        # x_t > c_up: 梯度 = c_up - x_t（向下推）
-        above_mask = (x_t > c_up).float()
-        gradient = gradient + above_mask * (c_up - x_t)
+        # power_t > c_up: 梯度 = c_up - power_t（向下推）
+        above_mask = (power_t > c_up).float()
+        gradient = gradient + above_mask * (c_up - power_t)
         
         # 调试信息
         debug_info = None
         if debug:
             debug_info = {
                 'x_t_range': (x_t.min().item(), x_t.max().item()),
+                'power_t_range': (power_t.min().item(), power_t.max().item()),
                 'c_down_range': (c_down.min().item(), c_down.max().item()),
                 'c_up_range': (c_up.min().item(), c_up.max().item()),
                 'gamma_ratio': gamma_mask.mean().item(),  # 超出区间的比例
@@ -505,8 +517,11 @@ class GaussianDiffusionMultivariate(nn.Module):
             # 改成: t_decay = 1 - t / num_steps，t=0 时为 1.0，t=499 时为 0.002
             t_decay = 1.0 - t / self.num_steps if self.num_steps > 0 else 1.0
             
+            # 【修复】从cond_full中提取forecast（前3维）
+            forecast = cond_full[:, :3, :]  # (B, 3, 168)
+            
             # 计算条件梯度（返回梯度方向和二值掩码）
-            cond_gradient, gamma_mask, grad_debug = self.compute_conditional_gradient(x_t, cond_matrix, debug=debug)
+            cond_gradient, gamma_mask, grad_debug = self.compute_conditional_gradient(x_t, cond_matrix, forecast=forecast, debug=debug)
             
             # 【修复】放宽梯度裁剪范围
             cond_gradient_clamped = torch.clamp(cond_gradient, min=-1.0, max=1.0)
