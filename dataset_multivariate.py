@@ -42,11 +42,11 @@ class MultiChannelKDE:
         self.precomputed_quantiles = {}  # 预计算的分位数 {channel: {interval: (c_down, c_up)}
         self.interval_counts = {}  # 存储每个区间的样本数
 
-    def _get_neighbor_fallback_stats(self, channel_name, interval_idx, dense_threshold=5):
+    def _get_neighbor_fallback_stats(self, channel_name, interval_idx, interval_counts, interval_means, interval_stds, dense_threshold=5):
         """Use nearby dense bins to estimate fallback mean/std for sparse intervals."""
-        counts = self.interval_counts.get(channel_name, [])
-        means = self.error_stats.get(channel_name, {}).get('means', [])
-        stds = self.error_stats.get(channel_name, {}).get('stds', [])
+        counts = interval_counts
+        means = interval_means
+        stds = interval_stds
 
         candidates = []
         max_radius = max(interval_idx, len(counts) - 1 - interval_idx)
@@ -188,7 +188,13 @@ class MultiChannelKDE:
                     print(f"    [KDE] interval {i}: done")
                 else:
                     self.kde_models[channel_name].append(None)
-                    fallback_mean, fallback_std = self._get_neighbor_fallback_stats(channel_name, i)
+                    fallback_mean, fallback_std = self._get_neighbor_fallback_stats(
+                        channel_name,
+                        i,
+                        interval_counts,
+                        interval_means,
+                        interval_stds,
+                    )
                     self.error_stats[channel_name]['means'].append(fallback_mean)
                     self.error_stats[channel_name]['stds'].append(fallback_std)
             

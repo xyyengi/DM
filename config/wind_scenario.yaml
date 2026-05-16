@@ -51,7 +51,7 @@ model:
   # 注意：beta_end标准值应<0.1，过大会导致扩散过程不稳定
   # DDPM原论文使用 beta_end=0.02 (linear) 或 0.012 (cosine)
   beta_start: 0.0001
-  beta_end: 0.02  # 修复：从0.5改为0.02，标准DDPM值
+  beta_end: 0.04  # 修复：从0.5改为0.02，标准DDPM值，后又改为了0.04，稍微增加扩散强度但不至于过大
   schedule: "linear"  # 从quad改为linear，更稳定的扩散过程
   
   # 条件引导强度 (公式10中的γ)
