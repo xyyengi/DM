@@ -332,46 +332,53 @@ class MultiChannelWindScenarioDataset(Dataset):
     - test_res.npy: (5381, 168, 11) 测试集残差
     """
     
-    def __init__(self, data_path='./input_4.27/', 
-                 mode='train', seq_length=168, n_intervals=10, n_channels=11):
+    def __init__(self, data_path='./input_4.27/',
+                 mode='train', seq_length=168, n_intervals=10, n_channels=11,
+                 build_kde=True):
         self.data_path = data_path
         self.mode = mode
         self.seq_length = seq_length
         self.n_channels = n_channels
         self.n_intervals = n_intervals
+        self.build_kde = build_kde
         
         print(f"  [Dataset] mode={mode}, loading data...")
         self._load_data()
         print(f"  [Dataset] normalizing data...")
         self._normalize_data()
         
-        print(f"  [Dataset] initializing KDE...")
-        self.kde = MultiChannelKDE(n_intervals=n_intervals)
-        kde_path = os.path.join(data_path, 'kde_multivariate.pkl')
-        
-        # 优先使用缓存，避免重复拟合（train模式也先检查缓存）
-        if os.path.exists(kde_path):
-            print(f"  [Dataset] loading KDE from cache: {kde_path}")
-            try:
-                self.kde.load(kde_path)
-                if self.kde.n_intervals != n_intervals:
-                    raise ValueError(f"KDE n_intervals mismatch: {self.kde.n_intervals} != {n_intervals}")
-                print(f"  [Dataset] KDE loaded from cache.")
-            except (ValueError, KeyError, EOFError, pickle.UnpicklingError) as exc:
-                print(f"  [Dataset] KDE cache invalid, refitting: {exc}")
-                self.kde = MultiChannelKDE(n_intervals=n_intervals)
+        self.kde = None
+        if self.build_kde:
+            print(f"  [Dataset] initializing KDE...")
+            self.kde = MultiChannelKDE(n_intervals=n_intervals)
+            kde_path = os.path.join(data_path, 'kde_multivariate.pkl')
+            
+            # 优先使用缓存，避免重复拟合（train模式也先检查缓存）
+            if os.path.exists(kde_path):
+                print(f"  [Dataset] loading KDE from cache: {kde_path}")
+                try:
+                    self.kde.load(kde_path)
+                    if self.kde.n_intervals != n_intervals:
+                        raise ValueError(f"KDE n_intervals mismatch: {self.kde.n_intervals} != {n_intervals}")
+                    print(f"  [Dataset] KDE loaded from cache.")
+                except (ValueError, KeyError, EOFError, pickle.UnpicklingError) as exc:
+                    print(f"  [Dataset] KDE cache invalid, refitting: {exc}")
+                    self.kde = MultiChannelKDE(n_intervals=n_intervals)
+                    self.kde.fit(self.forecast_norm, self.residual_norm)
+                    self.kde.save(kde_path)
+                    print(f"  [Dataset] KDE rebuilt and saved to {kde_path}")
+            else:
+                print(f"  [Dataset] fitting KDE (no cache, this may take a moment)...")
                 self.kde.fit(self.forecast_norm, self.residual_norm)
                 self.kde.save(kde_path)
-                print(f"  [Dataset] KDE rebuilt and saved to {kde_path}")
+                print(f"  [Dataset] KDE saved to {kde_path}")
+
+            # 预计算条件矩阵（在KDE创建之后）
+            print(f"  [Dataset] precomputing condition matrix...")
+            self._precompute_cond_matrix()
         else:
-            print(f"  [Dataset] fitting KDE (no cache, this may take a moment)...")
-            self.kde.fit(self.forecast_norm, self.residual_norm)
-            self.kde.save(kde_path)
-            print(f"  [Dataset] KDE saved to {kde_path}")
-        
-        # 预计算条件矩阵（在KDE创建之后）
-        print(f"  [Dataset] precomputing condition matrix...")
-        self._precompute_cond_matrix()
+            print(f"  [Dataset] KDE/guidance disabled; using zero condition matrix.")
+            self.cond_matrix_all = np.zeros((self.num_samples, 3, self.seq_length, 2), dtype=np.float32)
         print(f"  [Dataset] initialization complete.")
     
     def _load_data(self):
@@ -460,7 +467,7 @@ class MultiChannelWindScenarioDataset(Dataset):
         支持缓存：如果已有缓存文件则直接加载，避免重复计算
         """
         # 检查缓存文件
-        cache_path = os.path.join(self.data_path, f'cond_matrix_{self.mode}.npy')
+        cache_path = os.path.join(self.data_path, f'cond_matrix_{self.mode}_res_forecast_minus_actual.npy')
         
         if os.path.exists(cache_path):
             print(f"加载缓存的条件矩阵: {cache_path}")
@@ -478,11 +485,10 @@ class MultiChannelWindScenarioDataset(Dataset):
             for c in range(3):
                 for t in range(self.seq_length):
                     f_val = forecast_3ch[t, c]
-                    # 【修复】获取残差区间后转换为功率值区间
+                    # residual = forecast - actual, so actual = forecast - residual.
                     residual_down, residual_up = self.kde.get_conditional_interval(f_val, c)
-                    # 论文公式9: c = [f - K_h(f), f + K_h(f)]
-                    c_down = f_val + residual_down  # 功率值下界 = 预测值 + 残差下界
-                    c_up = f_val + residual_up      # 功率值上界 = 预测值 + 残差上界
+                    c_down = f_val - residual_up
+                    c_up = f_val - residual_down
                     self.cond_matrix_all[idx, c, t, 0] = c_down
                     self.cond_matrix_all[idx, c, t, 1] = c_up
             
@@ -549,7 +555,8 @@ class MultiChannelWindScenarioDataset(Dataset):
 
 def get_dataloader_multivariate(data_path='./wind_solar_load_168_FEDformer/',
                                 batch_size=16, mode='train', n_intervals=10,
-                                num_workers=None, pin_memory=None):
+                                num_workers=None, pin_memory=None,
+                                build_kde=True):
     """
     获取多通道数据加载器
     
@@ -567,7 +574,7 @@ def get_dataloader_multivariate(data_path='./wind_solar_load_168_FEDformer/',
         pin_memory = torch.cuda.is_available()
     
     dataset = MultiChannelWindScenarioDataset(
-        data_path=data_path, mode=mode, n_intervals=n_intervals
+        data_path=data_path, mode=mode, n_intervals=n_intervals, build_kde=build_kde
     )
     loader = DataLoader(
         dataset, 

@@ -33,10 +33,11 @@ lr_scheduler:
 model:
   # 实验版本开关：
   # - V0: target_type=actual, condition_mode=none, use_forecast=false, use_guidance=false
-  # - 当前 V1-like: target_type=residual, condition_mode=guidance_2023, use_forecast=true, use_guidance=true
+  # - 当前 Vmix: target_type=residual, condition_mode=mix, use_forecast=true, use_network_condition=true, use_guidance=true
   target_type: "residual"       # actual / residual
-  condition_mode: "guidance_2023" # none / guidance_2023 / csdi_forecast
+  condition_mode: "mix" # none / guidance_2023 / csdi_forecast / mix
   use_forecast: true
+  use_network_condition: true
   use_guidance: true
   cond_mask: [1, 1, 1]
 
@@ -73,14 +74,15 @@ model:
 
 # 推荐 V0 无条件 DDPM 开关（运行时可复制到 model 下，或新建单独配置文件）
 experiment:
-  name: "v1_like_residual_guidance_168h"
+  name: "v_mix_residual_forecast_concat_guidance"
 
 target:
   type: "residual" # actual / residual
 
 condition:
-  mode: "guidance_2023" # none / guidance_2023 / csdi_forecast
+  mode: "mix" # none / guidance_2023 / csdi_forecast / mix
   use_forecast: true
+  use_network_condition: true
   use_guidance: true
   cond_mask: [1, 1, 1]
 

@@ -34,12 +34,23 @@ def apply_experiment_switches(config):
         model_cfg['condition_mode'] = condition_cfg['mode']
     if 'use_forecast' in condition_cfg:
         model_cfg['use_forecast'] = condition_cfg['use_forecast']
+    if 'use_network_condition' in condition_cfg:
+        model_cfg['use_network_condition'] = condition_cfg['use_network_condition']
     if 'use_guidance' in condition_cfg:
         model_cfg['use_guidance'] = condition_cfg['use_guidance']
     if 'cond_mask' in condition_cfg:
         model_cfg['cond_mask'] = condition_cfg['cond_mask']
     if 'enable' in guidance_cfg:
         model_cfg['use_guidance'] = guidance_cfg['enable']
+    if {'wind_scale', 'pv_scale', 'load_scale'} <= set(guidance_cfg):
+        model_cfg['guidance_scales'] = [
+            guidance_cfg['wind_scale'],
+            guidance_cfg['pv_scale'],
+            guidance_cfg['load_scale'],
+        ]
+        model_cfg['guidance_scale'] = max(model_cfg['guidance_scales'])
+    if 'input_channels' in model_cfg:
+        model_cfg['in_channels'] = model_cfg['input_channels']
     return config
 
 
@@ -180,21 +191,51 @@ def generate_scenarios(model, test_loader, device, n_samples=10):
     )
 
 
+def model_output_to_actual(samples, forecast, target_type):
+    """Convert model output to final actual scenarios."""
+    if target_type == 'residual':
+        # residual = forecast - actual, therefore actual = forecast - residual.
+        return forecast[:, None, :, :] - samples
+    return samples
+
+
+def save_scenarios_npz(actual_samples, forecast, save_path):
+    """Save UC-facing scenario file with flattened equal-probability scenarios."""
+    N, n_samples, C, L = actual_samples.shape
+    flat = actual_samples.reshape(N * n_samples, C, L)
+    prob = np.ones(N * n_samples, dtype=np.float64) / float(N * n_samples)
+    samples_dir = os.path.join(save_path, 'samples')
+    os.makedirs(samples_dir, exist_ok=True)
+    np.savez(
+        os.path.join(samples_dir, 'scenarios.npz'),
+        wind=flat[:, 0, :],
+        pv=flat[:, 1, :],
+        load=flat[:, 2, :],
+        prob=prob,
+        forecast_wind=forecast[0, 0, :],
+        forecast_pv=forecast[0, 1, :],
+        forecast_load=forecast[0, 2, :],
+    )
+
+
 def evaluate_and_save(samples, forecast, residual, actual, max_values, save_path, target_type='residual'):
     """评估并保存结果（使用论文公式12-15）"""
     N, n_samples, C, L = samples.shape
-    target = actual if target_type == 'actual' else residual
+    actual_samples = model_output_to_actual(samples, forecast, target_type)
+    target = actual
     
     # 使用evaluation模块计算完整指标
-    metrics = evaluate_multichannel(samples, target)
+    metrics = evaluate_multichannel(actual_samples, target)
     print_metrics(metrics)
     
     # 保存结果
     os.makedirs(save_path, exist_ok=True)
     np.save(os.path.join(save_path, 'generated_samples.npy'), samples)
+    np.save(os.path.join(save_path, 'actual_scenarios.npy'), actual_samples)
     np.save(os.path.join(save_path, 'forecast_data.npy'), forecast)
     np.save(os.path.join(save_path, 'residual_data.npy'), residual)
     np.save(os.path.join(save_path, 'actual_data.npy'), actual)
+    save_scenarios_npz(actual_samples, forecast, save_path)
     
     # 保存ACF数据
     for c, name in enumerate(['wind', 'solar', 'load']):
@@ -276,8 +317,9 @@ def main():
     config = apply_experiment_switches(config)
     
     # 数据加载
+    build_kde = bool(config['model'].get('use_guidance', False))
     test_loader, _, max_values = get_dataloader_multivariate(
-        args.data_path, config['train']['batch_size'], 'test', config['model']['n_intervals'])
+        args.data_path, config['train']['batch_size'], 'test', config['model']['n_intervals'], build_kde=build_kde)
     
     # 模型
     model = MultiChannelCSDI(config['model'], device).to(device)

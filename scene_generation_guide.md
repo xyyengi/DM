@@ -406,8 +406,8 @@ FEDformer预测：
 对于每个时间点：
 
 1. 计算功率值区间：
-   c_down = P_forecast + residual_down
-   c_up = P_forecast + residual_up
+   c_down = P_forecast - residual_up
+   c_up = P_forecast - residual_down
    
    其中 residual_down/up 来自KDE拟合的历史残差分布
 

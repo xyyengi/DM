@@ -144,7 +144,8 @@ final_power = forecast_denorm + generated_residual_denorm
 **我之前说的（错误）：**
 ```
 输入：历史功率数据
-计算残差：ε = actual - forecast
+计算残差：ε = forecast - actual
+重构实际值：actual = forecast - ε
 ```
 
 **实际（正确）：**

@@ -25,7 +25,8 @@ wind, pv, load
 ```text
 actual   = 历史真实出力或负荷，是扩散模型要生成的目标
 forecast = 预测出力或预测负荷，是条件信息
-residual = actual - forecast，是可选实验目标，不是默认目标
+residual = forecast - actual，是可选实验目标，不是默认目标
+actual = forecast - residual
 ```
 
 默认情况下，扩散模型训练目标是 actual，而不是 forecast，也不是 residual。
@@ -61,7 +62,7 @@ xT ~ N(0, I)
 额外模块：
 
 ```text
-根据历史 forecast 和 actual 计算 error = actual - forecast
+根据历史 forecast 和 actual 计算 error = forecast - actual
 按照 forecast 分箱或 KDE 估计误差范围
 构造 c_down, c_up
 采样时对 mu_theta 做 guidance 修正

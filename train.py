@@ -36,13 +36,38 @@ def apply_experiment_switches(config):
         model_cfg['condition_mode'] = condition_cfg['mode']
     if 'use_forecast' in condition_cfg:
         model_cfg['use_forecast'] = condition_cfg['use_forecast']
+    if 'use_network_condition' in condition_cfg:
+        model_cfg['use_network_condition'] = condition_cfg['use_network_condition']
     if 'use_guidance' in condition_cfg:
         model_cfg['use_guidance'] = condition_cfg['use_guidance']
     if 'cond_mask' in condition_cfg:
         model_cfg['cond_mask'] = condition_cfg['cond_mask']
     if 'enable' in guidance_cfg:
         model_cfg['use_guidance'] = guidance_cfg['enable']
+    if {'wind_scale', 'pv_scale', 'load_scale'} <= set(guidance_cfg):
+        model_cfg['guidance_scales'] = [
+            guidance_cfg['wind_scale'],
+            guidance_cfg['pv_scale'],
+            guidance_cfg['load_scale'],
+        ]
+        model_cfg['guidance_scale'] = max(model_cfg['guidance_scales'])
+    if 'input_channels' in model_cfg:
+        model_cfg['in_channels'] = model_cfg['input_channels']
     return config
+
+
+def print_experiment_summary(config):
+    condition = config.get('condition', {})
+    target = config.get('target', {})
+    experiment = config.get('experiment', {})
+    print("\nExperiment summary:")
+    print(f"  experiment.name: {experiment.get('name', 'unknown')}")
+    print(f"  target.type: {target.get('type', config.get('model', {}).get('target_type'))}")
+    print(f"  condition.mode: {condition.get('mode', config.get('model', {}).get('condition_mode'))}")
+    print(f"  use_forecast: {condition.get('use_forecast', config.get('model', {}).get('use_forecast'))}")
+    print(f"  use_network_condition: {condition.get('use_network_condition', config.get('model', {}).get('use_network_condition'))}")
+    print(f"  use_guidance: {condition.get('use_guidance', config.get('model', {}).get('use_guidance'))}")
+    print("  residual definition: residual = forecast - actual; actual = forecast - residual\n")
 
 
 class EarlyStopping:
@@ -326,26 +351,34 @@ def visualize_sampling_progress(model, batch, device, exp_folder, record_steps=N
                         max(0, model.diffusion.num_steps // 5), max(0, model.diffusion.num_steps // 10), 0]
 
     model.eval()
-    # 准备条件
     forecast_3ch = batch['forecast_3ch'].to(device)
     time_encoding = batch['time_encoding'].to(device)
-    cond_full = model._build_condition(forecast_3ch, time_encoding)
-    cond_matrix = batch['cond_matrix'].to(device)
+    cond_matrix = batch['cond_matrix'].to(device) if model.use_guidance else None
     timepoints = batch['timepoints'].to(device)
     time_feat = model.get_time_features(timepoints)
 
-    B = cond_full.shape[0]
+    B = forecast_3ch.shape[0]
     rec = {t: [] for t in record_steps}
+
+    def model_input_fn(x_t):
+        return model.build_model_input(
+            x_t,
+            forecast_3ch=forecast_3ch if model.use_forecast else None,
+            time_encoding=time_encoding,
+        )
 
     with torch.no_grad():
         for s in range(n_samples):
-            x_t = torch.randn(B, 3, cond_full.shape[-1], device=device)
+            x_t = torch.randn(B, 3, 168, device=device)
             for t in range(model.diffusion.num_steps - 1, -1, -1):
                 if t in record_steps:
                     rec[t].append(x_t.detach().cpu().numpy())
-                # denoise_step returns (x_prev, debug_info), unpack it
-                x_t, _ = model.diffusion.denoise_step(x_t, t, cond_full, cond_matrix, time_feat)
-            # final
+                model_input = model_input_fn(x_t)
+                x_t, _ = model.diffusion.denoise_step(
+                    x_t, t, model_input, time_feat,
+                    cond_matrix=cond_matrix,
+                    forecast=forecast_3ch if model.use_forecast else None,
+                )
             if 0 in record_steps:
                 rec[0].append(x_t.detach().cpu().numpy())
 
@@ -455,6 +488,7 @@ def main():
     with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     config = apply_experiment_switches(config)
+    print_experiment_summary(config)
     
     # 命令行参数覆盖 - 训练参数
     if args.epochs: config['train']['epochs'] = args.epochs
@@ -480,10 +514,11 @@ def main():
     
     # 数据加载
     print("正在加载数据...")
+    build_kde = bool(config['model'].get('use_guidance', False))
     train_loader, _, _ = get_dataloader_multivariate(
-        args.data_path, config['train']['batch_size'], 'train', config['model']['n_intervals'])
+        args.data_path, config['train']['batch_size'], 'train', config['model']['n_intervals'], build_kde=build_kde)
     val_loader, _, _ = get_dataloader_multivariate(
-        args.data_path, config['train']['batch_size'], 'val', config['model']['n_intervals'])
+        args.data_path, config['train']['batch_size'], 'val', config['model']['n_intervals'], build_kde=build_kde)
     
     # 模型
     model = MultiChannelCSDI(config['model'], device).to(device)

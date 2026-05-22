@@ -362,13 +362,18 @@ class GaussianDiffusionMultivariate(nn.Module):
     """
     
     def __init__(self, model, num_steps=500, beta_start=0.0001, beta_end=0.04,
-                 schedule='quad', guidance_scale=1.0):
+                 schedule='quad', guidance_scale=1.0, guidance_scales=None,
+                 target_type='residual'):
         super().__init__()
         
         self.model = model  # ResUNet
         self.num_steps = num_steps
         self.guidance_scale = guidance_scale
+        self.target_type = target_type
         self._shape_debug_printed = False
+        if guidance_scales is None:
+            guidance_scales = [guidance_scale, guidance_scale, guidance_scale]
+        self.register_buffer('guidance_scales', torch.as_tensor(guidance_scales, dtype=torch.float32).view(1, 3, 1))
         
         # Beta schedule - 使用register_buffer确保张量随模型移动到GPU
         if schedule == 'quad':
@@ -413,7 +418,9 @@ class GaussianDiffusionMultivariate(nn.Module):
         """
         论文公式10: 计算条件梯度
         
-        【修复】条件区间现在是功率值区间，需要将x_t（残差）+ forecast（预测值）得到功率值后比较
+        条件区间是 actual 功率值区间。
+        target_type == actual 时，x_t 表示 actual。
+        target_type == residual 时，x_t 表示 residual，且 residual = forecast - actual。
         
         γ 是 0-1 二值系数：
         - 当 power_t 在条件区间 [c_down, c_up] 内时，γ=0（不修正）
@@ -434,31 +441,35 @@ class GaussianDiffusionMultivariate(nn.Module):
         c_down = cond_matrix[..., 0]  # (B, 3, 168) 功率值下界
         c_up = cond_matrix[..., 1]    # (B, 3, 168) 功率值上界
         
-        # 【修复】计算功率值 = 预测值 + 残差
-        if forecast is not None:
-            power_t = forecast + x_t  # (B, 3, 168) 当前功率值
+        if self.target_type == 'residual':
+            if forecast is None:
+                raise ValueError("forecast is required when target_type='residual'")
+            power_t = forecast - x_t  # residual = forecast - actual
+            residual_target = True
         else:
-            # 如果没有提供forecast，退回到旧行为（用于兼容性）
             power_t = x_t
-            print("[Warning] compute_conditional_gradient: forecast is None, using x_t as power_t")
+            residual_target = False
         
         # 计算二值系数 γ
         # 当 power_t < c_down 或 power_t > c_up 时，γ=1
         # 当 power_t 在 [c_down, c_up] 内时，γ=0
         gamma_mask = ((power_t < c_down) | (power_t > c_up)).float()
         
-        # 计算梯度方向（在功率值空间计算，但梯度作用于残差空间）
-        # 如果 power_t < c_down，梯度指向 c_down（向上）
-        # 如果 power_t > c_up，梯度指向 c_up（向下）
+        # 计算更新方向。actual target 时直接推 actual；residual target 时方向取反，
+        # 因为 actual = forecast - residual。
         gradient = torch.zeros_like(x_t)
         
-        # power_t < c_down: 梯度 = c_down - power_t（向上推）
         below_mask = (power_t < c_down).float()
-        gradient = gradient + below_mask * (c_down - power_t)
+        if residual_target:
+            gradient = gradient + below_mask * (power_t - c_down)
+        else:
+            gradient = gradient + below_mask * (c_down - power_t)
         
-        # power_t > c_up: 梯度 = c_up - power_t（向下推）
         above_mask = (power_t > c_up).float()
-        gradient = gradient + above_mask * (c_up - power_t)
+        if residual_target:
+            gradient = gradient + above_mask * (power_t - c_up)
+        else:
+            gradient = gradient + above_mask * (c_up - power_t)
         
         # 调试信息
         debug_info = None
@@ -477,7 +488,7 @@ class GaussianDiffusionMultivariate(nn.Module):
         
         return gradient, gamma_mask, debug_info
     
-    def denoise_step(self, x_t, t, cond_full, cond_matrix, time_feat, debug=False):
+    def denoise_step(self, x_t, t, model_input, time_feat, cond_matrix=None, forecast=None, debug=False):
         """
         论文公式10: 反向去噪一步
         
@@ -489,8 +500,9 @@ class GaussianDiffusionMultivariate(nn.Module):
         Args:
             x_t: (B, 3, 168) 当前噪声数据 (Target Residuals)
             t: 时间步索引
-            cond_full: (B, 11, 168) 条件部分 (Base Prediction + Time Encoding)
-            cond_matrix: (B, 3, 168, 2) KDE条件矩阵
+            model_input: (B, C_in, 168) 模型输入
+            cond_matrix: (B, 3, 168, 2) KDE条件矩阵，仅 guidance 使用
+            forecast: (B, 3, 168) 预测值，仅 residual guidance 使用
             time_feat: (B, 168, d_time) 时间特征
             debug: 是否返回调试信息
         Returns:
@@ -500,22 +512,21 @@ class GaussianDiffusionMultivariate(nn.Module):
         assert x_t.ndim == 3, f"x_t must be [B, 3, 168], got {tuple(x_t.shape)}"
         assert x_t.shape[1] == 3, f"x_t channel dim must be 3, got {x_t.shape[1]}"
         assert x_t.shape[2] == 168, f"x_t length dim must be 168, got {x_t.shape[2]}"
-        assert cond_full.ndim == 3 and cond_full.shape[0] == x_t.shape[0] and cond_full.shape[2] == 168, (
-            f"cond_full must be [B, C_cond, 168], got {tuple(cond_full.shape)}"
+        assert model_input.ndim == 3 and model_input.shape[0] == x_t.shape[0] and model_input.shape[2] == 168, (
+            f"model_input must be [B, C_in, 168], got {tuple(model_input.shape)}"
         )
-        assert cond_matrix.ndim == 4 and cond_matrix.shape == (x_t.shape[0], 3, 168, 2), (
-            f"cond_matrix must be [B, 3, 168, 2], got {tuple(cond_matrix.shape)}"
-        )
+        if self.guidance_scale > 0:
+            assert cond_matrix is not None, "cond_matrix is required when guidance is enabled"
+            assert cond_matrix.ndim == 4 and cond_matrix.shape == (x_t.shape[0], 3, 168, 2), (
+                f"cond_matrix must be [B, 3, 168, 2], got {tuple(cond_matrix.shape)}"
+            )
 
         B = x_t.shape[0]
         device = x_t.device
         debug_info = None
-        
-        # 构建14通道输入: [x_t (3), cond_full (11)]
-        input_14ch = torch.cat([x_t, cond_full], dim=1)  # (B, 14, 168)
-        
+
         # 预测噪声（模型输出3维）
-        predicted_noise = self.model(input_14ch, time_feat)
+        predicted_noise = self.model(model_input, time_feat)
         assert predicted_noise.shape == x_t.shape, (
             f"epsilon_theta shape must match x_t shape, got {tuple(predicted_noise.shape)} vs {tuple(x_t.shape)}"
         )
@@ -523,8 +534,8 @@ class GaussianDiffusionMultivariate(nn.Module):
         if not self._shape_debug_printed:
             print(
                 "[Shape] "
-                f"x0={tuple(x0.shape)}, xt={tuple(x_t.shape)}, "
-                f"noise={tuple(noise.shape)}, epsilon_theta={tuple(predicted_noise.shape)}"
+                f"xt={tuple(x_t.shape)}, model_input={tuple(model_input.shape)}, "
+                f"epsilon_theta={tuple(predicted_noise.shape)}"
             )
             self._shape_debug_printed = True
         
@@ -544,9 +555,6 @@ class GaussianDiffusionMultivariate(nn.Module):
             # 改成: t_decay = 1 - t / num_steps，t=0 时为 1.0，t=499 时为 0.002
             t_decay = 1.0 - t / self.num_steps if self.num_steps > 0 else 1.0
             
-            # 【修复】从cond_full中提取forecast（前3维）
-            forecast = cond_full[:, :3, :]  # (B, 3, 168)
-            
             # 计算条件梯度（返回梯度方向和二值掩码）
             cond_gradient, gamma_mask, grad_debug = self.compute_conditional_gradient(x_t, cond_matrix, forecast=forecast, debug=debug)
             
@@ -555,7 +563,8 @@ class GaussianDiffusionMultivariate(nn.Module):
             
             # 应用梯度修正：只在超出区间的地方修正
             # 【关键修复】gradient 已经是(目标 - 当前)的向量，代表更新的正确方向，应当是加上而不是减去！
-            mean = mean + self.guidance_scale * t_decay * cond_gradient_clamped * gamma_mask
+            scale = self.guidance_scales.to(x_t.device)
+            mean = mean + t_decay * scale * cond_gradient_clamped * gamma_mask
             
             if debug:
                 debug_info = {
@@ -565,7 +574,7 @@ class GaussianDiffusionMultivariate(nn.Module):
                     't_decay': t_decay,
                     'predicted_noise_range': (predicted_noise.min().item(), predicted_noise.max().item()),
                     'mean_before_guidance_range': (mean.min().item(), mean.max().item()),
-                    'guidance_applied': self.guidance_scale * t_decay,
+                    'guidance_applied': (scale * t_decay).detach().cpu().tolist(),
                     **grad_debug
                 }
         
@@ -585,13 +594,14 @@ class GaussianDiffusionMultivariate(nn.Module):
         
         return x_prev, debug_info
     
-    def sample(self, cond_full, cond_matrix, time_feat, n_samples=1, debug=False, debug_steps=None):
+    def sample(self, build_model_input_fn, batch_size, device, time_feat, cond_matrix=None,
+               forecast=None, n_samples=1, debug=False, debug_steps=None):
         """
         完整采样过程：从噪声生成场景
         
         Args:
-            cond_full: (B, 11, 168) 条件部分 (Base Prediction + Time Encoding)
-            cond_matrix: (B, 3, 168, 2) KDE条件矩阵
+            build_model_input_fn: callable that maps x_t -> model input
+            batch_size: batch size B
             time_feat: (B, 168, d_time) 时间特征
             n_samples: 生成样本数量
             debug: 是否启用调试模式
@@ -600,15 +610,7 @@ class GaussianDiffusionMultivariate(nn.Module):
             samples: (B, n_samples, 3, 168) 生成的场景
             debug_log: list 调试日志（仅当 debug=True）
         """
-        assert cond_full.ndim == 3 and cond_full.shape[2] == 168, (
-            f"cond_full must be [B, C_cond, 168], got {tuple(cond_full.shape)}"
-        )
-        assert cond_matrix.ndim == 4 and cond_matrix.shape == (cond_full.shape[0], 3, 168, 2), (
-            f"cond_matrix must be [B, 3, 168, 2], got {tuple(cond_matrix.shape)}"
-        )
-
-        B = cond_full.shape[0]
-        device = cond_full.device
+        B = batch_size
         
         # 初始化纯噪声
         samples = torch.zeros(B, n_samples, 3, 168, device=device)
@@ -621,7 +623,11 @@ class GaussianDiffusionMultivariate(nn.Module):
             for t in range(self.num_steps - 1, -1, -1):
                 # 判断是否需要收集调试信息
                 need_debug = debug and (debug_steps is None or t in debug_steps)
-                x_t, step_debug = self.denoise_step(x_t, t, cond_full, cond_matrix, time_feat, debug=need_debug)
+                model_input = build_model_input_fn(x_t)
+                x_t, step_debug = self.denoise_step(
+                    x_t, t, model_input, time_feat,
+                    cond_matrix=cond_matrix, forecast=forecast, debug=need_debug
+                )
                 
                 if need_debug and step_debug:
                     debug_log.append(step_debug)
@@ -632,13 +638,13 @@ class GaussianDiffusionMultivariate(nn.Module):
             return samples, debug_log
         return samples
     
-    def forward(self, x0, cond_full, time_feat, cond_matrix=None, t=None):
+    def forward(self, x0, model_input_fn, time_feat, t=None):
         """
         训练时的前向传播：计算损失
         
         Args:
             x0: (B, 3, 168) 原始残差数据 (Target Residuals)
-            cond_full: (B, 11, 168) 条件部分 (Base Prediction + Time Encoding)
+            model_input_fn: callable that maps x_t -> model input
             time_feat: (B, 168, d_time) 时间特征
             cond_matrix: (B, 3, 168, 2) KDE条件矩阵 (可选)
             t: 时间步（可选，随机采样）
@@ -648,10 +654,6 @@ class GaussianDiffusionMultivariate(nn.Module):
         assert x0.ndim == 3, f"x0 must be [B, 3, 168], got {tuple(x0.shape)}"
         assert x0.shape[1] == 3, f"x0 channel dim must be 3, got {x0.shape[1]}"
         assert x0.shape[2] == 168, f"x0 length dim must be 168, got {x0.shape[2]}"
-        assert cond_full.ndim == 3 and cond_full.shape[0] == x0.shape[0] and cond_full.shape[2] == 168, (
-            f"cond_full must be [B, C_cond, 168], got {tuple(cond_full.shape)}"
-        )
-
         B = x0.shape[0]
         device = x0.device
         
@@ -662,11 +664,20 @@ class GaussianDiffusionMultivariate(nn.Module):
         # 添加噪声（只对前3维Target Residuals添加噪声）
         x_t, noise = self.add_noise(x0, t)
         
-        # 构建14通道输入: [x_t (3), cond_full (11)]
-        input_14ch = torch.cat([x_t, cond_full], dim=1)  # (B, 14, 168)
+        model_input = model_input_fn(x_t)
         
         # 预测噪声（模型输出3维）
-        predicted_noise = self.model(input_14ch, time_feat)
+        predicted_noise = self.model(model_input, time_feat)
+        assert predicted_noise.shape == noise.shape, (
+            f"epsilon_theta shape must match noise shape, got {tuple(predicted_noise.shape)} vs {tuple(noise.shape)}"
+        )
+        if not self._shape_debug_printed:
+            print(
+                "[Shape] "
+                f"x0={tuple(x0.shape)}, xt={tuple(x_t.shape)}, noise={tuple(noise.shape)}, "
+                f"model_input={tuple(model_input.shape)}, epsilon_theta={tuple(predicted_noise.shape)}"
+            )
+            self._shape_debug_printed = True
         
         # 【修改】干干净净，只算噪声的基准 MSE 损失
         # 移除训练时的条件梯度纠缠，把约束释放到纯推理阶段
@@ -704,13 +715,14 @@ class MultiChannelCSDI(nn.Module):
         self.device = device
         self.config = config
         self.target_type = config.get('target_type', 'residual')
-        self.condition_mode = config.get('condition_mode', 'guidance_2023')
+        self.condition_mode = config.get('condition_mode', 'mix')
         self.use_forecast = config.get('use_forecast', True)
+        self.use_network_condition = config.get('use_network_condition', True)
         self.use_guidance = config.get('use_guidance', True)
         self.cond_mask = config.get('cond_mask', [1, 1, 1])
         
-        # 输入输出通道定义
-        self.in_channels = config.get('in_channels', 14)  # 14维输入
+        # 输入输出通道定义。V0/V1: x_t only; V2: [x_t, forecast]; Vmix: [x_t, forecast, time_encoding].
+        self.in_channels = config.get('in_channels', self._infer_input_channels())
         self.out_channels = config.get('out_channels', 3)  # 3维输出（风、光、负荷残差）
         
         # 时间特征嵌入维度
@@ -736,11 +748,14 @@ class MultiChannelCSDI(nn.Module):
             beta_start=config.get('beta_start', 0.0001),
             beta_end=config.get('beta_end', 0.02),
             schedule=config.get('schedule', 'quad'),
-            guidance_scale=config.get('guidance_scale', 1.0)
+            guidance_scale=config.get('guidance_scale', 1.0),
+            guidance_scales=config.get('guidance_scales', None),
+            target_type=self.target_type
         )
 
         if not self.use_guidance or self.condition_mode == 'none':
             self.diffusion.guidance_scale = 0.0
+            self.diffusion.guidance_scales.zero_()
         
         # 保存配置用于一致性检查
         self.diffusion_config = {
@@ -750,6 +765,13 @@ class MultiChannelCSDI(nn.Module):
             'schedule': config.get('schedule', 'quad'),
             'guidance_scale': config.get('guidance_scale', 1.0)
         }
+
+    def _infer_input_channels(self):
+        if self.use_network_condition and self.condition_mode == 'mix':
+            return 14
+        if self.use_network_condition:
+            return 6
+        return 3
 
     def _select_target(self, batch):
         """Return diffusion target x0 with shape [B, 3, 168]."""
@@ -765,8 +787,39 @@ class MultiChannelCSDI(nn.Module):
         assert x0.shape[2] == 168, f"x0 length dim must be 168, got {x0.shape[2]}"
         return x0
 
+    def _masked_forecast(self, forecast_3ch):
+        assert forecast_3ch.ndim == 3 and forecast_3ch.shape[1:] == (3, 168), (
+            f"forecast_3ch must be [B, 3, 168], got {tuple(forecast_3ch.shape)}"
+        )
+        mask = torch.as_tensor(self.cond_mask, dtype=forecast_3ch.dtype, device=forecast_3ch.device).view(1, 3, 1)
+        return forecast_3ch * mask
+
+    def build_model_input(self, x_t, forecast_3ch=None, time_encoding=None):
+        """Build model input according to version config."""
+        assert x_t.ndim == 3 and x_t.shape[1:] == (3, 168), (
+            f"x_t must be [B, 3, 168], got {tuple(x_t.shape)}"
+        )
+        if not self.use_network_condition:
+            model_input = x_t
+        else:
+            assert forecast_3ch is not None, "forecast_3ch is required when use_network_condition=True"
+            forecast_3ch = self._masked_forecast(forecast_3ch)
+            if self.condition_mode == 'mix':
+                assert time_encoding is not None, "time_encoding is required for condition_mode='mix'"
+                assert time_encoding.ndim == 3 and time_encoding.shape[1:] == (8, 168), (
+                    f"time_encoding must be [B, 8, 168], got {tuple(time_encoding.shape)}"
+                )
+                model_input = torch.cat([x_t, forecast_3ch, time_encoding], dim=1)
+            else:
+                model_input = torch.cat([x_t, forecast_3ch], dim=1)
+
+        assert model_input.shape[1] == self.in_channels, (
+            f"model input channels {model_input.shape[1]} != configured in_channels {self.in_channels}"
+        )
+        return model_input
+
     def _build_condition(self, forecast_3ch, time_encoding):
-        """Build the 11-channel condition block while preserving the existing UNet shape."""
+        """Compatibility helper for old visualization code."""
         assert forecast_3ch.ndim == 3 and forecast_3ch.shape[1:] == (3, 168), (
             f"forecast_3ch must be [B, 3, 168], got {tuple(forecast_3ch.shape)}"
         )
@@ -777,8 +830,7 @@ class MultiChannelCSDI(nn.Module):
             forecast_3ch = torch.zeros_like(forecast_3ch)
             time_encoding = torch.zeros_like(time_encoding)
         else:
-            mask = torch.as_tensor(self.cond_mask, dtype=forecast_3ch.dtype, device=forecast_3ch.device).view(1, 3, 1)
-            forecast_3ch = forecast_3ch * mask
+            forecast_3ch = self._masked_forecast(forecast_3ch)
         return torch.cat([forecast_3ch, time_encoding], dim=1)
         
     def get_time_features(self, timepoints):
@@ -831,13 +883,15 @@ class MultiChannelCSDI(nn.Module):
         # x0: actual by default for V0, residual only for explicit residual experiments.
         x0 = self._select_target(batch)  # (B, 3, 168)
         
-        # 条件部分: Base Prediction (3, 168) + Time Encoding (8, 168) = 11维
         forecast_3ch = batch['forecast_3ch'].to(self.device)  # (B, 3, 168)
         time_encoding = batch['time_encoding'].to(self.device)  # (B, 8, 168)
-        cond_full = self._build_condition(forecast_3ch, time_encoding)  # (B, 11, 168)
+        if self.use_forecast:
+            assert forecast_3ch.shape == x0.shape, f"forecast shape {forecast_3ch.shape} must match x0 {x0.shape}"
         
-        # KDE条件矩阵 (仅对Channel [0:3]构建)
-        cond_matrix = batch['cond_matrix'].to(self.device)  # (B, 3, 168, 2)
+        residual = batch['residual_3ch'].to(self.device)
+        if self.target_type == 'residual':
+            reconstructed_actual = forecast_3ch - residual
+            assert reconstructed_actual.shape == x0.shape
         
         # 时间点索引
         timepoints = batch['timepoints'].to(self.device)  # (B, 168)
@@ -845,8 +899,14 @@ class MultiChannelCSDI(nn.Module):
         # 获取时间特征
         time_feat = self.get_time_features(timepoints)
         
-        # 计算扩散损失（传入条件矩阵，保证训练推理一致）
-        loss = self.diffusion(x0, cond_full, time_feat, cond_matrix)
+        def model_input_fn(x_t):
+            return self.build_model_input(
+                x_t,
+                forecast_3ch=forecast_3ch if self.use_forecast else None,
+                time_encoding=time_encoding,
+            )
+
+        loss = self.diffusion(x0, model_input_fn, time_feat)
         
         return loss
     
@@ -860,18 +920,30 @@ class MultiChannelCSDI(nn.Module):
         Returns:
             samples: (B, n_samples, 3, 168) 生成的残差场景
         """
-        # 条件部分
         forecast_3ch = batch['forecast_3ch'].to(self.device)  # (B, 3, 168)
         time_encoding = batch['time_encoding'].to(self.device)  # (B, 8, 168)
-        cond_full = self._build_condition(forecast_3ch, time_encoding)  # (B, 11, 168)
         
-        # KDE条件矩阵
-        cond_matrix = batch['cond_matrix'].to(self.device)  # (B, 3, 168, 2)
+        cond_matrix = batch['cond_matrix'].to(self.device) if self.use_guidance else None
         timepoints = batch['timepoints'].to(self.device)
         
         time_feat = self.get_time_features(timepoints)
+
+        def model_input_fn(x_t):
+            return self.build_model_input(
+                x_t,
+                forecast_3ch=forecast_3ch if self.use_forecast else None,
+                time_encoding=time_encoding,
+            )
         
         with torch.no_grad():
-            samples = self.diffusion.sample(cond_full, cond_matrix, time_feat, n_samples)
+            samples = self.diffusion.sample(
+                model_input_fn,
+                batch_size=forecast_3ch.shape[0],
+                device=self.device,
+                time_feat=time_feat,
+                cond_matrix=cond_matrix,
+                forecast=forecast_3ch if self.use_forecast else None,
+                n_samples=n_samples,
+            )
         
         return samples

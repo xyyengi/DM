@@ -46,7 +46,8 @@ x_{t-1} = x_{t-1} + γ · ∇_x log p(c|x_t)
 ```
 输入：历史数据 + FEDformer预测值
       ↓
-计算残差：residual = actual - forecast
+计算残差：residual = forecast - actual
+重构实际值：actual = forecast - residual
       ↓
 归一化残差 → 输入扩散模型
       ↓

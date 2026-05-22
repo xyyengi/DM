@@ -56,7 +56,8 @@ forecast.shape = [B, 3, 168]
 实际与预测的差值。
 
 ```text
-residual = actual - forecast
+residual = forecast - actual
+actual = forecast - residual
 ```
 
 只有当配置明确：
@@ -224,7 +225,7 @@ assert cond.shape[-1] == x_t.shape[-1]
 
 ```text
 target_type=residual
-scenario = forecast + generated_residual
+scenario = forecast - generated_residual
 ```
 
 并与 actual target 版本分开保存，不允许覆盖主实验。

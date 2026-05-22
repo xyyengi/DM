@@ -93,7 +93,8 @@ V2：作为 cond 输入神经网络
 残差，是实际值和预测值的差。
 
 ```text
-residual = actual - forecast
+residual = forecast - actual
+actual = forecast - residual
 ```
 
 residual 可以作为额外实验，但不是默认主线。
@@ -446,7 +447,7 @@ guidance:
 请实现或整理：
 
 ```python
-error = actual - forecast
+error = forecast - actual
 ```
 
 按变量分别处理：

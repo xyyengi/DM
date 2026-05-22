@@ -106,7 +106,7 @@ xt = 对 x0 加噪后的曲线
 ```text
 x0       = 历史实际出力曲线
 forecast = 历史预测出力曲线
-error    = actual - forecast
+error    = forecast - actual
 cond_c   = 由 forecast 与误差分布构造出的上下界区间
 ```
 
@@ -131,7 +131,8 @@ epsilon_theta = model(xt, t, cond)
 ```text
 actual：扩散模型要生成的目标
 forecast：用于约束或条件输入的信息
-residual = actual - forecast：可作为一种建模目标或辅助分析对象，但不是默认必须生成的对象
+residual = forecast - actual：可作为一种建模目标或辅助分析对象，但不是默认必须生成的对象
+actual = forecast - residual
 ```
 
 ---
@@ -188,7 +189,7 @@ actual x0
 额外统计：
 
 ```text
-error = actual - forecast
+error = forecast - actual
 按 forecast 分箱，估计 error distribution
 得到每个 forecast 水平下的误差范围 K_h(f)
 构造 c_down, c_up
@@ -547,9 +548,9 @@ condition = forecast curve
 可以尝试：
 
 ```text
-target = residual = actual - forecast
+target = residual = forecast - actual
 diffusion 生成 residual scenarios
-scenario = forecast + residual_scenario
+scenario = forecast - residual_scenario
 ```
 
 该版本不是 2023 论文默认逻辑，但在工程上常见且可能有效。需要作为单独实验，不要和论文复现混在一起。
