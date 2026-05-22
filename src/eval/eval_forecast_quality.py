@@ -3,9 +3,10 @@
 """Evaluate forecast quality against actual wind/pv/load curves.
 
 The current processed dataset stores forecast in *_pred.npy and residual in
-*_res.npy. This script assumes residual = actual - forecast, so:
+*_res.npy. The residual definition is:
 
-    actual = forecast + residual
+    residual = forecast - actual
+    actual = forecast - residual
 
 Expected array shape is [N, 168, C], where C >= 3 and channels [0:3] are
 wind, pv, load.
@@ -22,6 +23,35 @@ import numpy as np
 
 
 CHANNELS = ("wind", "pv", "load")
+
+
+def maybe_compare_true(data_path, split, reconstructed_actual):
+    """Compare reconstructed actual with true.npy when shapes can be aligned."""
+    true_path = Path(data_path) / "true.npy"
+    if not true_path.exists() or split == "legacy":
+        return None
+
+    true = np.load(true_path)
+    if true.ndim != 3 or true.shape[1] != reconstructed_actual.shape[1] or true.shape[2] < 3:
+        return {
+            "status": "not_aligned",
+            "reason": f"true.npy shape {true.shape} is incompatible with {reconstructed_actual.shape}",
+        }
+
+    true_3ch = true[:, :, :3].astype(np.float64)
+    n = min(true_3ch.shape[0], reconstructed_actual.shape[0])
+    if n == 0:
+        return {"status": "not_aligned", "reason": "empty true/reconstructed arrays"}
+
+    diff = reconstructed_actual[:n] - true_3ch[:n]
+    return {
+        "status": "aligned_by_prefix",
+        "n_aligned": int(n),
+        "true_shape": list(true_3ch.shape),
+        "reconstructed_shape": list(reconstructed_actual.shape),
+        "mae": float(np.mean(np.abs(diff))),
+        "max_abs_error": float(np.max(np.abs(diff))),
+    }
 
 
 def load_split(data_path, split):
@@ -42,7 +72,7 @@ def load_split(data_path, split):
             raise FileNotFoundError(f"Expected {pred_path} and {res_path}")
         forecast = np.load(pred_path)
         residual = np.load(res_path)
-        actual = forecast + residual
+        actual = forecast - residual
 
     if forecast.ndim != 3 or actual.ndim != 3:
         raise ValueError(f"Expected [N, 168, C], got forecast={forecast.shape}, actual={actual.shape}")
@@ -53,7 +83,10 @@ def load_split(data_path, split):
     if forecast.shape[2] < 3:
         raise ValueError(f"Expected at least 3 channels, got {forecast.shape[2]}")
 
-    return forecast[:, :, :3].astype(np.float64), actual[:, :, :3].astype(np.float64)
+    forecast_3ch = forecast[:, :, :3].astype(np.float64)
+    actual_3ch = actual[:, :, :3].astype(np.float64)
+    true_check = maybe_compare_true(data_path, split, actual_3ch)
+    return forecast_3ch, actual_3ch, true_check
 
 
 def pearson_corr(x, y):
@@ -116,7 +149,21 @@ def main():
     parser.add_argument("--eps", type=float, default=1e-6)
     args = parser.parse_args()
 
-    forecast, actual = load_split(args.data_path, args.split)
+    forecast, actual, true_check = load_split(args.data_path, args.split)
+    print(
+        "Reconstructed actual: "
+        f"shape={actual.shape}, min={actual.min():.6f}, "
+        f"max={actual.max():.6f}, mean={actual.mean():.6f}"
+    )
+    if true_check is not None:
+        if true_check["status"] == "aligned_by_prefix":
+            print(
+                "true.npy alignment check: "
+                f"n={true_check['n_aligned']}, MAE={true_check['mae']:.10f}, "
+                f"MaxAE={true_check['max_abs_error']:.10f}"
+            )
+        else:
+            print(f"true.npy alignment check: {true_check['status']} ({true_check['reason']})")
     rows = compute_metrics(forecast, actual, eps=args.eps)
     csv_path, json_path = save_outputs(rows, args.output_dir)
 

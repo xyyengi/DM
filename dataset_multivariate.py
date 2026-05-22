@@ -6,7 +6,7 @@
 # 数据结构：
 # - pred.npy: (N, 168, 3) - 训练集预测值
 # - test_pred.npy: (N, 168, 3) - 测试集预测值  
-# - test_res.npy: (N, 168, 3) - 测试集残差 (预测 - 真实)
+# - test_res.npy: (N, 168, 3) - 测试集残差 (forecast - actual)
 # - 通道映射: 0=风电, 1=光伏, 2=负荷
 # 
 # 论文公式对应：
@@ -124,7 +124,7 @@ class MultiChannelKDE:
         
         Args:
             forecast_data: (N, L, 11) 预测值
-            residual_data: (N, L, 11) 残差值 (预测 - 真实)
+            residual_data: (N, L, 11) 残差值 (forecast - actual)
         """
         # 仅对前3个通道（风、光、负荷）进行KDE拟合
         n_channels_kde = 3  # 风、光、负荷
@@ -425,9 +425,25 @@ class MultiChannelWindScenarioDataset(Dataset):
         self.n_channels = self.forecast_data.shape[2]  # 应为11
         
     def _normalize_data(self):
-        """归一化数据到[0,1]范围"""
+        """
+        归一化数据到[0,1]范围。
+
+        数据定义：
+        residual = forecast - actual
+        actual = forecast - residual
+        """
         self.max_values = np.max(np.abs(self.forecast_data), axis=(0, 1))
         self.max_values = np.maximum(self.max_values, 1e-6)
+
+        reconstructed_actual = self.forecast_data[:, :, :3] - self.residual_data[:, :, :3]
+        assert np.isfinite(reconstructed_actual).all(), "reconstructed actual contains NaN/Inf"
+        print(
+            f"  [Dataset] reconstructed actual ({self.mode}) "
+            f"shape={reconstructed_actual.shape}, "
+            f"min={reconstructed_actual.min():.6f}, "
+            f"max={reconstructed_actual.max():.6f}, "
+            f"mean={reconstructed_actual.mean():.6f}"
+        )
         
         self.forecast_norm = self.forecast_data / self.max_values
         self.residual_norm = self.residual_data / self.max_values
@@ -507,7 +523,7 @@ class MultiChannelWindScenarioDataset(Dataset):
         # 提取各部分特征
         residual_3ch = residual[:3, :]  # (3, 168) Target Residuals
         forecast_3ch = forecast[:3, :]  # (3, 168) Base Prediction
-        actual_3ch = forecast_3ch + residual_3ch  # (3, 168) actual = forecast + residual
+        actual_3ch = forecast_3ch - residual_3ch  # (3, 168) actual = forecast - residual
         time_encoding = forecast[3:11, :]  # (8, 168) Time Encoding
 
         assert actual_3ch.ndim == 2 and actual_3ch.shape == (3, self.seq_length)
