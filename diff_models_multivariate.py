@@ -516,8 +516,8 @@ class GaussianDiffusionMultivariate(nn.Module):
         
         # 预测噪声（模型输出3维）
         predicted_noise = self.model(input_14ch, time_feat)
-        assert predicted_noise.shape == noise.shape, (
-            f"epsilon_theta shape must match noise shape, got {tuple(predicted_noise.shape)} vs {tuple(noise.shape)}"
+        assert predicted_noise.shape == x_t.shape, (
+            f"epsilon_theta shape must match x_t shape, got {tuple(predicted_noise.shape)} vs {tuple(x_t.shape)}"
         )
 
         if not self._shape_debug_printed:
