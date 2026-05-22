@@ -368,6 +368,7 @@ class GaussianDiffusionMultivariate(nn.Module):
         self.model = model  # ResUNet
         self.num_steps = num_steps
         self.guidance_scale = guidance_scale
+        self._shape_debug_printed = False
         
         # Beta schedule - 使用register_buffer确保张量随模型移动到GPU
         if schedule == 'quad':
@@ -396,6 +397,11 @@ class GaussianDiffusionMultivariate(nn.Module):
             x_t: 加噪后的数据
             noise: 添加的噪声
         """
+        assert x0.ndim == 3, f"x0 must be [B, 3, 168], got {tuple(x0.shape)}"
+        assert x0.shape[1] == 3, f"x0 channel dim must be 3, got {x0.shape[1]}"
+        assert x0.shape[2] == 168, f"x0 length dim must be 168, got {x0.shape[2]}"
+        assert t.ndim == 1 and t.shape[0] == x0.shape[0], f"t must be [B], got {tuple(t.shape)}"
+
         noise = torch.randn_like(x0)
         
         alpha_hat_t = self.alpha_hat[t].view(-1, 1, 1)
@@ -491,6 +497,16 @@ class GaussianDiffusionMultivariate(nn.Module):
             x_{t-1}: 去噪一步后的数据
             debug_info: dict 调试信息（仅当 debug=True）
         """
+        assert x_t.ndim == 3, f"x_t must be [B, 3, 168], got {tuple(x_t.shape)}"
+        assert x_t.shape[1] == 3, f"x_t channel dim must be 3, got {x_t.shape[1]}"
+        assert x_t.shape[2] == 168, f"x_t length dim must be 168, got {x_t.shape[2]}"
+        assert cond_full.ndim == 3 and cond_full.shape[0] == x_t.shape[0] and cond_full.shape[2] == 168, (
+            f"cond_full must be [B, C_cond, 168], got {tuple(cond_full.shape)}"
+        )
+        assert cond_matrix.ndim == 4 and cond_matrix.shape == (x_t.shape[0], 3, 168, 2), (
+            f"cond_matrix must be [B, 3, 168, 2], got {tuple(cond_matrix.shape)}"
+        )
+
         B = x_t.shape[0]
         device = x_t.device
         debug_info = None
@@ -500,6 +516,17 @@ class GaussianDiffusionMultivariate(nn.Module):
         
         # 预测噪声（模型输出3维）
         predicted_noise = self.model(input_14ch, time_feat)
+        assert predicted_noise.shape == noise.shape, (
+            f"epsilon_theta shape must match noise shape, got {tuple(predicted_noise.shape)} vs {tuple(noise.shape)}"
+        )
+
+        if not self._shape_debug_printed:
+            print(
+                "[Shape] "
+                f"x0={tuple(x0.shape)}, xt={tuple(x_t.shape)}, "
+                f"noise={tuple(noise.shape)}, epsilon_theta={tuple(predicted_noise.shape)}"
+            )
+            self._shape_debug_printed = True
         
         # 计算去噪均值
         alpha_t = self.alpha[t]
@@ -573,6 +600,13 @@ class GaussianDiffusionMultivariate(nn.Module):
             samples: (B, n_samples, 3, 168) 生成的场景
             debug_log: list 调试日志（仅当 debug=True）
         """
+        assert cond_full.ndim == 3 and cond_full.shape[2] == 168, (
+            f"cond_full must be [B, C_cond, 168], got {tuple(cond_full.shape)}"
+        )
+        assert cond_matrix.ndim == 4 and cond_matrix.shape == (cond_full.shape[0], 3, 168, 2), (
+            f"cond_matrix must be [B, 3, 168, 2], got {tuple(cond_matrix.shape)}"
+        )
+
         B = cond_full.shape[0]
         device = cond_full.device
         
@@ -611,6 +645,13 @@ class GaussianDiffusionMultivariate(nn.Module):
         Returns:
             loss: 训练损失
         """
+        assert x0.ndim == 3, f"x0 must be [B, 3, 168], got {tuple(x0.shape)}"
+        assert x0.shape[1] == 3, f"x0 channel dim must be 3, got {x0.shape[1]}"
+        assert x0.shape[2] == 168, f"x0 length dim must be 168, got {x0.shape[2]}"
+        assert cond_full.ndim == 3 and cond_full.shape[0] == x0.shape[0] and cond_full.shape[2] == 168, (
+            f"cond_full must be [B, C_cond, 168], got {tuple(cond_full.shape)}"
+        )
+
         B = x0.shape[0]
         device = x0.device
         
@@ -662,6 +703,11 @@ class MultiChannelCSDI(nn.Module):
         super().__init__()
         self.device = device
         self.config = config
+        self.target_type = config.get('target_type', 'residual')
+        self.condition_mode = config.get('condition_mode', 'guidance_2023')
+        self.use_forecast = config.get('use_forecast', True)
+        self.use_guidance = config.get('use_guidance', True)
+        self.cond_mask = config.get('cond_mask', [1, 1, 1])
         
         # 输入输出通道定义
         self.in_channels = config.get('in_channels', 14)  # 14维输入
@@ -692,6 +738,9 @@ class MultiChannelCSDI(nn.Module):
             schedule=config.get('schedule', 'quad'),
             guidance_scale=config.get('guidance_scale', 1.0)
         )
+
+        if not self.use_guidance or self.condition_mode == 'none':
+            self.diffusion.guidance_scale = 0.0
         
         # 保存配置用于一致性检查
         self.diffusion_config = {
@@ -701,6 +750,36 @@ class MultiChannelCSDI(nn.Module):
             'schedule': config.get('schedule', 'quad'),
             'guidance_scale': config.get('guidance_scale', 1.0)
         }
+
+    def _select_target(self, batch):
+        """Return diffusion target x0 with shape [B, 3, 168]."""
+        if self.target_type == 'actual':
+            x0 = batch['actual_3ch'].to(self.device)
+        elif self.target_type == 'residual':
+            x0 = batch['residual_3ch'].to(self.device)
+        else:
+            raise ValueError(f"Unsupported target_type: {self.target_type}")
+
+        assert x0.ndim == 3, f"x0 must be [B, 3, 168], got {tuple(x0.shape)}"
+        assert x0.shape[1] == 3, f"x0 channel dim must be 3, got {x0.shape[1]}"
+        assert x0.shape[2] == 168, f"x0 length dim must be 168, got {x0.shape[2]}"
+        return x0
+
+    def _build_condition(self, forecast_3ch, time_encoding):
+        """Build the 11-channel condition block while preserving the existing UNet shape."""
+        assert forecast_3ch.ndim == 3 and forecast_3ch.shape[1:] == (3, 168), (
+            f"forecast_3ch must be [B, 3, 168], got {tuple(forecast_3ch.shape)}"
+        )
+        assert time_encoding.ndim == 3 and time_encoding.shape[1:] == (8, 168), (
+            f"time_encoding must be [B, 8, 168], got {tuple(time_encoding.shape)}"
+        )
+        if self.condition_mode == 'none' or not self.use_forecast:
+            forecast_3ch = torch.zeros_like(forecast_3ch)
+            time_encoding = torch.zeros_like(time_encoding)
+        else:
+            mask = torch.as_tensor(self.cond_mask, dtype=forecast_3ch.dtype, device=forecast_3ch.device).view(1, 3, 1)
+            forecast_3ch = forecast_3ch * mask
+        return torch.cat([forecast_3ch, time_encoding], dim=1)
         
     def get_time_features(self, timepoints):
         """
@@ -749,13 +828,13 @@ class MultiChannelCSDI(nn.Module):
         Returns:
             loss: 训练损失
         """
-        # Target Residuals (3, 168) - 扩散目标
-        residual = batch['residual_3ch'].to(self.device)  # (B, 3, 168)
+        # x0: actual by default for V0, residual only for explicit residual experiments.
+        x0 = self._select_target(batch)  # (B, 3, 168)
         
         # 条件部分: Base Prediction (3, 168) + Time Encoding (8, 168) = 11维
         forecast_3ch = batch['forecast_3ch'].to(self.device)  # (B, 3, 168)
         time_encoding = batch['time_encoding'].to(self.device)  # (B, 8, 168)
-        cond_full = torch.cat([forecast_3ch, time_encoding], dim=1)  # (B, 11, 168)
+        cond_full = self._build_condition(forecast_3ch, time_encoding)  # (B, 11, 168)
         
         # KDE条件矩阵 (仅对Channel [0:3]构建)
         cond_matrix = batch['cond_matrix'].to(self.device)  # (B, 3, 168, 2)
@@ -767,7 +846,7 @@ class MultiChannelCSDI(nn.Module):
         time_feat = self.get_time_features(timepoints)
         
         # 计算扩散损失（传入条件矩阵，保证训练推理一致）
-        loss = self.diffusion(residual, cond_full, time_feat, cond_matrix)
+        loss = self.diffusion(x0, cond_full, time_feat, cond_matrix)
         
         return loss
     
@@ -784,7 +863,7 @@ class MultiChannelCSDI(nn.Module):
         # 条件部分
         forecast_3ch = batch['forecast_3ch'].to(self.device)  # (B, 3, 168)
         time_encoding = batch['time_encoding'].to(self.device)  # (B, 8, 168)
-        cond_full = torch.cat([forecast_3ch, time_encoding], dim=1)  # (B, 11, 168)
+        cond_full = self._build_condition(forecast_3ch, time_encoding)  # (B, 11, 168)
         
         # KDE条件矩阵
         cond_matrix = batch['cond_matrix'].to(self.device)  # (B, 3, 168, 2)

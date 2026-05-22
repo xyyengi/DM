@@ -31,6 +31,15 @@ lr_scheduler:
 
 # 模型配置
 model:
+  # 实验版本开关：
+  # - V0: target_type=actual, condition_mode=none, use_forecast=false, use_guidance=false
+  # - 当前 V1-like: target_type=residual, condition_mode=guidance_2023, use_forecast=true, use_guidance=true
+  target_type: "residual"       # actual / residual
+  condition_mode: "guidance_2023" # none / guidance_2023 / csdi_forecast
+  use_forecast: true
+  use_guidance: true
+  cond_mask: [1, 1, 1]
+
   # 输入输出通道
   in_channels: 14   # 14维输入（Target Residuals + Base Prediction + Time Encoding）
   out_channels: 3   # 3维输出（只预测前3维的噪声）
@@ -61,6 +70,25 @@ model:
   
   # KDE区间数量 (公式7中的区间划分)
   n_intervals: 10
+
+# 推荐 V0 无条件 DDPM 开关（运行时可复制到 model 下，或新建单独配置文件）
+experiment:
+  name: "v1_like_residual_guidance_168h"
+
+target:
+  type: "residual" # actual / residual
+
+condition:
+  mode: "guidance_2023" # none / guidance_2023 / csdi_forecast
+  use_forecast: true
+  use_guidance: true
+  cond_mask: [1, 1, 1]
+
+guidance:
+  enable: true
+  wind_scale: 0.5
+  pv_scale: 0.5
+  load_scale: 0.5
 
 # 数据配置
 data:

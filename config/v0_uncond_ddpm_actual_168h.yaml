@@ -1,0 +1,62 @@
+# V0: unconditional DDPM baseline on actual wind/pv/load.
+#
+# This file keeps the existing 14-channel UNet shape for a minimal first pass,
+# but zeroes forecast/time condition channels in code when condition.mode=none.
+
+experiment:
+  name: "v0_uncond_ddpm_actual_168h"
+
+target:
+  type: "actual"
+
+condition:
+  mode: "none"
+  use_forecast: false
+  use_guidance: false
+  cond_mask: [0, 0, 0]
+
+guidance:
+  enable: false
+  wind_scale: 0.0
+  pv_scale: 0.0
+  load_scale: 0.0
+
+train:
+  epochs: 200
+  batch_size: 64
+  lr: 5.0e-4
+  weight_decay: 1.0e-3
+  patience: 20
+
+lr_scheduler:
+  enabled: true
+  initial_lr: 1.0e-4
+  warmup_epochs: 10
+  min_lr: 1.0e-6
+
+model:
+  target_type: "actual"
+  condition_mode: "none"
+  use_forecast: false
+  use_guidance: false
+  cond_mask: [0, 0, 0]
+  in_channels: 14
+  out_channels: 3
+  d_time: 64
+  base_channels: 64
+  num_layers: 4
+  num_steps: 500
+  beta_start: 0.0001
+  beta_end: 0.04
+  schedule: "linear"
+  guidance_scale: 0.0
+  n_intervals: 10
+
+data:
+  data_path: "./input_4.27/"
+  seq_length: 168
+  n_channels: 11
+
+evaluation:
+  n_samples: 10
+  quantiles: [0.8, 1.0]

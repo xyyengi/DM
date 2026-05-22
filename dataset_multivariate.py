@@ -493,7 +493,8 @@ class MultiChannelWindScenarioDataset(Dataset):
         
         Returns:
             input_14ch: (14, 168) 14通道完整输入
-            residual_3ch: (3, 168) 仅风、光、负荷残差（扩散目标）
+            actual_3ch: (3, 168) 风、光、负荷真实值（默认扩散目标）
+            residual_3ch: (3, 168) 仅风、光、负荷残差（可选扩散目标）
             forecast_3ch: (3, 168) 预测趋势（用于条件）
             time_encoding: (8, 168) 时间编码
             cond_matrix: (3, 168, 2) 条件矩阵 [c_down, c_up]（仅对前3维构建）
@@ -506,7 +507,12 @@ class MultiChannelWindScenarioDataset(Dataset):
         # 提取各部分特征
         residual_3ch = residual[:3, :]  # (3, 168) Target Residuals
         forecast_3ch = forecast[:3, :]  # (3, 168) Base Prediction
+        actual_3ch = forecast_3ch + residual_3ch  # (3, 168) actual = forecast + residual
         time_encoding = forecast[3:11, :]  # (8, 168) Time Encoding
+
+        assert actual_3ch.ndim == 2 and actual_3ch.shape == (3, self.seq_length)
+        assert residual_3ch.ndim == 2 and residual_3ch.shape == (3, self.seq_length)
+        assert forecast_3ch.ndim == 2 and forecast_3ch.shape == (3, self.seq_length)
         
         # 构建14通道输入: [Target Residuals, Base Prediction, Time Encoding]
         input_14ch = np.concatenate([residual_3ch, forecast_3ch, time_encoding], axis=0)  # (14, 168)
@@ -516,6 +522,7 @@ class MultiChannelWindScenarioDataset(Dataset):
         
         return {
             'input_14ch': torch.FloatTensor(input_14ch),     # (14, 168) 14通道完整输入
+            'actual_3ch': torch.FloatTensor(actual_3ch),     # (3, 168) 真实值
             'residual_3ch': torch.FloatTensor(residual_3ch), # (3, 168) 扩散目标
             'forecast_3ch': torch.FloatTensor(forecast_3ch), # (3, 168) 预测趋势
             'time_encoding': torch.FloatTensor(time_encoding), # (8, 168) 时间编码

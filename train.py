@@ -23,6 +23,28 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 
+def apply_experiment_switches(config):
+    """Copy top-level target/condition switches into model config for the current code path."""
+    model_cfg = config.setdefault('model', {})
+    target_cfg = config.get('target', {})
+    condition_cfg = config.get('condition', {})
+    guidance_cfg = config.get('guidance', {})
+
+    if 'type' in target_cfg:
+        model_cfg['target_type'] = target_cfg['type']
+    if 'mode' in condition_cfg:
+        model_cfg['condition_mode'] = condition_cfg['mode']
+    if 'use_forecast' in condition_cfg:
+        model_cfg['use_forecast'] = condition_cfg['use_forecast']
+    if 'use_guidance' in condition_cfg:
+        model_cfg['use_guidance'] = condition_cfg['use_guidance']
+    if 'cond_mask' in condition_cfg:
+        model_cfg['cond_mask'] = condition_cfg['cond_mask']
+    if 'enable' in guidance_cfg:
+        model_cfg['use_guidance'] = guidance_cfg['enable']
+    return config
+
+
 class EarlyStopping:
     """早停机制类"""
     
@@ -307,7 +329,7 @@ def visualize_sampling_progress(model, batch, device, exp_folder, record_steps=N
     # 准备条件
     forecast_3ch = batch['forecast_3ch'].to(device)
     time_encoding = batch['time_encoding'].to(device)
-    cond_full = torch.cat([forecast_3ch, time_encoding], dim=1)
+    cond_full = model._build_condition(forecast_3ch, time_encoding)
     cond_matrix = batch['cond_matrix'].to(device)
     timepoints = batch['timepoints'].to(device)
     time_feat = model.get_time_features(timepoints)
@@ -432,6 +454,7 @@ def main():
     # 加载配置
     with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
+    config = apply_experiment_switches(config)
     
     # 命令行参数覆盖 - 训练参数
     if args.epochs: config['train']['epochs'] = args.epochs
@@ -445,7 +468,7 @@ def main():
     if args.num_steps: config['model']['num_steps'] = args.num_steps
     if args.base_channels: config['model']['base_channels'] = args.base_channels
     if args.num_layers: config['model']['num_layers'] = args.num_layers
-    if args.guidance_scale: config['model']['guidance_scale'] = args.guidance_scale
+    if args.guidance_scale is not None: config['model']['guidance_scale'] = args.guidance_scale
     if args.n_intervals: config['model']['n_intervals'] = args.n_intervals
     
     print(f"配置文件: {args.config}")

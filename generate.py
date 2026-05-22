@@ -21,6 +21,28 @@ from diff_models_multivariate import MultiChannelCSDI
 from evaluation import evaluate_multichannel, print_metrics
 
 
+def apply_experiment_switches(config):
+    """Copy top-level target/condition switches into model config for the current code path."""
+    model_cfg = config.setdefault('model', {})
+    target_cfg = config.get('target', {})
+    condition_cfg = config.get('condition', {})
+    guidance_cfg = config.get('guidance', {})
+
+    if 'type' in target_cfg:
+        model_cfg['target_type'] = target_cfg['type']
+    if 'mode' in condition_cfg:
+        model_cfg['condition_mode'] = condition_cfg['mode']
+    if 'use_forecast' in condition_cfg:
+        model_cfg['use_forecast'] = condition_cfg['use_forecast']
+    if 'use_guidance' in condition_cfg:
+        model_cfg['use_guidance'] = condition_cfg['use_guidance']
+    if 'cond_mask' in condition_cfg:
+        model_cfg['cond_mask'] = condition_cfg['cond_mask']
+    if 'enable' in guidance_cfg:
+        model_cfg['use_guidance'] = guidance_cfg['enable']
+    return config
+
+
 def find_experiment_folders(base_path, keyword=None):
     """查找实验文件夹"""
     if not os.path.exists(base_path):
@@ -132,7 +154,7 @@ def get_checkpoint_path(exp_folder, ckpt_type='best'):
 def generate_scenarios(model, test_loader, device, n_samples=10):
     """生成场景"""
     model.eval()
-    all_samples, all_forecast, all_residual = [], [], []
+    all_samples, all_forecast, all_residual, all_actual = [], [], [], []
     
     total_batches = len(test_loader)
     print(f"生成场景 (n_samples={n_samples}, 总批次: {total_batches})...")
@@ -143,21 +165,28 @@ def generate_scenarios(model, test_loader, device, n_samples=10):
             all_samples.append(samples.cpu().numpy())
             all_forecast.append(batch['forecast_3ch'].numpy())
             all_residual.append(batch['residual_3ch'].numpy())
+            all_actual.append(batch['actual_3ch'].numpy())
             
             # 进度提示
             if (batch_idx + 1) % 5 == 0 or batch_idx == 0:
                 print(f"  已完成 {batch_idx + 1}/{total_batches} 批次")
     
     print(f"生成完成!")
-    return np.concatenate(all_samples), np.concatenate(all_forecast), np.concatenate(all_residual)
+    return (
+        np.concatenate(all_samples),
+        np.concatenate(all_forecast),
+        np.concatenate(all_residual),
+        np.concatenate(all_actual),
+    )
 
 
-def evaluate_and_save(samples, forecast, residual, max_values, save_path):
+def evaluate_and_save(samples, forecast, residual, actual, max_values, save_path, target_type='residual'):
     """评估并保存结果（使用论文公式12-15）"""
     N, n_samples, C, L = samples.shape
+    target = actual if target_type == 'actual' else residual
     
     # 使用evaluation模块计算完整指标
-    metrics = evaluate_multichannel(samples, residual)
+    metrics = evaluate_multichannel(samples, target)
     print_metrics(metrics)
     
     # 保存结果
@@ -165,6 +194,7 @@ def evaluate_and_save(samples, forecast, residual, max_values, save_path):
     np.save(os.path.join(save_path, 'generated_samples.npy'), samples)
     np.save(os.path.join(save_path, 'forecast_data.npy'), forecast)
     np.save(os.path.join(save_path, 'residual_data.npy'), residual)
+    np.save(os.path.join(save_path, 'actual_data.npy'), actual)
     
     # 保存ACF数据
     for c, name in enumerate(['wind', 'solar', 'load']):
@@ -243,6 +273,7 @@ def main():
     else:
         with open(args.config, 'r') as f:
             config = yaml.safe_load(f)
+    config = apply_experiment_switches(config)
     
     # 数据加载
     test_loader, _, max_values = get_dataloader_multivariate(
@@ -271,11 +302,19 @@ def main():
         print(f"覆盖guidance_scale: {original_gs} -> {args.guidance_scale}")
     
     # 生成
-    samples, forecast, residual = generate_scenarios(model, test_loader, device, args.n_samples)
+    samples, forecast, residual, actual = generate_scenarios(model, test_loader, device, args.n_samples)
     
     # 保存
     result_folder = os.path.join(exp_folder, 'results', f'predict_{datetime.now().strftime("%Y%m%d_%H%M")}')
-    evaluate_and_save(samples, forecast, residual, max_values, result_folder)
+    evaluate_and_save(
+        samples,
+        forecast,
+        residual,
+        actual,
+        max_values,
+        result_folder,
+        target_type=config['model'].get('target_type', 'residual'),
+    )
     
     print(f"\n完成!")
 
