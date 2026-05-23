@@ -16,6 +16,15 @@ from datetime import datetime
 
 from dataset_multivariate import get_dataloader_multivariate
 from diff_models_multivariate import MultiChannelCSDI
+from src.eval.experiment_logger import (
+    append_summary,
+    build_summary_row,
+    create_run_id,
+    ensure_run_dir,
+    get_experiment_name,
+    save_metrics_json,
+    timestamp_now,
+)
 import math
 import numpy as np
 import matplotlib
@@ -104,24 +113,19 @@ class EarlyStopping:
         return f"patience: {self.wait}/{self.patience}"
 
 
-def create_experiment_folder(base_path, exp_name):
-    """创建带时间戳的实验文件夹"""
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M')
-    folder_name = f'run_{exp_name}_{timestamp}'
-    exp_folder = os.path.join(base_path, folder_name)
-    
-    if os.path.exists(exp_folder):
-        import random
-        suffix = random.randint(100, 999)
-        folder_name = f'run_{exp_name}_{timestamp}_{suffix}'
-        exp_folder = os.path.join(base_path, folder_name)
-    
-    os.makedirs(exp_folder, exist_ok=True)
-    os.makedirs(os.path.join(exp_folder, 'checkpoints'), exist_ok=True)
-    os.makedirs(os.path.join(exp_folder, 'logs'), exist_ok=True)
-    
+def create_experiment_folder(outputs_dir, config, exp_name=None):
+    """Create outputs/{run_id}/ with standard subdirectories."""
+    timestamp = timestamp_now()
+    experiment_name = get_experiment_name(config, fallback=exp_name or "experiment")
+    run_id = create_run_id(experiment_name, timestamp)
+    exp_folder = ensure_run_dir(outputs_dir, run_id)
+    config.setdefault("experiment", {})["name"] = experiment_name
+    config["experiment"]["run_id"] = run_id
+    config["experiment"]["timestamp"] = timestamp
+    config["experiment"]["output_dir"] = exp_folder
+    print(f"实验 run_id: {run_id}")
     print(f"实验文件夹: {exp_folder}")
-    return exp_folder
+    return exp_folder, run_id, timestamp
 
 
 def create_lr_scheduler(optimizer, config):
@@ -448,9 +452,26 @@ def visualize_sampling_progress(model, batch, device, exp_folder, record_steps=N
         f.write(str(stats) + '\n')
 
     print('Sampling stats:', stats)
-    # 检查是否超出物理范围 [-1, 1]
-    if stats['min'] < -1.0 or stats['max'] > 1.0:
-        msg = 'WARNING: generated residuals exceed physical range [-1,1]'
+    # Check target-specific expected normalized range.
+    target_type = getattr(model, 'target_type', getattr(model.diffusion, 'target_type', 'residual'))
+    if target_type == 'actual':
+        expected_low, expected_high = 0.0, 1.0
+        target_label = 'actual values'
+    else:
+        expected_low, expected_high = -1.0, 1.0
+        target_label = 'residual values'
+
+    # Post-training smoke diagnostic only; tolerate tiny float drift around bounds.
+    tolerance = 1e-3
+    lower_violation = max(0.0, expected_low - stats['min'])
+    upper_violation = max(0.0, stats['max'] - expected_high)
+    if lower_violation > tolerance or upper_violation > tolerance:
+        msg = (
+            f"WARNING: generated {target_label} outside expected normalized range "
+            f"[{expected_low}, {expected_high}] "
+            f"(min={stats['min']:.6f}, max={stats['max']:.6f}). "
+            "This can be normal for smoke tests or very early epochs."
+        )
         print(msg)
         with open(os.path.join(exp_folder, 'logs', 'sampling_stats.txt'), 'a', encoding='utf-8') as f:
             f.write(msg + '\n')
@@ -461,7 +482,7 @@ def main():
     # 基础参数
     parser.add_argument('--config', default='config/wind_scenario.yaml')
     parser.add_argument('--data_path', default='./input_4.27/')
-    parser.add_argument('--save_path', default='./save/')
+    parser.add_argument('--save_path', default='./outputs/')
     parser.add_argument('--exp_name', default='wind_scenario')
     
     # 训练参数（可命令行覆盖）
@@ -524,16 +545,42 @@ def main():
     model = MultiChannelCSDI(config['model'], device).to(device)
     
     # 训练
-    exp_folder = create_experiment_folder(args.save_path, args.exp_name)
-    with open(os.path.join(exp_folder, 'config_used.yaml'), 'w', encoding='utf-8') as f:
+    exp_folder, run_id, run_timestamp = create_experiment_folder(args.save_path, config, args.exp_name)
+    config['experiment']['config_path'] = args.config
+    config_used_path = os.path.join(exp_folder, 'config_used.yaml')
+    with open(config_used_path, 'w', encoding='utf-8') as f:
         yaml.dump(config, f)
     
     best_epoch = train(model, train_loader, val_loader, config, device, exp_folder, 
                        args.save_every, args.patience, args.use_lr_scheduler)
     
     print(f"\n训练完成! 最佳epoch: {best_epoch}")
-    print(f"模型保存: {exp_folder}/checkpoints/model_best.pt")
+    checkpoint_path = os.path.join(exp_folder, 'checkpoints', 'model_best.pt')
+    print(f"模型保存: {checkpoint_path}")
     print(f"\n提示: 使用 generate.py 在测试集上生成场景并计算评估指标")
+
+    pending_metrics = {
+        "run_id": run_id,
+        "timestamp": run_timestamp,
+        "checkpoint_path": checkpoint_path if os.path.exists(checkpoint_path) else "NA",
+        "scenario_path": os.path.join(exp_folder, 'samples', 'scenarios.npz'),
+        "figure_dir": os.path.join(exp_folder, 'figures'),
+        "notes": "train_completed_metrics_pending",
+    }
+    save_metrics_json(pending_metrics, exp_folder)
+    summary_row = build_summary_row(
+        config=config,
+        run_id=run_id,
+        timestamp=run_timestamp,
+        config_path=args.config,
+        checkpoint_path=checkpoint_path if os.path.exists(checkpoint_path) else None,
+        scenario_path=os.path.join(exp_folder, 'samples', 'scenarios.npz'),
+        figure_dir=os.path.join(exp_folder, 'figures'),
+        metrics=pending_metrics,
+        notes="train_completed_metrics_pending",
+    )
+    summary_path = append_summary(args.save_path, summary_row)
+    print(f"实验汇总已追加: {summary_path}")
 
     # 采样过程深度可视化（记录若干中间时间步波形）
     try:

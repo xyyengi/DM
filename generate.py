@@ -19,6 +19,12 @@ from datetime import datetime
 from dataset_multivariate import get_dataloader_multivariate
 from diff_models_multivariate import MultiChannelCSDI
 from evaluation import evaluate_multichannel, print_metrics
+from src.eval.experiment_logger import (
+    append_summary,
+    build_summary_row,
+    save_metrics_json,
+    timestamp_now,
+)
 
 
 def apply_experiment_switches(config):
@@ -58,8 +64,11 @@ def find_experiment_folders(base_path, keyword=None):
     """查找实验文件夹"""
     if not os.path.exists(base_path):
         return []
-    all_folders = [f for f in os.listdir(base_path) 
-                   if f.startswith('run_') and os.path.isdir(os.path.join(base_path, f))]
+    all_folders = [
+        f for f in os.listdir(base_path)
+        if os.path.isdir(os.path.join(base_path, f))
+        and os.path.exists(os.path.join(base_path, f, 'checkpoints'))
+    ]
     if keyword:
         return [f for f in all_folders if keyword in f]
     return all_folders
@@ -162,7 +171,7 @@ def get_checkpoint_path(exp_folder, ckpt_type='best'):
     raise FileNotFoundError(f"无可用checkpoint: {ckpt_path}")
 
 
-def generate_scenarios(model, test_loader, device, n_samples=10):
+def generate_scenarios(model, test_loader, device, n_samples=10, max_batches=None):
     """生成场景"""
     model.eval()
     all_samples, all_forecast, all_residual, all_actual = [], [], [], []
@@ -172,6 +181,8 @@ def generate_scenarios(model, test_loader, device, n_samples=10):
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(test_loader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
             samples = model.generate(batch, n_samples=n_samples)
             all_samples.append(samples.cpu().numpy())
             all_forecast.append(batch['forecast_3ch'].numpy())
@@ -180,7 +191,8 @@ def generate_scenarios(model, test_loader, device, n_samples=10):
             
             # 进度提示
             if (batch_idx + 1) % 5 == 0 or batch_idx == 0:
-                print(f"  已完成 {batch_idx + 1}/{total_batches} 批次")
+                total_msg = max_batches if max_batches is not None else total_batches
+                print(f"  已完成 {batch_idx + 1}/{total_msg} 批次")
     
     print(f"生成完成!")
     return (
@@ -206,8 +218,9 @@ def save_scenarios_npz(actual_samples, forecast, save_path):
     prob = np.ones(N * n_samples, dtype=np.float64) / float(N * n_samples)
     samples_dir = os.path.join(save_path, 'samples')
     os.makedirs(samples_dir, exist_ok=True)
+    scenario_path = os.path.join(samples_dir, 'scenarios.npz')
     np.savez(
-        os.path.join(samples_dir, 'scenarios.npz'),
+        scenario_path,
         wind=flat[:, 0, :],
         pv=flat[:, 1, :],
         load=flat[:, 2, :],
@@ -216,9 +229,33 @@ def save_scenarios_npz(actual_samples, forecast, save_path):
         forecast_pv=forecast[0, 1, :],
         forecast_load=forecast[0, 2, :],
     )
+    return scenario_path
 
 
-def evaluate_and_save(samples, forecast, residual, actual, max_values, save_path, target_type='residual'):
+def add_basic_mae(metrics, actual_samples, actual):
+    """Add scenario-mean MAE fields expected by experiment_summary.csv."""
+    scenario_mean = np.mean(actual_samples, axis=1)
+    abs_err = np.abs(scenario_mean - actual)
+    channel_mae = np.mean(abs_err, axis=(0, 2))
+    metrics['wind_MAE'] = float(channel_mae[0])
+    metrics['pv_MAE'] = float(channel_mae[1])
+    metrics['load_MAE'] = float(channel_mae[2])
+    metrics['mean_MAE'] = float(np.mean(channel_mae))
+    return metrics
+
+
+def evaluate_and_save(
+    samples,
+    forecast,
+    residual,
+    actual,
+    max_values,
+    save_path,
+    config,
+    config_path=None,
+    checkpoint_path=None,
+    target_type='residual',
+):
     """评估并保存结果（使用论文公式12-15）"""
     N, n_samples, C, L = samples.shape
     actual_samples = model_output_to_actual(samples, forecast, target_type)
@@ -226,6 +263,7 @@ def evaluate_and_save(samples, forecast, residual, actual, max_values, save_path
     
     # 使用evaluation模块计算完整指标
     metrics = evaluate_multichannel(actual_samples, target)
+    metrics = add_basic_mae(metrics, actual_samples, target)
     print_metrics(metrics)
     
     # 保存结果
@@ -235,7 +273,7 @@ def evaluate_and_save(samples, forecast, residual, actual, max_values, save_path
     np.save(os.path.join(save_path, 'forecast_data.npy'), forecast)
     np.save(os.path.join(save_path, 'residual_data.npy'), residual)
     np.save(os.path.join(save_path, 'actual_data.npy'), actual)
-    save_scenarios_npz(actual_samples, forecast, save_path)
+    scenario_path = save_scenarios_npz(actual_samples, forecast, save_path)
     
     # 保存ACF数据
     for c, name in enumerate(['wind', 'solar', 'load']):
@@ -256,18 +294,46 @@ def evaluate_and_save(samples, forecast, residual, actual, max_values, save_path
         for k, v in metrics.items():
             if isinstance(v, (int, float)):
                 f.write(f"{k}: {v}\n")
+
+    run_id = os.path.basename(os.path.abspath(save_path))
+    timestamp = config.get('experiment', {}).get('timestamp', timestamp_now())
+    figure_dir = os.path.join(save_path, 'figures')
+    metrics.update({
+        'run_id': run_id,
+        'timestamp': timestamp,
+        'checkpoint_path': checkpoint_path or 'NA',
+        'scenario_path': scenario_path,
+        'figure_dir': figure_dir,
+        'scenario_shape': str([int(N * n_samples), int(C), int(L)]),
+    })
+    metrics_path = save_metrics_json(metrics, save_path)
+    summary_row = build_summary_row(
+        config=config,
+        run_id=run_id,
+        timestamp=timestamp,
+        config_path=config_path,
+        checkpoint_path=checkpoint_path,
+        scenario_path=scenario_path,
+        figure_dir=figure_dir,
+        metrics=metrics,
+        notes='evaluated',
+    )
+    summary_path = append_summary(os.path.dirname(os.path.abspath(save_path)), summary_row)
     
     print(f"\n结果保存至: {save_path}")
+    print(f"metrics.json: {metrics_path}")
+    print(f"实验汇总已追加: {summary_path}")
 
 
 def main():
     parser = argparse.ArgumentParser(description='多变量协同条件扩散模型 - 预测')
     parser.add_argument('--config', default='config/wind_scenario.yaml')
     parser.add_argument('--data_path', default='./input_4.27/')
-    parser.add_argument('--save_path', default='./save/')
+    parser.add_argument('--save_path', default='./outputs/')
     parser.add_argument('--exp_name', default='wind_scenario', help='实验名称或文件夹名')
     parser.add_argument('--ckpt_epoch', type=int, default=None, help='指定epoch，默认使用最佳模型')
     parser.add_argument('--n_samples', type=int, default=10, help='生成样本数')
+    parser.add_argument('--max_batches', type=int, default=None, help='最多生成多少个测试批次，用于CPU smoke test')
     parser.add_argument('--list', action='store_true', help='列出所有可用实验')
     parser.add_argument('--guidance_scale', type=float, default=None, help='覆盖配置中的guidance_scale')
     args = parser.parse_args()
@@ -278,7 +344,7 @@ def main():
         return
     
     # 查找实验文件夹
-    if args.exp_name.startswith('run_'):
+    if os.path.isdir(os.path.join(args.save_path, args.exp_name)):
         exp_folder = os.path.join(args.save_path, args.exp_name)
     else:
         folders = find_experiment_folders(args.save_path, args.exp_name)
@@ -344,17 +410,25 @@ def main():
         print(f"覆盖guidance_scale: {original_gs} -> {args.guidance_scale}")
     
     # 生成
-    samples, forecast, residual, actual = generate_scenarios(model, test_loader, device, args.n_samples)
+    samples, forecast, residual, actual = generate_scenarios(
+        model,
+        test_loader,
+        device,
+        args.n_samples,
+        max_batches=args.max_batches,
+    )
     
     # 保存
-    result_folder = os.path.join(exp_folder, 'results', f'predict_{datetime.now().strftime("%Y%m%d_%H%M")}')
     evaluate_and_save(
         samples,
         forecast,
         residual,
         actual,
         max_values,
-        result_folder,
+        exp_folder,
+        config=config,
+        config_path=config_path if os.path.exists(config_path) else args.config,
+        checkpoint_path=ckpt_path,
         target_type=config['model'].get('target_type', 'residual'),
     )
     
