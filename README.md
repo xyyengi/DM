@@ -238,7 +238,15 @@ run_one v2_csdi_cond_actual_given_forecast_168h configs/v2_csdi_cond_actual_give
 run_one v_mix_residual_forecast_concat_guidance configs/v_mix_residual_forecast_concat_guidance.yaml
 ```
 
-To run the four versions unattended overnight, put the block above into a script, for example `run_all_versions.sh`, then use one of:
+The repository includes `run_all_versions.sh` with these defaults:
+
+```text
+EPOCHS=150
+PATIENCE=15
+NSAMPLES=20
+```
+
+To run the four versions unattended overnight, use one of:
 
 ```bash
 bash run_all_versions.sh 2>&1 | tee overnight_run.log
