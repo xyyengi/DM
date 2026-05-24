@@ -151,3 +151,98 @@ python generate.py --exp_name wind_scenario --ckpt_epoch 100 --n_samples 50
 **选择逻辑：**
 - 不指定`--ckpt_epoch`：自动使用`model_best.pt`（验证损失最低的模型）
 - 指定`--ckpt_epoch`：使用`model_epoch_{epoch}.pt`
+
+## Experiment Runbook: Train -> Generate -> Summary
+
+Each run writes to `outputs/{run_id}/`, where `run_id` is generated as:
+
+```text
+{timestamp}_{experiment_name}
+```
+
+For each version, the recommended sequence is:
+
+```text
+train.py -> generate.py -> src/eval/collect_experiments.py
+```
+
+`generate.py --exp_name` should use the full `run_id` directory name, not only the short experiment name. The command blocks below find the newest matching `run_id` automatically.
+
+### PowerShell: one version
+
+Replace the config and experiment name as needed:
+
+```powershell
+$EXP = "v0_uncond_ddpm_actual_168h"
+$CONFIG = "configs/v0_uncond_ddpm_actual_168h.yaml"
+$DATA = "input_4.27"
+
+python train.py --config $CONFIG --data_path $DATA --save_path outputs --epochs 1 --batch_size 8 --exp_name $EXP
+$RUN_ID = (Get-ChildItem -Directory outputs | Where-Object { $_.Name -like "*_$EXP" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1).Name
+python generate.py --save_path outputs --exp_name $RUN_ID --data_path $DATA --n_samples 2 --max_batches 1
+python src/eval/collect_experiments.py --outputs_dir outputs
+```
+
+### PowerShell: four-version smoke test
+
+This runs V0/V1/V2/Vmix with 1 epoch and one generate batch. It is for CPU/local smoke tests, not final results.
+
+```powershell
+$DATA = "input_4.27"
+$EPOCHS = 1
+$BATCH = 8
+$NSAMPLES = 2
+$MAX_BATCHES = 1
+
+$RUNS = @(
+  @{ Exp = "v0_uncond_ddpm_actual_168h"; Config = "configs/v0_uncond_ddpm_actual_168h.yaml" },
+  @{ Exp = "v1_2023_guidance_actual_168h"; Config = "configs/v1_2023_guidance_actual_168h.yaml" },
+  @{ Exp = "v2_csdi_cond_actual_given_forecast_168h"; Config = "configs/v2_csdi_cond_actual_given_forecast_168h.yaml" },
+  @{ Exp = "v_mix_residual_forecast_concat_guidance"; Config = "configs/v_mix_residual_forecast_concat_guidance.yaml" }
+)
+
+foreach ($R in $RUNS) {
+  python train.py --config $R.Config --data_path $DATA --save_path outputs --epochs $EPOCHS --batch_size $BATCH --exp_name $R.Exp
+  $RUN_ID = (Get-ChildItem -Directory outputs | Where-Object { $_.Name -like "*_$($R.Exp)" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1).Name
+  python generate.py --save_path outputs --exp_name $RUN_ID --data_path $DATA --n_samples $NSAMPLES --max_batches $MAX_BATCHES
+  python src/eval/collect_experiments.py --outputs_dir outputs
+}
+```
+
+### Bash: server sequential run
+
+Adjust `EPOCHS`, `BATCH`, `NSAMPLES`, and `DATA` before running on the server. Remove `--max_batches` for full test-set generation.
+
+```bash
+DATA=input_4.27
+EPOCHS=100
+BATCH=64
+NSAMPLES=50
+
+run_one () {
+  EXP="$1"
+  CONFIG="$2"
+
+  python train.py --config "$CONFIG" --data_path "$DATA" --save_path outputs --epochs "$EPOCHS" --batch_size "$BATCH" --exp_name "$EXP"
+  RUN_ID=$(ls -td outputs/*_"$EXP" | head -n 1 | xargs basename)
+  python generate.py --save_path outputs --exp_name "$RUN_ID" --data_path "$DATA" --n_samples "$NSAMPLES"
+  python src/eval/collect_experiments.py --outputs_dir outputs
+}
+
+run_one v0_uncond_ddpm_actual_168h configs/v0_uncond_ddpm_actual_168h.yaml
+run_one v1_2023_guidance_actual_168h configs/v1_2023_guidance_actual_168h.yaml
+run_one v2_csdi_cond_actual_given_forecast_168h configs/v2_csdi_cond_actual_given_forecast_168h.yaml
+run_one v_mix_residual_forecast_concat_guidance configs/v_mix_residual_forecast_concat_guidance.yaml
+```
+
+After all runs:
+
+```bash
+python src/eval/collect_experiments.py --outputs_dir outputs
+```
+
+The consolidated table is:
+
+```text
+outputs/experiment_summary.csv
+```
