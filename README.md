@@ -211,19 +211,22 @@ foreach ($R in $RUNS) {
 
 ### Bash: server sequential run
 
-Adjust `EPOCHS`, `BATCH`, `NSAMPLES`, and `DATA` before running on the server. Remove `--max_batches` for full test-set generation.
+Adjust `EPOCHS`, `PATIENCE`, `BATCH`, `NSAMPLES`, and `DATA` before running on the server. Remove `--max_batches` for full test-set generation.
+
+For a first overnight run, `NSAMPLES=20` is usually a safer default than `50`: training time is unchanged, but generation/evaluation time and output size are lower. Use `NSAMPLES=50` later for the final comparison if the first pass looks stable.
 
 ```bash
 DATA=input_4.27
-EPOCHS=100
+EPOCHS=150
+PATIENCE=15
 BATCH=64
-NSAMPLES=50
+NSAMPLES=20
 
 run_one () {
   EXP="$1"
   CONFIG="$2"
 
-  python train.py --config "$CONFIG" --data_path "$DATA" --save_path outputs --epochs "$EPOCHS" --batch_size "$BATCH" --exp_name "$EXP"
+  python train.py --config "$CONFIG" --data_path "$DATA" --save_path outputs --epochs "$EPOCHS" --patience "$PATIENCE" --batch_size "$BATCH" --exp_name "$EXP"
   RUN_ID=$(ls -td outputs/*_"$EXP" | head -n 1 | xargs basename)
   python generate.py --save_path outputs --exp_name "$RUN_ID" --data_path "$DATA" --n_samples "$NSAMPLES"
   python src/eval/collect_experiments.py --outputs_dir outputs
@@ -233,6 +236,19 @@ run_one v0_uncond_ddpm_actual_168h configs/v0_uncond_ddpm_actual_168h.yaml
 run_one v1_2023_guidance_actual_168h configs/v1_2023_guidance_actual_168h.yaml
 run_one v2_csdi_cond_actual_given_forecast_168h configs/v2_csdi_cond_actual_given_forecast_168h.yaml
 run_one v_mix_residual_forecast_concat_guidance configs/v_mix_residual_forecast_concat_guidance.yaml
+```
+
+To run the four versions unattended overnight, put the block above into a script, for example `run_all_versions.sh`, then use one of:
+
+```bash
+bash run_all_versions.sh 2>&1 | tee overnight_run.log
+```
+
+or:
+
+```bash
+nohup bash run_all_versions.sh > overnight_run.log 2>&1 &
+tail -f overnight_run.log
 ```
 
 After all runs:
