@@ -183,6 +183,8 @@ def generate_scenarios(model, test_loader, device, n_samples=10, max_batches=Non
         for batch_idx, batch in enumerate(test_loader):
             if max_batches is not None and batch_idx >= max_batches:
                 break
+            total_msg = max_batches if max_batches is not None else total_batches
+            print(f"  generating batch {batch_idx + 1}/{total_msg} ...", flush=True)
             samples = model.generate(batch, n_samples=n_samples)
             all_samples.append(samples.cpu().numpy())
             all_forecast.append(batch['forecast_3ch'].numpy())
@@ -336,6 +338,7 @@ def main():
     parser.add_argument('--max_batches', type=int, default=None, help='最多生成多少个测试批次，用于CPU smoke test')
     parser.add_argument('--list', action='store_true', help='列出所有可用实验')
     parser.add_argument('--guidance_scale', type=float, default=None, help='覆盖配置中的guidance_scale')
+    parser.add_argument('--batch_size', type=int, default=None, help='generate/evaluate batch size; default=min(train batch, 8)')
     args = parser.parse_args()
     
     # 列出所有实验
@@ -384,8 +387,10 @@ def main():
     
     # 数据加载
     build_kde = bool(config['model'].get('use_guidance', False))
+    generate_batch_size = args.batch_size or min(int(config['train']['batch_size']), 16)
+    print(f"生成batch size: {generate_batch_size}")
     test_loader, _, max_values = get_dataloader_multivariate(
-        args.data_path, config['train']['batch_size'], 'test', config['model']['n_intervals'], build_kde=build_kde)
+        args.data_path, generate_batch_size, 'test', config['model']['n_intervals'], build_kde=build_kde)
     
     # 模型
     model = MultiChannelCSDI(config['model'], device).to(device)

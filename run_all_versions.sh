@@ -6,11 +6,27 @@ EPOCHS=${EPOCHS:-150}
 PATIENCE=${PATIENCE:-15}
 BATCH=${BATCH:-64}
 NSAMPLES=${NSAMPLES:-20}
+GEN_BATCH=${GEN_BATCH:-16}
 OUTPUTS_DIR=${OUTPUTS_DIR:-outputs}
+START_FROM=${START_FROM:-}
+SHOULD_RUN=1
+
+if [[ -n "${START_FROM}" ]]; then
+  SHOULD_RUN=0
+fi
 
 run_one () {
   local exp="$1"
   local config="$2"
+
+  if [[ "${SHOULD_RUN}" == "0" ]]; then
+    if [[ "${exp}" == "${START_FROM}" ]]; then
+      SHOULD_RUN=1
+    else
+      echo "Skipping ${exp}; waiting for START_FROM=${START_FROM}"
+      return
+    fi
+  fi
 
   echo "============================================================"
   echo "Running ${exp}"
@@ -20,7 +36,9 @@ run_one () {
   echo "PATIENCE=${PATIENCE}"
   echo "BATCH=${BATCH}"
   echo "NSAMPLES=${NSAMPLES}"
+  echo "GEN_BATCH=${GEN_BATCH}"
   echo "OUTPUTS_DIR=${OUTPUTS_DIR}"
+  echo "START_FROM=${START_FROM}"
   echo "START_TIME=$(date '+%Y-%m-%d %H:%M:%S')"
   echo "============================================================"
 
@@ -41,7 +59,8 @@ run_one () {
     --save_path "${OUTPUTS_DIR}" \
     --exp_name "${run_id}" \
     --data_path "${DATA}" \
-    --n_samples "${NSAMPLES}"
+    --n_samples "${NSAMPLES}" \
+    --batch_size "${GEN_BATCH}"
 
   python src/eval/collect_experiments.py --outputs_dir "${OUTPUTS_DIR}"
 

@@ -925,25 +925,48 @@ class MultiChannelCSDI(nn.Module):
         
         cond_matrix = batch['cond_matrix'].to(self.device) if self.use_guidance else None
         timepoints = batch['timepoints'].to(self.device)
-        
-        time_feat = self.get_time_features(timepoints)
+
+        B = forecast_3ch.shape[0]
+
+        # Vectorize scenario samples by folding the sample dimension into batch.
+        # This avoids n_samples separate reverse-diffusion loops per test batch.
+        if n_samples > 1:
+            forecast_for_model = forecast_3ch.repeat_interleave(n_samples, dim=0)
+            time_encoding_for_model = time_encoding.repeat_interleave(n_samples, dim=0)
+            timepoints_for_model = timepoints.repeat_interleave(n_samples, dim=0)
+            cond_matrix_for_model = (
+                cond_matrix.repeat_interleave(n_samples, dim=0)
+                if cond_matrix is not None else None
+            )
+            effective_batch = B * n_samples
+        else:
+            forecast_for_model = forecast_3ch
+            time_encoding_for_model = time_encoding
+            timepoints_for_model = timepoints
+            cond_matrix_for_model = cond_matrix
+            effective_batch = B
+
+        time_feat = self.get_time_features(timepoints_for_model)
 
         def model_input_fn(x_t):
             return self.build_model_input(
                 x_t,
-                forecast_3ch=forecast_3ch if self.use_forecast else None,
-                time_encoding=time_encoding,
+                forecast_3ch=forecast_for_model if self.use_forecast else None,
+                time_encoding=time_encoding_for_model,
             )
         
         with torch.no_grad():
             samples = self.diffusion.sample(
                 model_input_fn,
-                batch_size=forecast_3ch.shape[0],
+                batch_size=effective_batch,
                 device=self.device,
                 time_feat=time_feat,
-                cond_matrix=cond_matrix,
-                forecast=forecast_3ch if self.use_forecast else None,
-                n_samples=n_samples,
+                cond_matrix=cond_matrix_for_model,
+                forecast=forecast_for_model if self.use_forecast else None,
+                n_samples=1,
             )
-        
+
+        if n_samples > 1:
+            samples = samples[:, 0].reshape(B, n_samples, 3, 168)
+
         return samples
