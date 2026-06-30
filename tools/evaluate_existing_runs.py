@@ -178,8 +178,9 @@ def evaluate_run(
 
     arrays = limit_windows(arrays, max_samples)
     train_actual = load_actual_from_split(data_path, "train")
+    test_actual_for_flags = load_actual_from_split(data_path, "test")[:arrays.actual.shape[0]]
     thresholds = fit_extreme_thresholds(train_actual)
-    flags = apply_extreme_flags(arrays.actual, thresholds)
+    flags = apply_extreme_flags(test_actual_for_flags, thresholds)
 
     out_dir = output_dir_for(run_dir, output_root)
     os.makedirs(out_dir, exist_ok=True)
@@ -191,7 +192,7 @@ def evaluate_run(
 
     write_csv(os.path.join(out_dir, "metrics_overall.csv"), overall)
     write_csv(os.path.join(out_dir, "metrics_extreme_subsets.csv"), subset_rows)
-    write_csv(os.path.join(out_dir, "metrics_tail.csv"), tail_rows(arrays, thresholds, run_id))
+    write_csv(os.path.join(out_dir, "metrics_tail.csv"), tail_rows(arrays, thresholds, run_id, reference_actual=test_actual_for_flags))
     write_csv(os.path.join(out_dir, "rank_histogram.csv"), rank_histogram_rows(arrays, run_id))
     save_flags(flags, os.path.join(out_dir, "extreme_flags_test.csv"))
     save_thresholds(thresholds, os.path.join(out_dir, "extreme_thresholds_train.json"))

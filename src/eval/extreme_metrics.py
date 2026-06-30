@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """Advanced evaluation helpers for scenario generation runs.
 
@@ -274,16 +274,23 @@ def tail_rows(
     arrays: ScenarioArrays,
     thresholds: Mapping[str, float],
     run_id: str,
+    reference_actual: Optional[np.ndarray] = None,
 ) -> List[Dict[str, float | str | int]]:
     rows: List[Dict[str, float | str | int]] = []
+    tail_actual = reference_actual if reference_actual is not None else arrays.actual
+    if tail_actual.shape != arrays.actual.shape:
+        raise ValueError(
+            f"reference_actual shape {tail_actual.shape} must match actual shape {arrays.actual.shape}"
+        )
     for idx, name in enumerate(CHANNELS):
         samples = arrays.samples[:, :, idx, :]
         actual = arrays.actual[:, idx, :]
+        actual_for_tail = tail_actual[:, idx, :]
         sample_mean = np.mean(samples, axis=1)
         abs_err = np.abs(sample_mean - actual)
         tail_mask = (
-            (actual <= thresholds[f"{name}_actual_p05"])
-            | (actual >= thresholds[f"{name}_actual_p95"])
+            (actual_for_tail <= thresholds[f"{name}_actual_p05"])
+            | (actual_for_tail >= thresholds[f"{name}_actual_p95"])
         )
         tail_count = int(np.sum(tail_mask))
         if tail_count == 0:
@@ -314,7 +321,6 @@ def tail_rows(
     }
     rows.append(total)
     return rows
-
 
 def rank_histogram_rows(arrays: ScenarioArrays, run_id: str) -> List[Dict[str, int | str]]:
     rows: List[Dict[str, int | str]] = []
