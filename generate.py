@@ -9,6 +9,7 @@
 """
 
 import argparse
+import json
 import os
 import sys
 import numpy as np
@@ -213,6 +214,34 @@ def model_output_to_actual(samples, forecast, target_type):
     return samples
 
 
+def load_denormalization_scales(data_path, fallback_max_values):
+    """Return [wind, solar, load] multiplicative scales and their provenance."""
+    params_path = os.path.join(data_path, 'normalization_params.json')
+    if os.path.exists(params_path):
+        with open(params_path, 'r', encoding='utf-8') as f:
+            params = json.load(f)
+        scales = np.asarray([
+            params['wind_total_capacity'],
+            params['solar_total_capacity'],
+            params['load_denominator'],
+        ], dtype=np.float64)
+        source = params_path
+    else:
+        scales = np.asarray(fallback_max_values[:3], dtype=np.float64)
+        source = 'dataset.max_values (legacy fallback)'
+
+    if scales.shape != (3,) or not np.isfinite(scales).all() or np.any(scales <= 0):
+        raise ValueError(f'Invalid denormalization scales from {source}: {scales}')
+    return scales, source
+
+
+def denormalize_channels(values, scales):
+    """Denormalize arrays whose channel axis is second-to-last: [..., C, L]."""
+    shape = [1] * values.ndim
+    shape[-2] = 3
+    return (values * scales.reshape(shape)).astype(values.dtype, copy=False)
+
+
 def save_scenarios_npz(actual_samples, forecast, save_path):
     """Save UC-facing scenario file with flattened equal-probability scenarios."""
     N, n_samples, C, L = actual_samples.shape
@@ -252,6 +281,7 @@ def evaluate_and_save(
     residual,
     actual,
     max_values,
+    data_path,
     save_path,
     config,
     config_path=None,
@@ -260,8 +290,20 @@ def evaluate_and_save(
 ):
     """评估并保存结果（使用论文公式12-15）"""
     N, n_samples, C, L = samples.shape
-    actual_samples = model_output_to_actual(samples, forecast, target_type)
-    target = actual
+    actual_samples_norm = model_output_to_actual(samples, forecast, target_type)
+    scales, scale_source = load_denormalization_scales(data_path, max_values)
+
+    samples_physical = denormalize_channels(samples, scales)
+    actual_samples = denormalize_channels(actual_samples_norm, scales)
+    forecast_physical = denormalize_channels(forecast, scales)
+    residual_physical = denormalize_channels(residual, scales)
+    target = denormalize_channels(actual, scales)
+
+    print(
+        'Denormalization: '
+        f'wind={scales[0]:.6f}, solar={scales[1]:.6f}, '
+        f'load={scales[2]:.6f}; source={scale_source}'
+    )
     
     # 使用evaluation模块计算完整指标
     metrics = evaluate_multichannel(actual_samples, target)
@@ -270,12 +312,30 @@ def evaluate_and_save(
     
     # 保存结果
     os.makedirs(save_path, exist_ok=True)
-    np.save(os.path.join(save_path, 'generated_samples.npy'), samples)
+    # Canonical result files are in physical power units (MW).
+    np.save(os.path.join(save_path, 'generated_samples.npy'), samples_physical)
     np.save(os.path.join(save_path, 'actual_scenarios.npy'), actual_samples)
-    np.save(os.path.join(save_path, 'forecast_data.npy'), forecast)
-    np.save(os.path.join(save_path, 'residual_data.npy'), residual)
-    np.save(os.path.join(save_path, 'actual_data.npy'), actual)
-    scenario_path = save_scenarios_npz(actual_samples, forecast, save_path)
+    np.save(os.path.join(save_path, 'forecast_data.npy'), forecast_physical)
+    np.save(os.path.join(save_path, 'residual_data.npy'), residual_physical)
+    np.save(os.path.join(save_path, 'actual_data.npy'), target)
+
+    # Keep normalized-space arrays for reproducibility and diagnostics.
+    np.save(os.path.join(save_path, 'generated_samples_normalized.npy'), samples)
+    np.save(os.path.join(save_path, 'actual_scenarios_normalized.npy'), actual_samples_norm)
+    np.save(os.path.join(save_path, 'forecast_data_normalized.npy'), forecast)
+    np.save(os.path.join(save_path, 'residual_data_normalized.npy'), residual)
+    np.save(os.path.join(save_path, 'actual_data_normalized.npy'), actual)
+
+    with open(os.path.join(save_path, 'denormalization_used.json'), 'w', encoding='utf-8') as f:
+        json.dump({
+            'channel_order': ['wind', 'solar', 'load'],
+            'scales': scales.tolist(),
+            'source': scale_source,
+            'output_unit': 'MW',
+            'normalized_copies_suffix': '_normalized.npy',
+        }, f, ensure_ascii=False, indent=2)
+
+    scenario_path = save_scenarios_npz(actual_samples, forecast_physical, save_path)
     
     # 保存ACF数据
     for c, name in enumerate(['wind', 'solar', 'load']):
@@ -431,6 +491,7 @@ def main():
         residual,
         actual,
         max_values,
+        args.data_path,
         exp_folder,
         config=config,
         config_path=config_path if os.path.exists(config_path) else args.config,

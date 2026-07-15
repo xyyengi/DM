@@ -104,7 +104,13 @@ def regenerate_arrays(
 
     from dataset_multivariate import get_dataloader_multivariate
     from diff_models_multivariate import MultiChannelCSDI
-    from generate import generate_scenarios, get_checkpoint_path, model_output_to_actual
+    from generate import (
+        denormalize_channels,
+        generate_scenarios,
+        get_checkpoint_path,
+        load_denormalization_scales,
+        model_output_to_actual,
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint_path = get_checkpoint_path(run_dir, "best")
@@ -112,7 +118,7 @@ def regenerate_arrays(
 
     build_kde = bool(config["model"].get("use_guidance", False))
     eval_batch_size = batch_size or min(int(config.get("train", {}).get("batch_size", 16)), 16)
-    test_loader, _, _ = get_dataloader_multivariate(
+    test_loader, _, max_values = get_dataloader_multivariate(
         data_path,
         eval_batch_size,
         "test",
@@ -134,10 +140,11 @@ def regenerate_arrays(
         forecast,
         config["model"].get("target_type", "residual"),
     )
+    scales, _ = load_denormalization_scales(data_path, max_values)
     return ScenarioArrays(
-        samples=actual_samples.astype(np.float64),
-        actual=actual.astype(np.float64),
-        forecast=forecast.astype(np.float64),
+        samples=denormalize_channels(actual_samples, scales).astype(np.float64),
+        actual=denormalize_channels(actual, scales).astype(np.float64),
+        forecast=denormalize_channels(forecast, scales).astype(np.float64),
     )
 
 

@@ -37,7 +37,31 @@ def load_actual_from_split(data_path: str, split: str) -> np.ndarray:
     """Load reconstructed actual [N, C, L] for one split."""
     pred = np.load(os.path.join(data_path, f"{split}_pred.npy"))[:, :, :3]
     res = np.load(os.path.join(data_path, f"{split}_res.npy"))[:, :, :3]
-    actual = pred - res
+    metadata_path = os.path.join(data_path, "export_metadata.json")
+    residual_definition = "forecast_minus_actual"
+    if os.path.exists(metadata_path):
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            residual_definition = json.load(f).get(
+                "residual_definition", "forecast_minus_actual"
+            )
+
+    if residual_definition == "actual_minus_forecast":
+        actual = pred + res
+    elif residual_definition == "forecast_minus_actual":
+        actual = pred - res
+    else:
+        raise ValueError(f"Unsupported residual_definition={residual_definition!r}")
+
+    params_path = os.path.join(data_path, "normalization_params.json")
+    if os.path.exists(params_path):
+        with open(params_path, "r", encoding="utf-8") as f:
+            params = json.load(f)
+        scales = np.asarray([
+            params["wind_total_capacity"],
+            params["solar_total_capacity"],
+            params["load_denominator"],
+        ], dtype=np.float64)
+        actual = actual * scales.reshape(1, 1, 3)
     return actual.transpose(0, 2, 1).astype(np.float64)
 
 
