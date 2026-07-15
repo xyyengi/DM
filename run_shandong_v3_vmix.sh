@@ -2,8 +2,8 @@
 set -euo pipefail
 
 DATA=${DATA:-diffusion_npy_normalized}
-EPOCHS=${EPOCHS:-200}
-PATIENCE=${PATIENCE:-20}
+EPOCHS=${EPOCHS:-150}
+PATIENCE=${PATIENCE:-15}
 BATCH=${BATCH:-64}
 NSAMPLES=${NSAMPLES:-20}
 GEN_BATCH=${GEN_BATCH:-16}
@@ -50,9 +50,9 @@ run_one () {
     "${guidance_args[@]}"
 }
 
-run_one v3 shandong_v3_actual_forecast_time_encoding_168h \
+run_one v3 v3_actual_forecast_time_encoding_168h \
   configs/v3_actual_forecast_time_encoding_168h.yaml
-run_one vmix shandong_vmix_residual_forecast_concat_guidance \
+run_one vmix v_mix_residual_forecast_concat_guidance \
   configs/v_mix_residual_forecast_concat_guidance.yaml
 
 python src/eval/collect_experiments.py --outputs_dir "${OUTPUTS_DIR}"
