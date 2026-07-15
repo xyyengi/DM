@@ -5,6 +5,15 @@ input_4.27/*.pkl
 # 训练结果（本地保留）
 save/run_*/
 
+# Experiment outputs and local report/build artifacts
+outputs_shandong/
+outputs/docx_build_*/
+outputs/docx_extreme_*/
+outputs/*.docx
+outputs/*brief*.md
+tmp/
+*.tar.gz
+
 # Python 缓存
 __pycache__/
 *.pyc

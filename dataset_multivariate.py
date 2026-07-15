@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader, Dataset
 from scipy import stats
 import pickle
 import os
+import json
 
 
 class MultiChannelKDE:
@@ -341,6 +342,7 @@ class MultiChannelWindScenarioDataset(Dataset):
         self.n_channels = n_channels
         self.n_intervals = n_intervals
         self.build_kde = build_kde
+        self._load_export_metadata()
         
         print(f"  [Dataset] mode={mode}, loading data...")
         self._load_data()
@@ -380,6 +382,32 @@ class MultiChannelWindScenarioDataset(Dataset):
             print(f"  [Dataset] KDE/guidance disabled; using zero condition matrix.")
             self.cond_matrix_all = np.zeros((self.num_samples, 3, self.seq_length, 2), dtype=np.float32)
         print(f"  [Dataset] initialization complete.")
+
+    def _load_export_metadata(self):
+        """Load optional export semantics while keeping legacy datasets compatible."""
+        metadata_path = os.path.join(self.data_path, 'export_metadata.json')
+        self.pre_normalized = False
+        self.residual_definition = 'forecast_minus_actual'
+
+        if os.path.exists(metadata_path):
+            with open(metadata_path, 'r', encoding='utf-8') as f:
+                metadata = json.load(f)
+            self.pre_normalized = bool(metadata.get('pre_normalized', False))
+            self.residual_definition = metadata.get(
+                'residual_definition', 'forecast_minus_actual'
+            )
+
+        supported = {'forecast_minus_actual', 'actual_minus_forecast'}
+        if self.residual_definition not in supported:
+            raise ValueError(
+                f"Unsupported residual_definition={self.residual_definition!r}; "
+                f"expected one of {sorted(supported)}"
+            )
+        print(
+            "  [Dataset] export semantics: "
+            f"pre_normalized={self.pre_normalized}, "
+            f"residual_definition={self.residual_definition}"
+        )
     
     def _load_data(self):
         """
@@ -423,6 +451,13 @@ class MultiChannelWindScenarioDataset(Dataset):
         else:  # test mode
             self.forecast_data = self.test_pred
             self.residual_data = self.test_res
+
+        # Internally the model consistently uses residual = forecast - actual.
+        # New exports may use the opposite sign; only the three physical channels
+        # are residuals (channels 3:11 are compatibility time features).
+        if self.residual_data is not None and self.residual_definition == 'actual_minus_forecast':
+            self.residual_data = self.residual_data.copy()
+            self.residual_data[:, :, :3] *= -1.0
         
         # 确保数据维度正确
         if self.forecast_data is None:
@@ -439,8 +474,11 @@ class MultiChannelWindScenarioDataset(Dataset):
         residual = forecast - actual
         actual = forecast - residual
         """
-        self.max_values = np.max(np.abs(self.forecast_data), axis=(0, 1))
-        self.max_values = np.maximum(self.max_values, 1e-6)
+        if self.pre_normalized:
+            self.max_values = np.ones(self.forecast_data.shape[2], dtype=np.float32)
+        else:
+            self.max_values = np.max(np.abs(self.forecast_data), axis=(0, 1))
+            self.max_values = np.maximum(self.max_values, 1e-6)
 
         reconstructed_actual = self.forecast_data[:, :, :3] - self.residual_data[:, :, :3]
         assert np.isfinite(reconstructed_actual).all(), "reconstructed actual contains NaN/Inf"

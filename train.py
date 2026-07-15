@@ -523,7 +523,9 @@ def main():
     if args.num_steps: config['model']['num_steps'] = args.num_steps
     if args.base_channels: config['model']['base_channels'] = args.base_channels
     if args.num_layers: config['model']['num_layers'] = args.num_layers
-    if args.guidance_scale is not None: config['model']['guidance_scale'] = args.guidance_scale
+    if args.guidance_scale is not None:
+        config['model']['guidance_scale'] = args.guidance_scale
+        config['model']['guidance_scales'] = [args.guidance_scale] * 3
     if args.n_intervals: config['model']['n_intervals'] = args.n_intervals
     
     print(f"配置文件: {args.config}")

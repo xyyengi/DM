@@ -412,6 +412,7 @@ def main():
     if args.guidance_scale is not None:
         original_gs = model.diffusion.guidance_scale
         model.diffusion.guidance_scale = args.guidance_scale
+        model.diffusion.guidance_scales.fill_(args.guidance_scale)
         print(f"覆盖guidance_scale: {original_gs} -> {args.guidance_scale}")
     
     # 生成

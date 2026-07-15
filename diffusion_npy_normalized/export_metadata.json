@@ -1,0 +1,139 @@
+{
+  "note": "No FEDformer model metrics are generated here. These npy files are normalized diffusion inputs.",
+  "pre_normalized": true,
+  "normalization_scope": "train_only",
+  "residual_definition": "actual_minus_forecast",
+  "channel_order": ["wind", "solar", "load"],
+  "time_mark_order": ["month_sin", "month_cos", "day_sin", "day_cos", "weekday_sin", "weekday_cos", "hour_sin", "hour_cos"],
+  "splits": {
+    "train": {
+      "hours": 7296,
+      "windows": 7129,
+      "start_local": "2025-01-01 00:00:00+08:00",
+      "end_local": "2025-10-31 23:00:00+08:00",
+      "arrays": {
+        "train_actual.npy": [
+          7129,
+          168,
+          3
+        ],
+        "train_forecast.npy": [
+          7129,
+          168,
+          3
+        ],
+        "train_residual.npy": [
+          7129,
+          168,
+          3
+        ],
+        "train_time_mark.npy": [
+          7129,
+          168,
+          8
+        ],
+        "train_true.npy": [
+          7129,
+          168,
+          11
+        ],
+        "train_pred.npy": [
+          7129,
+          168,
+          11
+        ],
+        "train_res.npy": [
+          7129,
+          168,
+          11
+        ]
+      }
+    },
+    "val": {
+      "hours": 720,
+      "windows": 553,
+      "start_local": "2025-11-01 00:00:00+08:00",
+      "end_local": "2025-11-30 23:00:00+08:00",
+      "arrays": {
+        "val_actual.npy": [
+          553,
+          168,
+          3
+        ],
+        "val_forecast.npy": [
+          553,
+          168,
+          3
+        ],
+        "val_residual.npy": [
+          553,
+          168,
+          3
+        ],
+        "val_time_mark.npy": [
+          553,
+          168,
+          8
+        ],
+        "val_true.npy": [
+          553,
+          168,
+          11
+        ],
+        "val_pred.npy": [
+          553,
+          168,
+          11
+        ],
+        "val_res.npy": [
+          553,
+          168,
+          11
+        ]
+      }
+    },
+    "test": {
+      "hours": 744,
+      "windows": 577,
+      "start_local": "2025-12-01 00:00:00+08:00",
+      "end_local": "2025-12-31 23:00:00+08:00",
+      "arrays": {
+        "test_actual.npy": [
+          577,
+          168,
+          3
+        ],
+        "test_forecast.npy": [
+          577,
+          168,
+          3
+        ],
+        "test_residual.npy": [
+          577,
+          168,
+          3
+        ],
+        "test_time_mark.npy": [
+          577,
+          168,
+          8
+        ],
+        "test_true.npy": [
+          577,
+          168,
+          11
+        ],
+        "test_pred.npy": [
+          577,
+          168,
+          11
+        ],
+        "test_res.npy": [
+          577,
+          168,
+          11
+        ]
+      }
+    }
+  }
+}
