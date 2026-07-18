@@ -9,6 +9,7 @@
 """
 
 import argparse
+import json
 import os
 import torch
 import yaml
@@ -16,6 +17,7 @@ from datetime import datetime
 
 from dataset_multivariate import get_dataloader_multivariate
 from diff_models_multivariate import MultiChannelCSDI
+from src.training.event_aware_sampler import make_event_aware_loader
 from src.eval.experiment_logger import (
     append_summary,
     build_summary_row,
@@ -76,6 +78,11 @@ def print_experiment_summary(config):
     print(f"  use_forecast: {condition.get('use_forecast', config.get('model', {}).get('use_forecast'))}")
     print(f"  use_network_condition: {condition.get('use_network_condition', config.get('model', {}).get('use_network_condition'))}")
     print(f"  use_guidance: {condition.get('use_guidance', config.get('model', {}).get('use_guidance'))}")
+    event_sampling = config.get('event_sampling', {})
+    print(f"  event_sampling.enabled: {event_sampling.get('enabled', False)}")
+    if event_sampling.get('enabled', False):
+        print(f"  event_sampling.event_fraction: {event_sampling.get('event_fraction', 0.20)}")
+        print(f"  event_sampling.event_types: {event_sampling.get('event_types', [])}")
     print("  residual definition: residual = forecast - actual; actual = forecast - residual\n")
 
 
@@ -237,6 +244,9 @@ def train(model, train_loader, val_loader, config, device, exp_folder, save_ever
     
     for epoch in range(epochs):
         # ========== 训练阶段 ==========
+        batch_sampler = getattr(train_loader, 'batch_sampler', None)
+        if hasattr(batch_sampler, 'set_epoch'):
+            batch_sampler.set_epoch(epoch)
         model.train()
         train_loss = 0
         for batch in train_loader:
@@ -247,6 +257,10 @@ def train(model, train_loader, val_loader, config, device, exp_folder, save_ever
             train_loss += loss.item()
         avg_train_loss = train_loss / len(train_loader)
         train_losses.append(avg_train_loss)
+        if hasattr(batch_sampler, 'last_epoch_stats') and batch_sampler.last_epoch_stats:
+            sampling_log = os.path.join(exp_folder, 'logs', 'event_sampling_epochs.jsonl')
+            with open(sampling_log, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(batch_sampler.last_epoch_stats, ensure_ascii=False) + '\n')
         
         # ========== 验证阶段 ==========
         model.eval()
@@ -492,6 +506,8 @@ def main():
     parser.add_argument('--patience', type=int, default=5, help='早停耐心值')
     parser.add_argument('--save_every', type=int, default=50, help='每N轮保存模型')
     parser.add_argument('--use_lr_scheduler', action='store_true', help='启用学习率调度器')
+    parser.add_argument('--event_fraction', type=float, default=None, help='V4-s定向事件抽样比例')
+    parser.add_argument('--max_draws_per_event', type=int, default=None, help='每个event_id每epoch最多定向抽取次数')
     
     # 模型参数（可命令行覆盖）- 核心扩散参数
     parser.add_argument('--beta_start', type=float, default=None, help='扩散beta起始值 (默认0.0001)')
@@ -515,6 +531,10 @@ def main():
     if args.epochs: config['train']['epochs'] = args.epochs
     if args.lr: config['train']['lr'] = args.lr
     if args.batch_size: config['train']['batch_size'] = args.batch_size
+    if args.event_fraction is not None:
+        config.setdefault('event_sampling', {})['event_fraction'] = args.event_fraction
+    if args.max_draws_per_event is not None:
+        config.setdefault('event_sampling', {})['max_draws_per_event_per_epoch'] = args.max_draws_per_event
     
     # 命令行参数覆盖 - 模型参数
     if args.beta_start: config['model']['beta_start'] = args.beta_start
@@ -542,6 +562,14 @@ def main():
         args.data_path, config['train']['batch_size'], 'train', config['model']['n_intervals'], build_kde=build_kde)
     val_loader, _, _ = get_dataloader_multivariate(
         args.data_path, config['train']['batch_size'], 'val', config['model']['n_intervals'], build_kde=build_kde)
+    event_sampler_audit = None
+    if config.get('event_sampling', {}).get('enabled', False):
+        print("正在构建V4-s训练事件目录与分层Sampler...")
+        train_loader, _, event_sampler_audit = make_event_aware_loader(
+            train_loader, args.data_path, config
+        )
+        print("V4-s EventAwareBatchSampler已启用:")
+        print(json.dumps(event_sampler_audit['sampler'], ensure_ascii=False, indent=2))
     
     # 模型
     model = MultiChannelCSDI(config['model'], device).to(device)
@@ -552,6 +580,11 @@ def main():
     config_used_path = os.path.join(exp_folder, 'config_used.yaml')
     with open(config_used_path, 'w', encoding='utf-8') as f:
         yaml.dump(config, f)
+    if event_sampler_audit is not None:
+        audit_path = os.path.join(exp_folder, 'logs', 'event_sampler_audit.json')
+        with open(audit_path, 'w', encoding='utf-8') as f:
+            json.dump(event_sampler_audit, f, ensure_ascii=False, indent=2)
+        print(f"事件Sampler审计记录: {audit_path}")
     
     best_epoch = train(model, train_loader, val_loader, config, device, exp_folder, 
                        args.save_every, args.patience, args.use_lr_scheduler)

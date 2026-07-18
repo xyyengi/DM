@@ -17,7 +17,6 @@
 """
 
 import numpy as np
-from scipy import stats
 
 
 # ==================== 场景指标（论文公式） ====================
@@ -112,9 +111,12 @@ def compute_scenario_width(samples, actual, quantile=1.0, global_range=None):
 
 def compute_energy_score(samples, actual, verbose=False):
     """
-    论文公式14: Energy Score
-    
-    ES = (1/T) Σ Σ ||S_i - S_j|| - (2/T) Σ ||S_i - Y||
+    标准经验 Energy Score（无偏 U-statistic 估计）：
+
+    ES = E||X - Y|| - 0.5 E||X - X'||
+
+    数值越小越好；除浮点舍入误差外应为非负数。实现与
+    ``compute_multivariate_energy_score`` 使用相同定义。
     
     Args:
         samples: (N, n_samples, L) 生成的场景
@@ -124,7 +126,6 @@ def compute_energy_score(samples, actual, verbose=False):
         energy_score: 能量分数
     """
     N, n_samples, L = samples.shape
-    T = N * L
     
     if verbose:
         print(f"  计算Energy Score (n_samples={n_samples})...")
@@ -141,7 +142,7 @@ def compute_energy_score(samples, actual, verbose=False):
             pair_count += 1
             if verbose and pair_count % 100 == 0:
                 print(f"    场景对进度: {pair_count}/{total_pairs}")
-    term1 = term1 * 2 / (n_samples * (n_samples - 1)) if n_samples > 1 else 0
+    term1 = term1 / pair_count if pair_count > 0 else 0
     
     # 第二项: 场景与实际值的距离
     term2 = 0
@@ -149,9 +150,12 @@ def compute_energy_score(samples, actual, verbose=False):
         diff = samples[:, i, :] - actual  # (N, L)
         dist = np.sqrt(np.sum(diff ** 2, axis=1))  # (N,)
         term2 += np.mean(dist)
-    term2 = term2 * 2 / n_samples
-    
-    energy_score = term1 - term2
+    term2 = term2 / n_samples
+
+    # Standard energy score: E||X-y|| - 0.5 E||X-X'||.
+    # ``term1`` is the mean distance between distinct ensemble members and
+    # ``term2`` is the mean distance between ensemble members and truth.
+    energy_score = term2 - 0.5 * term1
     
     if verbose:
         print(f"  Energy Score 完成: {energy_score:.4f}")
@@ -231,7 +235,7 @@ def compute_acf(samples, actual, max_lag=24, verbose=False):
     return acf_actual, acf_samples_mean, acf_samples_std
 
 
-def evaluate_all(samples, actual, quantiles=[1.0, 0.9, 0.8]):
+def evaluate_all(samples, actual, quantiles=[1.0, 0.95, 0.9, 0.8]):
     """
     完整评估：计算所有指标
     
@@ -263,7 +267,7 @@ def evaluate_all(samples, actual, quantiles=[1.0, 0.9, 0.8]):
     return metrics
 
 
-def evaluate_multichannel(samples, actual, channel_names=['wind', 'solar', 'load'], quantiles=[1.0, 0.9, 0.8], verbose=True):
+def evaluate_multichannel(samples, actual, channel_names=['wind', 'solar', 'load'], quantiles=[1.0, 0.95, 0.9, 0.8], verbose=True):
     """
     多通道完整评估：核心场景指标
     
@@ -327,8 +331,14 @@ def evaluate_multichannel(samples, actual, channel_names=['wind', 'solar', 'load
     # 3. 总体指标
     metrics['total_crps'] = np.mean([metrics[f'{name}_crps'] for name in channel_names])
     metrics['total_energy_score'] = np.mean([metrics[f'{name}_energy_score'] for name in channel_names])
-    metrics['total_coverage_100%'] = np.mean([metrics[f'{name}_coverage_100%'] for name in channel_names])
-    metrics['total_width_100%'] = np.mean([metrics[f'{name}_width_100%'] for name in channel_names])
+    for q in quantiles:
+        q_name = f'{int(q*100)}%'
+        metrics[f'total_coverage_{q_name}'] = np.mean(
+            [metrics[f'{name}_coverage_{q_name}'] for name in channel_names]
+        )
+        metrics[f'total_width_{q_name}'] = np.mean(
+            [metrics[f'{name}_width_{q_name}'] for name in channel_names]
+        )
     metrics['total_acf_mae'] = np.mean([metrics[f'{name}_acf_mae'] for name in channel_names])
     
     if verbose:
@@ -516,10 +526,14 @@ def print_metrics(metrics, channel_names=['wind', 'solar', 'load']):
         print(f"  CRPS (平均):                   {metrics['total_crps']:.4f}")
     if 'total_energy_score' in metrics:
         print(f"  Energy Score (单通道平均):     {metrics['total_energy_score']:.4f}")
+    if 'total_coverage_90%' in metrics:
+        print(f"  Coverage (90% nominal):        {metrics['total_coverage_90%']:.2f}%")
+    if 'total_width_90%' in metrics:
+        print(f"  Width (90% nominal):           {metrics['total_width_90%']:.2f}%")
     if 'total_coverage_100%' in metrics:
-        print(f"  Coverage (100%):               {metrics['total_coverage_100%']:.2f}%")
+        print(f"  Coverage (sample min-max):     {metrics['total_coverage_100%']:.2f}%")
     if 'total_width_100%' in metrics:
-        print(f"  Width (100%):                  {metrics['total_width_100%']:.2f}%")
+        print(f"  Width (sample min-max):        {metrics['total_width_100%']:.2f}%")
     if 'total_acf_mae' in metrics:
         print(f"  ACF MAE (辅助):                {metrics['total_acf_mae']:.4f}")
     
