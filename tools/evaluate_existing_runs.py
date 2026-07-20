@@ -29,6 +29,7 @@ def apply_experiment_switches(config: dict) -> dict:
     target_cfg = config.get("target", {})
     condition_cfg = config.get("condition", {})
     guidance_cfg = config.get("guidance", {})
+    sampling_cfg = config.get("sampling", {})
 
     if "type" in target_cfg:
         model_cfg["target_type"] = target_cfg["type"]
@@ -53,6 +54,8 @@ def apply_experiment_switches(config: dict) -> dict:
         model_cfg["guidance_scale"] = max(model_cfg["guidance_scales"])
     if "input_channels" in model_cfg:
         model_cfg["in_channels"] = model_cfg["input_channels"]
+    if "reverse_variance_type" in sampling_cfg:
+        model_cfg["reverse_variance_type"] = sampling_cfg["reverse_variance_type"]
     return config
 from src.eval.extreme_metrics import (  # noqa: E402
     ScenarioArrays,
@@ -124,6 +127,9 @@ def regenerate_arrays(
         "test",
         config["model"]["n_intervals"],
         build_kde=build_kde,
+        residual_standardization=config.get("target", {}).get(
+            "residual_standardization", {"enabled": False}
+        ),
     )
 
     model = MultiChannelCSDI(config["model"], device).to(device)
@@ -139,6 +145,7 @@ def regenerate_arrays(
         raw_samples,
         forecast,
         config["model"].get("target_type", "residual"),
+        test_loader.dataset.residual_standardizer,
     )
     scales, _ = load_denormalization_scales(data_path, max_values)
     return ScenarioArrays(

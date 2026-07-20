@@ -26,6 +26,7 @@ from src.eval.experiment_logger import (
     save_metrics_json,
     timestamp_now,
 )
+from src.training.residual_standardization import inverse_standardize_residual
 
 
 def apply_experiment_switches(config):
@@ -34,9 +35,13 @@ def apply_experiment_switches(config):
     target_cfg = config.get('target', {})
     condition_cfg = config.get('condition', {})
     guidance_cfg = config.get('guidance', {})
+    sampling_cfg = config.get('sampling', {})
 
     if 'type' in target_cfg:
         model_cfg['target_type'] = target_cfg['type']
+    model_cfg['residual_standardization_enabled'] = bool(
+        target_cfg.get('residual_standardization', {}).get('enabled', False)
+    )
     if 'mode' in condition_cfg:
         model_cfg['condition_mode'] = condition_cfg['mode']
     if 'use_forecast' in condition_cfg:
@@ -58,6 +63,8 @@ def apply_experiment_switches(config):
         model_cfg['guidance_scale'] = max(model_cfg['guidance_scales'])
     if 'input_channels' in model_cfg:
         model_cfg['in_channels'] = model_cfg['input_channels']
+    if 'reverse_variance_type' in sampling_cfg:
+        model_cfg['reverse_variance_type'] = sampling_cfg['reverse_variance_type']
     return config
 
 
@@ -206,11 +213,32 @@ def generate_scenarios(model, test_loader, device, n_samples=10, max_batches=Non
     )
 
 
-def model_output_to_actual(samples, forecast, target_type):
-    """Convert model output to final actual scenarios."""
+def model_output_to_residual(samples, target_type, residual_standardizer=None):
+    """Convert model-space output to normalized-power residual coordinates."""
+    if target_type != 'residual':
+        return samples
+    if residual_standardizer is None:
+        return samples
+    return inverse_standardize_residual(
+        samples,
+        residual_standardizer,
+        channel_axis=2,
+    ).astype(samples.dtype, copy=False)
+
+
+def model_output_to_actual(
+    samples,
+    forecast,
+    target_type,
+    residual_standardizer=None,
+):
+    """Convert model output to normalized-power actual scenarios."""
     if target_type == 'residual':
+        residual_samples = model_output_to_residual(
+            samples, target_type, residual_standardizer
+        )
         # residual = forecast - actual, therefore actual = forecast - residual.
-        return forecast[:, None, :, :] - samples
+        return forecast[:, None, :, :] - residual_samples
     return samples
 
 
@@ -287,13 +315,19 @@ def evaluate_and_save(
     config_path=None,
     checkpoint_path=None,
     target_type='residual',
+    residual_standardizer=None,
 ):
     """评估并保存结果（使用论文公式12-15）"""
     N, n_samples, C, L = samples.shape
-    actual_samples_norm = model_output_to_actual(samples, forecast, target_type)
+    residual_samples_norm = model_output_to_residual(
+        samples, target_type, residual_standardizer
+    )
+    actual_samples_norm = model_output_to_actual(
+        samples, forecast, target_type, residual_standardizer
+    )
     scales, scale_source = load_denormalization_scales(data_path, max_values)
 
-    samples_physical = denormalize_channels(samples, scales)
+    samples_physical = denormalize_channels(residual_samples_norm, scales)
     actual_samples = denormalize_channels(actual_samples_norm, scales)
     forecast_physical = denormalize_channels(forecast, scales)
     residual_physical = denormalize_channels(residual, scales)
@@ -320,7 +354,9 @@ def evaluate_and_save(
     np.save(os.path.join(save_path, 'actual_data.npy'), target)
 
     # Keep normalized-space arrays for reproducibility and diagnostics.
-    np.save(os.path.join(save_path, 'generated_samples_normalized.npy'), samples)
+    np.save(os.path.join(save_path, 'generated_samples_normalized.npy'), residual_samples_norm)
+    if residual_standardizer is not None:
+        np.save(os.path.join(save_path, 'generated_samples_standardized.npy'), samples)
     np.save(os.path.join(save_path, 'actual_scenarios_normalized.npy'), actual_samples_norm)
     np.save(os.path.join(save_path, 'forecast_data_normalized.npy'), forecast)
     np.save(os.path.join(save_path, 'residual_data_normalized.npy'), residual)
@@ -333,6 +369,8 @@ def evaluate_and_save(
             'source': scale_source,
             'output_unit': 'MW',
             'normalized_copies_suffix': '_normalized.npy',
+            'residual_standardization': residual_standardizer,
+            'generated_samples_normalized_semantics': 'forecast_minus_actual residual in normalized power coordinates',
         }, f, ensure_ascii=False, indent=2)
 
     scenario_path = save_scenarios_npz(actual_samples, forecast_physical, save_path)
@@ -367,6 +405,8 @@ def evaluate_and_save(
         'scenario_path': scenario_path,
         'figure_dir': figure_dir,
         'scenario_shape': str([int(N * n_samples), int(C), int(L)]),
+        'reverse_variance_type': config.get('model', {}).get('reverse_variance_type', 'beta'),
+        'residual_standardization_enabled': residual_standardizer is not None,
     })
     metrics_path = save_metrics_json(metrics, save_path)
     summary_row = build_summary_row(
@@ -399,6 +439,11 @@ def main():
     parser.add_argument('--list', action='store_true', help='列出所有可用实验')
     parser.add_argument('--guidance_scale', type=float, default=None, help='覆盖配置中的guidance_scale')
     parser.add_argument('--batch_size', type=int, default=None, help='generate/evaluate batch size; default=min(train batch, 8)')
+    parser.add_argument('--reverse_variance_type', choices=['beta', 'posterior'], default=None,
+                        help='Override reverse-process variance without retraining')
+    parser.add_argument('--output_dir', default=None,
+                        help='Write generated arrays separately instead of overwriting the checkpoint run')
+    parser.add_argument('--seed', type=int, default=2026, help='Generation random seed')
     args = parser.parse_args()
     
     # 列出所有实验
@@ -444,13 +489,25 @@ def main():
         with open(args.config, 'r') as f:
             config = yaml.safe_load(f)
     config = apply_experiment_switches(config)
+    if args.reverse_variance_type is not None:
+        config.setdefault('sampling', {})['reverse_variance_type'] = args.reverse_variance_type
+        config.setdefault('model', {})['reverse_variance_type'] = args.reverse_variance_type
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     
     # 数据加载
     build_kde = bool(config['model'].get('use_guidance', False))
     generate_batch_size = args.batch_size or min(int(config['train']['batch_size']), 16)
     print(f"生成batch size: {generate_batch_size}")
     test_loader, _, max_values = get_dataloader_multivariate(
-        args.data_path, generate_batch_size, 'test', config['model']['n_intervals'], build_kde=build_kde)
+        args.data_path, generate_batch_size, 'test', config['model']['n_intervals'],
+        build_kde=build_kde,
+        residual_standardization=config.get('target', {}).get(
+            'residual_standardization', {'enabled': False}
+        ))
     
     # 模型
     model = MultiChannelCSDI(config['model'], device).to(device)
@@ -467,6 +524,7 @@ def main():
             print(f"警告: 缺失关键参数 {real_missing}")
     
     print(f"模型epoch: {checkpoint.get('epoch', 'unknown')}")
+    print(f"Reverse variance type: {model.diffusion.reverse_variance_type}")
     
     # 覆盖guidance_scale（如果命令行指定）
     if args.guidance_scale is not None:
@@ -483,6 +541,12 @@ def main():
         args.n_samples,
         max_batches=args.max_batches,
     )
+
+    result_folder = args.output_dir or exp_folder
+    os.makedirs(result_folder, exist_ok=True)
+    generation_config_path = os.path.join(result_folder, 'generation_config_used.yaml')
+    with open(generation_config_path, 'w', encoding='utf-8') as f:
+        yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
     
     # 保存
     evaluate_and_save(
@@ -492,11 +556,12 @@ def main():
         actual,
         max_values,
         args.data_path,
-        exp_folder,
+        result_folder,
         config=config,
-        config_path=config_path if os.path.exists(config_path) else args.config,
+        config_path=generation_config_path,
         checkpoint_path=ckpt_path,
         target_type=config['model'].get('target_type', 'residual'),
+        residual_standardizer=test_loader.dataset.residual_standardizer,
     )
     
     print(f"\n完成!")

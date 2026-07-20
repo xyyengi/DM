@@ -40,9 +40,13 @@ def apply_experiment_switches(config):
     target_cfg = config.get('target', {})
     condition_cfg = config.get('condition', {})
     guidance_cfg = config.get('guidance', {})
+    sampling_cfg = config.get('sampling', {})
 
     if 'type' in target_cfg:
         model_cfg['target_type'] = target_cfg['type']
+    model_cfg['residual_standardization_enabled'] = bool(
+        target_cfg.get('residual_standardization', {}).get('enabled', False)
+    )
     if 'mode' in condition_cfg:
         model_cfg['condition_mode'] = condition_cfg['mode']
     if 'use_forecast' in condition_cfg:
@@ -64,6 +68,8 @@ def apply_experiment_switches(config):
         model_cfg['guidance_scale'] = max(model_cfg['guidance_scales'])
     if 'input_channels' in model_cfg:
         model_cfg['in_channels'] = model_cfg['input_channels']
+    if 'reverse_variance_type' in sampling_cfg:
+        model_cfg['reverse_variance_type'] = sampling_cfg['reverse_variance_type']
     return config
 
 
@@ -78,6 +84,14 @@ def print_experiment_summary(config):
     print(f"  use_forecast: {condition.get('use_forecast', config.get('model', {}).get('use_forecast'))}")
     print(f"  use_network_condition: {condition.get('use_network_condition', config.get('model', {}).get('use_network_condition'))}")
     print(f"  use_guidance: {condition.get('use_guidance', config.get('model', {}).get('use_guidance'))}")
+    print(
+        "  residual_standardization.enabled: "
+        f"{target.get('residual_standardization', {}).get('enabled', False)}"
+    )
+    print(
+        "  sampling.reverse_variance_type: "
+        f"{config.get('sampling', {}).get('reverse_variance_type', config.get('model', {}).get('reverse_variance_type', 'beta'))}"
+    )
     event_sampling = config.get('event_sampling', {})
     print(f"  event_sampling.enabled: {event_sampling.get('enabled', False)}")
     if event_sampling.get('enabled', False):
@@ -471,6 +485,9 @@ def visualize_sampling_progress(model, batch, device, exp_folder, record_steps=N
     if target_type == 'actual':
         expected_low, expected_high = 0.0, 1.0
         target_label = 'actual values'
+    elif bool(getattr(model, 'config', {}).get('residual_standardization_enabled', False)):
+        expected_low, expected_high = -6.0, 6.0
+        target_label = 'standardized residual values'
     else:
         expected_low, expected_high = -1.0, 1.0
         target_label = 'residual values'
@@ -558,10 +575,23 @@ def main():
     # 数据加载
     print("正在加载数据...")
     build_kde = bool(config['model'].get('use_guidance', False))
+    residual_standardization = config.get('target', {}).get(
+        'residual_standardization', {'enabled': False}
+    )
     train_loader, _, _ = get_dataloader_multivariate(
-        args.data_path, config['train']['batch_size'], 'train', config['model']['n_intervals'], build_kde=build_kde)
+        args.data_path, config['train']['batch_size'], 'train', config['model']['n_intervals'],
+        build_kde=build_kde, residual_standardization=residual_standardization)
+    if bool(residual_standardization.get('enabled', False)):
+        fitted_stats = train_loader.dataset.residual_standardizer
+        config.setdefault('target', {}).setdefault('residual_standardization', {})[
+            'fitted_stats'
+        ] = fitted_stats
+        residual_standardization = config['target']['residual_standardization']
+        print("Residual standardization fitted on train unique hours:")
+        print(json.dumps(fitted_stats, ensure_ascii=False, indent=2))
     val_loader, _, _ = get_dataloader_multivariate(
-        args.data_path, config['train']['batch_size'], 'val', config['model']['n_intervals'], build_kde=build_kde)
+        args.data_path, config['train']['batch_size'], 'val', config['model']['n_intervals'],
+        build_kde=build_kde, residual_standardization=residual_standardization)
     event_sampler_audit = None
     if config.get('event_sampling', {}).get('enabled', False):
         print("正在构建V4-s训练事件目录与分层Sampler...")
@@ -580,6 +610,14 @@ def main():
     config_used_path = os.path.join(exp_folder, 'config_used.yaml')
     with open(config_used_path, 'w', encoding='utf-8') as f:
         yaml.dump(config, f)
+    fitted_residual_stats = config.get('target', {}).get(
+        'residual_standardization', {}
+    ).get('fitted_stats')
+    if fitted_residual_stats is not None:
+        residual_stats_path = os.path.join(exp_folder, 'residual_standardization.json')
+        with open(residual_stats_path, 'w', encoding='utf-8') as f:
+            json.dump(fitted_residual_stats, f, ensure_ascii=False, indent=2)
+        print(f"Residual standardization record: {residual_stats_path}")
     if event_sampler_audit is not None:
         audit_path = os.path.join(exp_folder, 'logs', 'event_sampler_audit.json')
         with open(audit_path, 'w', encoding='utf-8') as f:

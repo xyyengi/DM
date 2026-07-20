@@ -23,6 +23,12 @@ import pickle
 import os
 import json
 
+from src.training.residual_standardization import (
+    fit_residual_standardizer,
+    standardize_residual,
+    validate_standardizer,
+)
+
 
 class MultiChannelKDE:
     """
@@ -335,19 +341,22 @@ class MultiChannelWindScenarioDataset(Dataset):
     
     def __init__(self, data_path='./input_4.27/',
                  mode='train', seq_length=168, n_intervals=10, n_channels=11,
-                 build_kde=True):
+                 build_kde=True, residual_standardization=None):
         self.data_path = data_path
         self.mode = mode
         self.seq_length = seq_length
         self.n_channels = n_channels
         self.n_intervals = n_intervals
         self.build_kde = build_kde
+        self.residual_standardization_config = residual_standardization or {'enabled': False}
+        self.residual_standardizer = None
         self._load_export_metadata()
         
         print(f"  [Dataset] mode={mode}, loading data...")
         self._load_data()
         print(f"  [Dataset] normalizing data...")
         self._normalize_data()
+        self._prepare_residual_target()
         
         self.kde = None
         if self.build_kde:
@@ -492,6 +501,33 @@ class MultiChannelWindScenarioDataset(Dataset):
         
         self.forecast_norm = self.forecast_data / self.max_values
         self.residual_norm = self.residual_data / self.max_values
+
+    def _prepare_residual_target(self):
+        """Standardize only the diffusion target using train unique-hour stats."""
+        settings = dict(self.residual_standardization_config or {})
+        if not bool(settings.get('enabled', False)):
+            self.residual_target_norm = self.residual_norm[:, :, :3]
+            return
+
+        fitted = settings.get('fitted_stats')
+        if fitted is None:
+            fitted = fit_residual_standardizer(
+                self.train_res,
+                residual_definition=self.residual_definition,
+                normalization_divisors=self.max_values[:3],
+                epsilon=float(settings.get('epsilon', 1e-6)),
+            )
+        self.residual_standardizer = validate_standardizer(fitted)
+        self.residual_target_norm = standardize_residual(
+            self.residual_norm[:, :, :3],
+            self.residual_standardizer,
+            channel_axis=2,
+        ).astype(np.float32, copy=False)
+        print(
+            "  [Dataset] standardized residual target from train unique hours: "
+            f"mean={self.residual_standardizer['mean']}, "
+            f"std={self.residual_standardizer['std']}"
+        )
     
     def _precompute_cond_matrix(self):
         """
@@ -563,6 +599,7 @@ class MultiChannelWindScenarioDataset(Dataset):
         # 获取完整11维数据，转置为 (11, 168)
         forecast = self.forecast_norm[index].transpose(1, 0)  # (168, 11) -> (11, 168)
         residual = self.residual_norm[index].transpose(1, 0)  # (168, 11) -> (11, 168)
+        residual_target_3ch = self.residual_target_norm[index].transpose(1, 0)
         
         # 提取各部分特征
         residual_3ch = residual[:3, :]  # (3, 168) Target Residuals
@@ -575,7 +612,7 @@ class MultiChannelWindScenarioDataset(Dataset):
         assert forecast_3ch.ndim == 2 and forecast_3ch.shape == (3, self.seq_length)
         
         # 构建14通道输入: [Target Residuals, Base Prediction, Time Encoding]
-        input_14ch = np.concatenate([residual_3ch, forecast_3ch, time_encoding], axis=0)  # (14, 168)
+        input_14ch = np.concatenate([residual_target_3ch, forecast_3ch, time_encoding], axis=0)  # (14, 168)
         
         # 使用预计算的条件矩阵（已移除504次KDE查询）
         cond_matrix = self.cond_matrix_all[index]  # (3, 168, 2)
@@ -583,7 +620,8 @@ class MultiChannelWindScenarioDataset(Dataset):
         return {
             'input_14ch': torch.FloatTensor(input_14ch),     # (14, 168) 14通道完整输入
             'actual_3ch': torch.FloatTensor(actual_3ch),     # (3, 168) 真实值
-            'residual_3ch': torch.FloatTensor(residual_3ch), # (3, 168) 扩散目标
+            'residual_target_3ch': torch.FloatTensor(residual_target_3ch), # model-space target
+            'residual_3ch': torch.FloatTensor(residual_3ch), # normalized-power residual for reconstruction/evaluation
             'forecast_3ch': torch.FloatTensor(forecast_3ch), # (3, 168) 预测趋势
             'time_encoding': torch.FloatTensor(time_encoding), # (8, 168) 时间编码
             'cond_matrix': torch.FloatTensor(cond_matrix),   # (3, 168, 2) 条件
@@ -594,7 +632,7 @@ class MultiChannelWindScenarioDataset(Dataset):
 def get_dataloader_multivariate(data_path='./wind_solar_load_168_FEDformer/',
                                 batch_size=16, mode='train', n_intervals=10,
                                 num_workers=None, pin_memory=None,
-                                build_kde=True):
+                                build_kde=True, residual_standardization=None):
     """
     获取多通道数据加载器
     
@@ -612,7 +650,8 @@ def get_dataloader_multivariate(data_path='./wind_solar_load_168_FEDformer/',
         pin_memory = torch.cuda.is_available()
     
     dataset = MultiChannelWindScenarioDataset(
-        data_path=data_path, mode=mode, n_intervals=n_intervals, build_kde=build_kde
+        data_path=data_path, mode=mode, n_intervals=n_intervals, build_kde=build_kde,
+        residual_standardization=residual_standardization,
     )
     loader = DataLoader(
         dataset, 

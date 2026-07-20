@@ -363,13 +363,18 @@ class GaussianDiffusionMultivariate(nn.Module):
     
     def __init__(self, model, num_steps=500, beta_start=0.0001, beta_end=0.04,
                  schedule='quad', guidance_scale=1.0, guidance_scales=None,
-                 target_type='residual'):
+                 target_type='residual', reverse_variance_type='beta'):
         super().__init__()
         
         self.model = model  # ResUNet
         self.num_steps = num_steps
         self.guidance_scale = guidance_scale
         self.target_type = target_type
+        if reverse_variance_type not in {'beta', 'posterior'}:
+            raise ValueError(
+                f"reverse_variance_type must be 'beta' or 'posterior', got {reverse_variance_type!r}"
+            )
+        self.reverse_variance_type = reverse_variance_type
         self._shape_debug_printed = False
         if guidance_scales is None:
             guidance_scales = [guidance_scale, guidance_scale, guidance_scale]
@@ -388,6 +393,16 @@ class GaussianDiffusionMultivariate(nn.Module):
         self.register_buffer('beta', beta)
         self.register_buffer('alpha', alpha)
         self.register_buffer('alpha_hat', alpha_hat)
+
+    def reverse_variance(self, t):
+        """Return fixed-large beta variance or the DDPM posterior variance."""
+        if self.reverse_variance_type == 'beta':
+            return self.beta[t]
+        if t <= 0:
+            return torch.zeros_like(self.beta[0])
+        alpha_hat_prev = self.alpha_hat[t - 1]
+        posterior = self.beta[t] * (1.0 - alpha_hat_prev) / (1.0 - self.alpha_hat[t])
+        return posterior.clamp(min=0.0)
         
     def add_noise(self, x0, t):
         """
@@ -580,7 +595,7 @@ class GaussianDiffusionMultivariate(nn.Module):
         
         # 添加噪声（除了最后一步）
         if t > 0:
-            sigma = self.beta[t].sqrt()
+            sigma = self.reverse_variance(t).sqrt()
             noise = torch.randn_like(x_t)
             # 移除错误限制: noise = torch.clamp(noise, min=-1.0, max=1.0)
             x_prev = mean + sigma * noise
@@ -588,6 +603,8 @@ class GaussianDiffusionMultivariate(nn.Module):
             x_prev = mean
         
         if debug and debug_info:
+            debug_info['reverse_variance_type'] = self.reverse_variance_type
+            debug_info['reverse_sigma'] = float(sigma.item()) if t > 0 else 0.0
             debug_info['x_prev_range'] = (x_prev.min().item(), x_prev.max().item())
             debug_info['has_nan'] = torch.isnan(x_prev).any().item()
             debug_info['has_inf'] = torch.isinf(x_prev).any().item()
@@ -750,7 +767,8 @@ class MultiChannelCSDI(nn.Module):
             schedule=config.get('schedule', 'quad'),
             guidance_scale=config.get('guidance_scale', 1.0),
             guidance_scales=config.get('guidance_scales', None),
-            target_type=self.target_type
+            target_type=self.target_type,
+            reverse_variance_type=config.get('reverse_variance_type', 'beta'),
         )
 
         if not self.use_guidance or self.condition_mode == 'none':
@@ -763,7 +781,8 @@ class MultiChannelCSDI(nn.Module):
             'beta_start': config.get('beta_start', 0.0001),
             'beta_end': config.get('beta_end', 0.02),
             'schedule': config.get('schedule', 'quad'),
-            'guidance_scale': config.get('guidance_scale', 1.0)
+            'guidance_scale': config.get('guidance_scale', 1.0),
+            'reverse_variance_type': config.get('reverse_variance_type', 'beta'),
         }
 
     def _infer_input_channels(self):
@@ -778,7 +797,7 @@ class MultiChannelCSDI(nn.Module):
         if self.target_type == 'actual':
             x0 = batch['actual_3ch'].to(self.device)
         elif self.target_type == 'residual':
-            x0 = batch['residual_3ch'].to(self.device)
+            x0 = batch.get('residual_target_3ch', batch['residual_3ch']).to(self.device)
         else:
             raise ValueError(f"Unsupported target_type: {self.target_type}")
 
