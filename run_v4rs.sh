@@ -11,6 +11,7 @@ BATCH=${BATCH:-64}
 NSAMPLES=${NSAMPLES:-50}
 GEN_BATCH=${GEN_BATCH:-4}
 SEED=${SEED:-2026}
+VARIANCE_TYPES=${VARIANCE_TYPES:-posterior}
 
 python train.py \
   --config "${CONFIG}" \
@@ -29,8 +30,12 @@ if [[ -z "${run_id}" ]]; then
   exit 1
 fi
 
-echo "Generating beta and posterior ensembles from ${run_id}"
-for variance_type in beta posterior; do
+echo "Generating variance type(s) [${VARIANCE_TYPES}] from ${run_id}"
+for variance_type in ${VARIANCE_TYPES}; do
+  if [[ "${variance_type}" != "beta" && "${variance_type}" != "posterior" ]]; then
+    echo "Unsupported reverse variance type: ${variance_type}" >&2
+    exit 1
+  fi
   result_dir="${OUTPUTS_DIR}/${run_id}_${variance_type}_n${NSAMPLES}_seed${SEED}"
   python generate.py \
     --save_path "${OUTPUTS_DIR}" \

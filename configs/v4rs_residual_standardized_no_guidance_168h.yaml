@@ -33,9 +33,9 @@ guidance:
   quantile_high: 0.90
 
 sampling:
-  # Training is unaffected by this switch. Generate both beta and posterior
-  # from the same checkpoint for a controlled comparison.
-  reverse_variance_type: "beta"
+  # The paired ablation favored the exact posterior variance. This setting
+  # affects generation only; training remains unchanged.
+  reverse_variance_type: "posterior"
 
 model:
   input_channels: 14

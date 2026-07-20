@@ -66,6 +66,11 @@ V4-RS只改变扩散残差目标：使用训练集唯一小时序列拟合风、
 bash run_v4rs.sh
 ```
 
+`run_v4rs.sh` now generates the `posterior` ensemble by default because the
+paired V4-s ablation improved CRPS, Energy Score, interval width, and ACF in
+all three channels. To explicitly regenerate both variants from a new V4-RS
+checkpoint, use `VARIANCE_TYPES="beta posterior" bash run_v4rs.sh`.
+
 默认参数：
 
 ```text
