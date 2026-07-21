@@ -179,16 +179,16 @@ def get_checkpoint_path(exp_folder, ckpt_type='best'):
     raise FileNotFoundError(f"无可用checkpoint: {ckpt_path}")
 
 
-def generate_scenarios(model, test_loader, device, n_samples=10, max_batches=None):
+def generate_scenarios(model, data_loader, device, n_samples=10, max_batches=None):
     """生成场景"""
     model.eval()
     all_samples, all_forecast, all_residual, all_actual = [], [], [], []
     
-    total_batches = len(test_loader)
+    total_batches = len(data_loader)
     print(f"生成场景 (n_samples={n_samples}, 总批次: {total_batches})...")
     
     with torch.no_grad():
-        for batch_idx, batch in enumerate(test_loader):
+        for batch_idx, batch in enumerate(data_loader):
             if max_batches is not None and batch_idx >= max_batches:
                 break
             total_msg = max_batches if max_batches is not None else total_batches
@@ -303,6 +303,15 @@ def add_basic_mae(metrics, actual_samples, actual):
     return metrics
 
 
+def resolve_result_folder(exp_folder, output_dir, data_split, n_samples, seed):
+    """Choose a safe result folder; validation never overwrites a training run."""
+    if output_dir:
+        return output_dir
+    if data_split == 'val':
+        return f"{exp_folder}_val_n{n_samples}_seed{seed}"
+    return exp_folder
+
+
 def evaluate_and_save(
     samples,
     forecast,
@@ -316,6 +325,7 @@ def evaluate_and_save(
     checkpoint_path=None,
     target_type='residual',
     residual_standardizer=None,
+    data_split='test',
 ):
     """评估并保存结果（使用论文公式12-15）"""
     N, n_samples, C, L = samples.shape
@@ -371,6 +381,7 @@ def evaluate_and_save(
             'normalized_copies_suffix': '_normalized.npy',
             'residual_standardization': residual_standardizer,
             'generated_samples_normalized_semantics': 'forecast_minus_actual residual in normalized power coordinates',
+            'data_split': data_split,
         }, f, ensure_ascii=False, indent=2)
 
     scenario_path = save_scenarios_npz(actual_samples, forecast_physical, save_path)
@@ -407,6 +418,7 @@ def evaluate_and_save(
         'scenario_shape': str([int(N * n_samples), int(C), int(L)]),
         'reverse_variance_type': config.get('model', {}).get('reverse_variance_type', 'beta'),
         'residual_standardization_enabled': residual_standardizer is not None,
+        'data_split': data_split,
     })
     metrics_path = save_metrics_json(metrics, save_path)
     summary_row = build_summary_row(
@@ -418,7 +430,7 @@ def evaluate_and_save(
         scenario_path=scenario_path,
         figure_dir=figure_dir,
         metrics=metrics,
-        notes='evaluated',
+        notes=f'evaluated split={data_split}',
     )
     summary_path = append_summary(os.path.dirname(os.path.abspath(save_path)), summary_row)
     
@@ -444,7 +456,10 @@ def main():
     parser.add_argument('--output_dir', default=None,
                         help='Write generated arrays separately instead of overwriting the checkpoint run')
     parser.add_argument('--seed', type=int, default=2026, help='Generation random seed')
+    parser.add_argument('--split', choices=['val', 'test'], default='test',
+                        help='Data split used for generation/evaluation; tune on val and reserve test for final evaluation')
     args = parser.parse_args()
+    print(f"Evaluation data split: {args.split}")
     
     # 列出所有实验
     if args.list:
@@ -502,8 +517,8 @@ def main():
     build_kde = bool(config['model'].get('use_guidance', False))
     generate_batch_size = args.batch_size or min(int(config['train']['batch_size']), 16)
     print(f"生成batch size: {generate_batch_size}")
-    test_loader, _, max_values = get_dataloader_multivariate(
-        args.data_path, generate_batch_size, 'test', config['model']['n_intervals'],
+    data_loader, _, max_values = get_dataloader_multivariate(
+        args.data_path, generate_batch_size, args.split, config['model']['n_intervals'],
         build_kde=build_kde,
         residual_standardization=config.get('target', {}).get(
             'residual_standardization', {'enabled': False}
@@ -536,14 +551,17 @@ def main():
     # 生成
     samples, forecast, residual, actual = generate_scenarios(
         model,
-        test_loader,
+        data_loader,
         device,
         args.n_samples,
         max_batches=args.max_batches,
     )
 
-    result_folder = args.output_dir or exp_folder
+    result_folder = resolve_result_folder(
+        exp_folder, args.output_dir, args.split, args.n_samples, args.seed
+    )
     os.makedirs(result_folder, exist_ok=True)
+    config.setdefault('evaluation', {})['evaluated_split'] = args.split
     generation_config_path = os.path.join(result_folder, 'generation_config_used.yaml')
     with open(generation_config_path, 'w', encoding='utf-8') as f:
         yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
@@ -561,7 +579,8 @@ def main():
         config_path=generation_config_path,
         checkpoint_path=ckpt_path,
         target_type=config['model'].get('target_type', 'residual'),
-        residual_standardizer=test_loader.dataset.residual_standardizer,
+        residual_standardizer=data_loader.dataset.residual_standardizer,
+        data_split=args.split,
     )
     
     print(f"\n完成!")

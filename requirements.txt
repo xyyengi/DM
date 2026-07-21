@@ -1,6 +1,7 @@
 torch
 pandas
 numpy
+scipy
 tqdm
 pyyaml
 matplotlib
