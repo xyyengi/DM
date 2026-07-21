@@ -17,6 +17,54 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+SUPPORTED_FORECAST_FEATURES = ('load_ramp_1h', 'net_load')
+
+
+def build_forecast_dynamic_features(forecast_3ch, feature_config):
+    """Build leakage-free forecast features in standardized train coordinates."""
+    if not bool(feature_config.get('enabled', False)):
+        return None
+
+    names = tuple(feature_config.get('names', ()))
+    unsupported = sorted(set(names) - set(SUPPORTED_FORECAST_FEATURES))
+    if unsupported:
+        raise ValueError(f"Unsupported forecast features: {unsupported}")
+    if len(names) != len(set(names)):
+        raise ValueError(f"Duplicate forecast feature names: {names}")
+    if not names:
+        raise ValueError("forecast_features.enabled=true requires at least one feature name")
+
+    assert forecast_3ch.ndim == 3 and forecast_3ch.shape[1] == 3, (
+        f"forecast_3ch must be [B, 3, L], got {tuple(forecast_3ch.shape)}"
+    )
+    wind = forecast_3ch[:, 0, :]
+    solar = forecast_3ch[:, 1, :]
+    load = forecast_3ch[:, 2, :]
+    raw = []
+    for name in names:
+        if name == 'load_ramp_1h':
+            feature = torch.zeros_like(load)
+            feature[:, 1:] = load[:, 1:] - load[:, :-1]
+        elif name == 'net_load':
+            scale = feature_config.get('net_load_scale', {})
+            wind_to_load = float(scale['wind_to_load'])
+            solar_to_load = float(scale['solar_to_load'])
+            feature = load - wind_to_load * wind - solar_to_load * solar
+        raw.append(feature)
+
+    features = torch.stack(raw, dim=1)
+    normalization = feature_config.get('normalization', {})
+    means = normalization.get('mean')
+    stds = normalization.get('std')
+    if means is None or stds is None or len(means) != len(names) or len(stds) != len(names):
+        raise ValueError("forecast feature normalization mean/std must match feature names")
+    mean = torch.as_tensor(means, dtype=features.dtype, device=features.device).view(1, -1, 1)
+    std = torch.as_tensor(stds, dtype=features.dtype, device=features.device).view(1, -1, 1)
+    if torch.any(std <= 0):
+        raise ValueError("forecast feature normalization std must be positive")
+    return (features - mean) / std
+
+
 # ============================================================================
 # 时间特征注入模块
 # ============================================================================
@@ -737,6 +785,11 @@ class MultiChannelCSDI(nn.Module):
         self.use_network_condition = config.get('use_network_condition', True)
         self.use_guidance = config.get('use_guidance', True)
         self.cond_mask = config.get('cond_mask', [1, 1, 1])
+        self.forecast_feature_config = config.get('forecast_features', {'enabled': False})
+        self.forecast_feature_names = tuple(
+            self.forecast_feature_config.get('names', ())
+            if self.forecast_feature_config.get('enabled', False) else ()
+        )
         
         # 输入输出通道定义。V0/V1: x_t only; V2: [x_t, forecast]; Vmix: [x_t, forecast, time_encoding].
         self.in_channels = config.get('in_channels', self._infer_input_channels())
@@ -786,10 +839,11 @@ class MultiChannelCSDI(nn.Module):
         }
 
     def _infer_input_channels(self):
+        n_forecast_features = len(self.forecast_feature_names)
         if self.use_network_condition and self.condition_mode == 'mix':
-            return 14
+            return 14 + n_forecast_features
         if self.use_network_condition:
-            return 6
+            return 6 + n_forecast_features
         return 3
 
     def _select_target(self, batch):
@@ -823,14 +877,24 @@ class MultiChannelCSDI(nn.Module):
         else:
             assert forecast_3ch is not None, "forecast_3ch is required when use_network_condition=True"
             forecast_3ch = self._masked_forecast(forecast_3ch)
+            dynamic_features = build_forecast_dynamic_features(
+                forecast_3ch, self.forecast_feature_config
+            )
             if self.condition_mode == 'mix':
                 assert time_encoding is not None, "time_encoding is required for condition_mode='mix'"
                 assert time_encoding.ndim == 3 and time_encoding.shape[1:] == (8, 168), (
                     f"time_encoding must be [B, 8, 168], got {tuple(time_encoding.shape)}"
                 )
-                model_input = torch.cat([x_t, forecast_3ch, time_encoding], dim=1)
+                parts = [x_t, forecast_3ch]
+                if dynamic_features is not None:
+                    parts.append(dynamic_features)
+                parts.append(time_encoding)
+                model_input = torch.cat(parts, dim=1)
             else:
-                model_input = torch.cat([x_t, forecast_3ch], dim=1)
+                parts = [x_t, forecast_3ch]
+                if dynamic_features is not None:
+                    parts.append(dynamic_features)
+                model_input = torch.cat(parts, dim=1)
 
         assert model_input.shape[1] == self.in_channels, (
             f"model input channels {model_input.shape[1]} != configured in_channels {self.in_channels}"

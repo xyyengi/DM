@@ -52,6 +52,8 @@ def apply_experiment_switches(config):
         model_cfg['use_guidance'] = condition_cfg['use_guidance']
     if 'cond_mask' in condition_cfg:
         model_cfg['cond_mask'] = condition_cfg['cond_mask']
+    if 'forecast_features' in condition_cfg:
+        model_cfg['forecast_features'] = condition_cfg['forecast_features']
     if 'enable' in guidance_cfg:
         model_cfg['use_guidance'] = guidance_cfg['enable']
     if {'wind_scale', 'pv_scale', 'load_scale'} <= set(guidance_cfg):
@@ -562,6 +564,7 @@ def main():
     )
     os.makedirs(result_folder, exist_ok=True)
     config.setdefault('evaluation', {})['evaluated_split'] = args.split
+    config['evaluation']['n_samples'] = args.n_samples
     generation_config_path = os.path.join(result_folder, 'generation_config_used.yaml')
     with open(generation_config_path, 'w', encoding='utf-8') as f:
         yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)

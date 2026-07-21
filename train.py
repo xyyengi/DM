@@ -57,6 +57,8 @@ def apply_experiment_switches(config):
         model_cfg['use_guidance'] = condition_cfg['use_guidance']
     if 'cond_mask' in condition_cfg:
         model_cfg['cond_mask'] = condition_cfg['cond_mask']
+    if 'forecast_features' in condition_cfg:
+        model_cfg['forecast_features'] = condition_cfg['forecast_features']
     if 'enable' in guidance_cfg:
         model_cfg['use_guidance'] = guidance_cfg['enable']
     if {'wind_scale', 'pv_scale', 'load_scale'} <= set(guidance_cfg):
@@ -88,6 +90,10 @@ def print_experiment_summary(config):
         "  residual_standardization.enabled: "
         f"{target.get('residual_standardization', {}).get('enabled', False)}"
     )
+    forecast_features = condition.get('forecast_features', {})
+    print(f"  forecast_features.enabled: {forecast_features.get('enabled', False)}")
+    if forecast_features.get('enabled', False):
+        print(f"  forecast_features.names: {forecast_features.get('names', [])}")
     print(
         "  sampling.reverse_variance_type: "
         f"{config.get('sampling', {}).get('reverse_variance_type', config.get('model', {}).get('reverse_variance_type', 'beta'))}"
