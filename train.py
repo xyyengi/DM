@@ -11,8 +11,10 @@
 import argparse
 import json
 import os
+import random
 import torch
 import yaml
+from contextlib import contextmanager
 from datetime import datetime
 
 from dataset_multivariate import get_dataloader_multivariate
@@ -32,6 +34,42 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
+
+def set_reproducible_seed(seed):
+    """Seed training and request deterministic CUDA kernels where available."""
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, 'cudnn'):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+@contextmanager
+def fixed_validation_rng(seed):
+    """Use identical validation t/noise every epoch without perturbing training RNG."""
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    cpu_state = torch.random.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    random.seed(int(seed))
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+    try:
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.random.set_rng_state(cpu_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
 
 
 def apply_experiment_switches(config):
@@ -228,6 +266,10 @@ def train(model, train_loader, val_loader, config, device, exp_folder, save_ever
     
     # 早停机制
     early_stopping = EarlyStopping(patience=patience, min_delta=1e-4)
+    validation_seed = int(config['train'].get('validation_seed', 314159))
+    top_k = max(1, int(config['train'].get('top_k_checkpoints', 3)))
+    top_checkpoints = []
+    top_manifest_path = os.path.join(exp_folder, 'checkpoints', 'top_checkpoints.json')
     
     print(f"开始训练: epochs={epochs}, patience={patience}")
     
@@ -237,7 +279,10 @@ def train(model, train_loader, val_loader, config, device, exp_folder, save_ever
 
     with open(log_file, 'w', encoding='utf-8') as f:
         f.write(f"训练开始: {datetime.now()}\nEpochs: {epochs}\nPatience: {patience}\n")
-        f.write(f"LR: {lr}\nLR Scheduler: {use_lr_scheduler}\n\n")
+        f.write(f"LR: {lr}\nLR Scheduler: {use_lr_scheduler}\n")
+        f.write(f"Training seed: {config['train'].get('seed')}\n")
+        f.write(f"Fixed validation seed: {validation_seed}\n")
+        f.write(f"Top-k checkpoints: {top_k}\n\n")
 
     # 计算并打印 alpha_hat[-1]（用于检查噪声强度）
     mcfg = config.get('model', {})
@@ -285,10 +330,11 @@ def train(model, train_loader, val_loader, config, device, exp_folder, save_ever
         # ========== 验证阶段 ==========
         model.eval()
         val_loss = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                loss = model(batch)
-                val_loss += loss.item()
+        with fixed_validation_rng(validation_seed):
+            with torch.no_grad():
+                for batch in val_loader:
+                    loss = model(batch)
+                    val_loss += loss.item()
         avg_val_loss = val_loss / len(val_loader)
         val_losses.append(avg_val_loss)
         
@@ -303,19 +349,52 @@ def train(model, train_loader, val_loader, config, device, exp_folder, save_ever
         
         with open(log_file, 'a', encoding='utf-8') as f:
             f.write(f"Epoch {epoch+1}: Train={avg_train_loss:.4f}, Val={avg_val_loss:.4f}, LR={current_lr:.6f}\n")
+        checkpoint_payload = {
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'train_loss': avg_train_loss,
+            'val_loss': avg_val_loss,
+            'training_seed': int(config['train'].get('seed', 2026)),
+            'validation_seed': validation_seed,
+            'config': config,
+        }
+        qualifies_for_top_k = (
+            len(top_checkpoints) < top_k
+            or avg_val_loss < max(item['val_loss'] for item in top_checkpoints)
+        )
+        if qualifies_for_top_k:
+            epoch_path = os.path.join(
+                exp_folder, 'checkpoints', f'model_epoch_{epoch + 1}.pt'
+            )
+            torch.save(checkpoint_payload, epoch_path)
+            top_checkpoints.append({
+                'epoch': epoch + 1,
+                'val_loss': float(avg_val_loss),
+                'train_loss': float(avg_train_loss),
+                'checkpoint_path': epoch_path,
+            })
+            top_checkpoints = sorted(
+                top_checkpoints, key=lambda item: (item['val_loss'], item['epoch'])
+            )[:top_k]
+            manifest = {
+                'selection_metric': 'fixed_noise_validation_epsilon_mse',
+                'training_seed': int(config['train'].get('seed', 2026)),
+                'validation_seed': validation_seed,
+                'top_k': top_k,
+                'checkpoints': [
+                    dict(rank=rank, **item)
+                    for rank, item in enumerate(top_checkpoints, start=1)
+                ],
+            }
+            with open(top_manifest_path, 'w', encoding='utf-8') as handle:
+                json.dump(manifest, handle, ensure_ascii=False, indent=2)
         
         # ========== 早停检查 ==========
         # 先检查是否是最佳模型（val_loss 有改善）
         is_best = avg_val_loss < early_stopping.best_loss - early_stopping.min_delta
         if is_best:
             # 保存最佳模型
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'train_loss': avg_train_loss,
-                'val_loss': avg_val_loss,
-                'config': config
-            }, os.path.join(exp_folder, 'checkpoints', 'model_best.pt'))
+            torch.save(checkpoint_payload, os.path.join(exp_folder, 'checkpoints', 'model_best.pt'))
             if (epoch + 1) % 10 == 0 or epoch == 0:
                 print(f"  → 最佳模型已保存 (Val Loss: {avg_val_loss:.4f})")
         
@@ -520,12 +599,13 @@ def main():
     parser.add_argument('--config', default='config/wind_scenario.yaml')
     parser.add_argument('--data_path', default='./input_4.27/')
     parser.add_argument('--save_path', default='./outputs/')
-    parser.add_argument('--exp_name', default='wind_scenario')
+    parser.add_argument('--exp_name', default=None)
     
     # 训练参数（可命令行覆盖）
     parser.add_argument('--epochs', type=int, default=None, help='训练轮数')
     parser.add_argument('--lr', type=float, default=None, help='学习率')
     parser.add_argument('--batch_size', type=int, default=None, help='批大小')
+    parser.add_argument('--seed', type=int, default=None, help='训练随机种子')
     parser.add_argument('--patience', type=int, default=5, help='早停耐心值')
     parser.add_argument('--save_every', type=int, default=50, help='每N轮保存模型')
     parser.add_argument('--use_lr_scheduler', action='store_true', help='启用学习率调度器')
@@ -548,12 +628,15 @@ def main():
     with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     config = apply_experiment_switches(config)
+    if args.exp_name:
+        config.setdefault('experiment', {})['name'] = args.exp_name
     print_experiment_summary(config)
     
     # 命令行参数覆盖 - 训练参数
     if args.epochs: config['train']['epochs'] = args.epochs
     if args.lr: config['train']['lr'] = args.lr
     if args.batch_size: config['train']['batch_size'] = args.batch_size
+    if args.seed is not None: config['train']['seed'] = args.seed
     if args.event_fraction is not None:
         config.setdefault('event_sampling', {})['event_fraction'] = args.event_fraction
     if args.max_draws_per_event is not None:
@@ -575,6 +658,11 @@ def main():
     print(f"当前 beta_end: {config['model'].get('beta_end')}")
     print(f"当前 schedule: {config['model'].get('schedule')}")
     
+    training_seed = int(config['train'].get('seed', 2026))
+    set_reproducible_seed(training_seed)
+    print(f"训练随机种子: {training_seed}")
+    print(f"固定validation随机种子: {config['train'].get('validation_seed', 314159)}")
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"设备: {device}")
     
@@ -586,7 +674,8 @@ def main():
     )
     train_loader, _, _ = get_dataloader_multivariate(
         args.data_path, config['train']['batch_size'], 'train', config['model']['n_intervals'],
-        build_kde=build_kde, residual_standardization=residual_standardization)
+        build_kde=build_kde, residual_standardization=residual_standardization,
+        seed=training_seed)
     if bool(residual_standardization.get('enabled', False)):
         fitted_stats = train_loader.dataset.residual_standardizer
         config.setdefault('target', {}).setdefault('residual_standardization', {})[
@@ -597,7 +686,8 @@ def main():
         print(json.dumps(fitted_stats, ensure_ascii=False, indent=2))
     val_loader, _, _ = get_dataloader_multivariate(
         args.data_path, config['train']['batch_size'], 'val', config['model']['n_intervals'],
-        build_kde=build_kde, residual_standardization=residual_standardization)
+        build_kde=build_kde, residual_standardization=residual_standardization,
+        seed=config['train'].get('validation_seed', 314159))
     event_sampler_audit = None
     if config.get('event_sampling', {}).get('enabled', False):
         print("正在构建V4-s训练事件目录与分层Sampler...")

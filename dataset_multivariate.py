@@ -22,12 +22,21 @@ from scipy import stats
 import pickle
 import os
 import json
+import random
 
 from src.training.residual_standardization import (
     fit_residual_standardizer,
     standardize_residual,
     validate_standardizer,
 )
+
+
+def _seed_dataloader_worker(worker_id):
+    """Seed NumPy/Python from the deterministic PyTorch worker seed."""
+    del worker_id
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 class MultiChannelKDE:
@@ -632,7 +641,8 @@ class MultiChannelWindScenarioDataset(Dataset):
 def get_dataloader_multivariate(data_path='./wind_solar_load_168_FEDformer/',
                                 batch_size=16, mode='train', n_intervals=10,
                                 num_workers=None, pin_memory=None,
-                                build_kde=True, residual_standardization=None):
+                                build_kde=True, residual_standardization=None,
+                                seed=None):
     """
     获取多通道数据加载器
     
@@ -653,11 +663,19 @@ def get_dataloader_multivariate(data_path='./wind_solar_load_168_FEDformer/',
         data_path=data_path, mode=mode, n_intervals=n_intervals, build_kde=build_kde,
         residual_standardization=residual_standardization,
     )
+    generator = None
+    if seed is not None:
+        split_offset = {'train': 0, 'val': 10_000, 'test': 20_000}.get(mode, 30_000)
+        generator = torch.Generator()
+        generator.manual_seed(int(seed) + split_offset)
+
     loader = DataLoader(
         dataset, 
         batch_size=batch_size, 
         shuffle=(mode=='train'),
         num_workers=num_workers,
-        pin_memory=pin_memory
+        pin_memory=pin_memory,
+        generator=generator,
+        worker_init_fn=_seed_dataloader_worker if seed is not None else None,
     )
     return loader, dataset.kde, dataset.max_values
