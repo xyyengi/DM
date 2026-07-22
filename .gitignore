@@ -31,3 +31,5 @@ debug_*.py
 # 日志和输出
 *.log
 *.txt
+logs/**/*.pid
+logs/**/*.status

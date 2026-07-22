@@ -1,5 +1,6 @@
 experiment:
-  name: "v4rs_reproducible_no_guidance_168h"
+  name: "v5_t_stage1_168h"
+  family: "v5_stage1"
 
 data:
   variables: ["wind", "pv", "load"]
@@ -16,9 +17,9 @@ target:
     epsilon: 1.0e-6
 
 condition:
-  mode: "mix"
-  use_forecast: true
-  use_network_condition: true
+  mode: "timestep_only"
+  use_forecast: true       # retained for residual-to-actual reconstruction only
+  use_network_condition: false
   use_guidance: false
   cond_mask: [1, 1, 1]
 
@@ -36,13 +37,18 @@ sampling:
   reverse_variance_type: "posterior"
 
 model:
-  architecture: "v4_legacy"
-  input_channels: 14
-  in_channels: 14
+  architecture: "v5_t"
+  input_channels: 3
+  in_channels: 3
   out_channels: 3
-  d_time: 64
+  sequence_length: 168
   base_channels: 64
-  num_layers: 4  # legacy compatibility field; V4 topology is fixed in code
+  num_layers: 3
+  channel_multipliers: [1, 2, 4]
+  group_norm_groups: 8
+  dropout: 0.10
+  timestep_embedding_dim: 128
+  use_sequence_condition: false
   n_intervals: 10
   num_steps: 500
   beta_start: 0.0001
@@ -55,6 +61,7 @@ train:
   epochs: 150
   weight_decay: 1.0e-3
   patience: 15
+  save_every: 50
   seed: 2026
   validation_seed: 314159
   top_k_checkpoints: 3

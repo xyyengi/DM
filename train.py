@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime
 
 from dataset_multivariate import get_dataloader_multivariate
-from diff_models_multivariate import MultiChannelCSDI
+from src.models import build_model
 from src.training.event_aware_sampler import make_event_aware_loader
 from src.eval.experiment_logger import (
     append_summary,
@@ -119,6 +119,7 @@ def print_experiment_summary(config):
     experiment = config.get('experiment', {})
     print("\nExperiment summary:")
     print(f"  experiment.name: {experiment.get('name', 'unknown')}")
+    print(f"  model.architecture: {config.get('model', {}).get('architecture', 'v4_legacy')}")
     print(f"  target.type: {target.get('type', config.get('model', {}).get('target_type'))}")
     print(f"  condition.mode: {condition.get('mode', config.get('model', {}).get('condition_mode'))}")
     print(f"  use_forecast: {condition.get('use_forecast', config.get('model', {}).get('use_forecast'))}")
@@ -593,11 +594,40 @@ def visualize_sampling_progress(model, batch, device, exp_folder, record_steps=N
             f.write(msg + '\n')
 
 
+def visualize_v5_final_sample(model, batch, exp_folder, n_samples=1):
+    """Small post-training V5 diagnostic without reimplementing its sampler."""
+    model.eval()
+    with torch.no_grad():
+        samples = model.generate(batch, n_samples=max(1, int(n_samples)))
+    final = samples[0, 0].detach().cpu().numpy()
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+    for channel, axis in enumerate(np.atleast_1d(axes)):
+        axis.plot(np.arange(final.shape[1]), final[channel], lw=1)
+        axis.set_ylabel(f'Channel {channel}')
+        axis.grid(True)
+    axes[-1].set_xlabel('Relative hour')
+    plt.tight_layout()
+    out_path = os.path.join(exp_folder, 'logs', 'sampling_progress.png')
+    fig.savefig(out_path)
+    plt.close(fig)
+    stats = {
+        'architecture': getattr(model, 'architecture', 'unknown'),
+        'model_space_min': float(final.min()),
+        'model_space_max': float(final.max()),
+        'model_space_mean': float(final.mean()),
+        'diffusion_steps': int(model.diffusion.num_steps),
+    }
+    with open(os.path.join(exp_folder, 'logs', 'sampling_stats.txt'), 'w', encoding='utf-8') as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+    print('V5 sampling stats:', stats)
+
+
 def main():
     parser = argparse.ArgumentParser(description='多变量协同条件扩散模型 - 训练')
     # 基础参数
     parser.add_argument('--config', default='config/wind_scenario.yaml')
-    parser.add_argument('--data_path', default='./input_4.27/')
+    parser.add_argument('--data_path', default=None,
+                        help='Data directory; defaults to data.data_path in YAML')
     parser.add_argument('--save_path', default='./outputs/')
     parser.add_argument('--exp_name', default=None)
     
@@ -606,8 +636,8 @@ def main():
     parser.add_argument('--lr', type=float, default=None, help='学习率')
     parser.add_argument('--batch_size', type=int, default=None, help='批大小')
     parser.add_argument('--seed', type=int, default=None, help='训练随机种子')
-    parser.add_argument('--patience', type=int, default=5, help='早停耐心值')
-    parser.add_argument('--save_every', type=int, default=50, help='每N轮保存模型')
+    parser.add_argument('--patience', type=int, default=None, help='早停耐心值')
+    parser.add_argument('--save_every', type=int, default=None, help='每N轮保存模型')
     parser.add_argument('--use_lr_scheduler', action='store_true', help='启用学习率调度器')
     parser.add_argument('--event_fraction', type=float, default=None, help='V4-s定向事件抽样比例')
     parser.add_argument('--max_draws_per_event', type=int, default=None, help='每个event_id每epoch最多定向抽取次数')
@@ -615,7 +645,7 @@ def main():
     # 模型参数（可命令行覆盖）- 核心扩散参数
     parser.add_argument('--beta_start', type=float, default=None, help='扩散beta起始值 (默认0.0001)')
     parser.add_argument('--beta_end', type=float, default=None, help='扩散beta结束值 (默认0.02, 建议<0.1)')
-    parser.add_argument('--schedule', type=str, default=None, choices=['linear', 'quad', 'cosine'], help='beta调度方式')
+    parser.add_argument('--schedule', type=str, default=None, choices=['linear', 'quad'], help='beta调度方式')
     parser.add_argument('--num_steps', type=int, default=None, help='扩散步数 (默认500)')
     parser.add_argument('--base_channels', type=int, default=None, help='UNet基础通道数 (默认128)')
     parser.add_argument('--num_layers', type=int, default=None, help='UNet层数 (默认4)')
@@ -653,6 +683,21 @@ def main():
         config['model']['guidance_scale'] = args.guidance_scale
         config['model']['guidance_scales'] = [args.guidance_scale] * 3
     if args.n_intervals: config['model']['n_intervals'] = args.n_intervals
+
+    data_path = args.data_path or config.get('data', {}).get(
+        'data_path', './input_4.27/'
+    )
+    patience = (
+        args.patience if args.patience is not None
+        else int(config.get('train', {}).get('patience', 5))
+    )
+    save_every = (
+        args.save_every if args.save_every is not None
+        else int(config.get('train', {}).get('save_every', 50))
+    )
+    config.setdefault('data', {})['data_path'] = data_path
+    config.setdefault('train', {})['patience'] = patience
+    config['train']['save_every'] = save_every
     
     print(f"配置文件: {args.config}")
     print(f"当前 beta_end: {config['model'].get('beta_end')}")
@@ -673,7 +718,7 @@ def main():
         'residual_standardization', {'enabled': False}
     )
     train_loader, _, _ = get_dataloader_multivariate(
-        args.data_path, config['train']['batch_size'], 'train', config['model']['n_intervals'],
+        data_path, config['train']['batch_size'], 'train', config['model']['n_intervals'],
         build_kde=build_kde, residual_standardization=residual_standardization,
         seed=training_seed)
     if bool(residual_standardization.get('enabled', False)):
@@ -685,20 +730,20 @@ def main():
         print("Residual standardization fitted on train unique hours:")
         print(json.dumps(fitted_stats, ensure_ascii=False, indent=2))
     val_loader, _, _ = get_dataloader_multivariate(
-        args.data_path, config['train']['batch_size'], 'val', config['model']['n_intervals'],
+        data_path, config['train']['batch_size'], 'val', config['model']['n_intervals'],
         build_kde=build_kde, residual_standardization=residual_standardization,
         seed=config['train'].get('validation_seed', 314159))
     event_sampler_audit = None
     if config.get('event_sampling', {}).get('enabled', False):
         print("正在构建V4-s训练事件目录与分层Sampler...")
         train_loader, _, event_sampler_audit = make_event_aware_loader(
-            train_loader, args.data_path, config
+            train_loader, data_path, config
         )
         print("V4-s EventAwareBatchSampler已启用:")
         print(json.dumps(event_sampler_audit['sampler'], ensure_ascii=False, indent=2))
     
     # 模型
-    model = MultiChannelCSDI(config['model'], device).to(device)
+    model = build_model(config['model'], device).to(device)
     
     # 训练
     exp_folder, run_id, run_timestamp = create_experiment_folder(args.save_path, config, args.exp_name)
@@ -720,8 +765,10 @@ def main():
             json.dump(event_sampler_audit, f, ensure_ascii=False, indent=2)
         print(f"事件Sampler审计记录: {audit_path}")
     
-    best_epoch = train(model, train_loader, val_loader, config, device, exp_folder, 
-                       args.save_every, args.patience, args.use_lr_scheduler)
+    best_epoch = train(
+        model, train_loader, val_loader, config, device, exp_folder,
+        save_every, patience, args.use_lr_scheduler,
+    )
     
     print(f"\n训练完成! 最佳epoch: {best_epoch}")
     checkpoint_path = os.path.join(exp_folder, 'checkpoints', 'model_best.pt')
@@ -757,7 +804,13 @@ def main():
         sample_batch = next(val_iter)
         record_steps = [model.diffusion.num_steps - 1, model.diffusion.num_steps // 2,
                         max(0, model.diffusion.num_steps // 5), max(0, model.diffusion.num_steps // 10), 0]
-        visualize_sampling_progress(model, sample_batch, device, exp_folder, record_steps=record_steps, n_samples=1)
+        if getattr(model, 'architecture', 'v4_legacy') in {'v5_t', 'v5_tf'}:
+            visualize_v5_final_sample(model, sample_batch, exp_folder, n_samples=1)
+        else:
+            visualize_sampling_progress(
+                model, sample_batch, device, exp_folder,
+                record_steps=record_steps, n_samples=1,
+            )
         print(f"采样进程图已保存到: {os.path.join(exp_folder, 'logs', 'sampling_progress.png')}")
     except Exception as e:
         print('采样可视化失败:', e)

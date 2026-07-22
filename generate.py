@@ -18,7 +18,7 @@ import yaml
 from datetime import datetime
 
 from dataset_multivariate import get_dataloader_multivariate
-from diff_models_multivariate import MultiChannelCSDI
+from src.models import build_model, load_model_checkpoint, resolve_architecture
 from evaluation import evaluate_multichannel, print_metrics
 from src.eval.experiment_logger import (
     append_summary,
@@ -181,7 +181,43 @@ def get_checkpoint_path(exp_folder, ckpt_type='best'):
     raise FileNotFoundError(f"无可用checkpoint: {ckpt_path}")
 
 
-def generate_scenarios(model, data_loader, device, n_samples=10, max_batches=None):
+CONDITION_ABLATIONS = {"none", "forecast", "calendar", "forecast_calendar"}
+
+
+def apply_condition_ablation(batch, mode="none"):
+    """Return a shallow batch copy with selected V5-TF network conditions zeroed."""
+    if mode not in CONDITION_ABLATIONS:
+        raise ValueError(
+            f"Unsupported condition ablation={mode!r}; "
+            f"expected one of {sorted(CONDITION_ABLATIONS)}"
+        )
+    if mode == "none":
+        return batch
+
+    ablated = dict(batch)
+    if mode in {"forecast", "forecast_calendar"}:
+        if "forecast_3ch" not in batch:
+            raise KeyError("forecast_3ch is required for forecast ablation")
+        ablated["forecast_3ch"] = torch.zeros_like(batch["forecast_3ch"])
+    if mode in {"calendar", "forecast_calendar"}:
+        calendar_keys = [
+            key for key in ("calendar_8ch", "time_encoding") if key in batch
+        ]
+        if not calendar_keys:
+            raise KeyError("calendar_8ch or time_encoding is required for calendar ablation")
+        for key in calendar_keys:
+            ablated[key] = torch.zeros_like(batch[key])
+    return ablated
+
+
+def generate_scenarios(
+    model,
+    data_loader,
+    device,
+    n_samples=10,
+    max_batches=None,
+    condition_ablation="none",
+):
     """生成场景"""
     model.eval()
     all_samples, all_forecast, all_residual, all_actual = [], [], [], []
@@ -195,7 +231,8 @@ def generate_scenarios(model, data_loader, device, n_samples=10, max_batches=Non
                 break
             total_msg = max_batches if max_batches is not None else total_batches
             print(f"  generating batch {batch_idx + 1}/{total_msg} ...", flush=True)
-            samples = model.generate(batch, n_samples=n_samples)
+            model_batch = apply_condition_ablation(batch, condition_ablation)
+            samples = model.generate(model_batch, n_samples=n_samples)
             all_samples.append(samples.cpu().numpy())
             all_forecast.append(batch['forecast_3ch'].numpy())
             all_residual.append(batch['residual_3ch'].numpy())
@@ -352,7 +389,10 @@ def evaluate_and_save(
     )
     
     # 使用evaluation模块计算完整指标
-    metrics = evaluate_multichannel(actual_samples, target)
+    quantiles = config.get('evaluation', {}).get(
+        'quantiles', [1.0, 0.95, 0.9, 0.8]
+    )
+    metrics = evaluate_multichannel(actual_samples, target, quantiles=quantiles)
     metrics = add_basic_mae(metrics, actual_samples, target)
     print_metrics(metrics)
     
@@ -421,6 +461,9 @@ def evaluate_and_save(
         'reverse_variance_type': config.get('model', {}).get('reverse_variance_type', 'beta'),
         'residual_standardization_enabled': residual_standardizer is not None,
         'data_split': data_split,
+        'condition_ablation': config.get('evaluation', {}).get(
+            'condition_ablation', 'none'
+        ),
     })
     metrics_path = save_metrics_json(metrics, save_path)
     summary_row = build_summary_row(
@@ -444,11 +487,13 @@ def evaluate_and_save(
 def main():
     parser = argparse.ArgumentParser(description='多变量协同条件扩散模型 - 预测')
     parser.add_argument('--config', default='config/wind_scenario.yaml')
-    parser.add_argument('--data_path', default='./input_4.27/')
+    parser.add_argument('--data_path', default=None,
+                        help='Data directory; defaults to data.data_path in YAML')
     parser.add_argument('--save_path', default='./outputs/')
     parser.add_argument('--exp_name', default='wind_scenario', help='实验名称或文件夹名')
     parser.add_argument('--ckpt_epoch', type=int, default=None, help='指定epoch，默认使用最佳模型')
-    parser.add_argument('--n_samples', type=int, default=10, help='生成样本数')
+    parser.add_argument('--n_samples', type=int, default=None,
+                        help='生成样本数; defaults to evaluation.n_samples in YAML')
     parser.add_argument('--max_batches', type=int, default=None, help='最多生成多少个测试批次，用于CPU smoke test')
     parser.add_argument('--list', action='store_true', help='列出所有可用实验')
     parser.add_argument('--guidance_scale', type=float, default=None, help='覆盖配置中的guidance_scale')
@@ -457,9 +502,16 @@ def main():
                         help='Override reverse-process variance without retraining')
     parser.add_argument('--output_dir', default=None,
                         help='Write generated arrays separately instead of overwriting the checkpoint run')
-    parser.add_argument('--seed', type=int, default=2026, help='Generation random seed')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Generation seed; defaults to evaluation.generation_seed in YAML')
     parser.add_argument('--split', choices=['val', 'test'], default='test',
                         help='Data split used for generation/evaluation; tune on val and reserve test for final evaluation')
+    parser.add_argument(
+        '--condition_ablation',
+        choices=sorted(CONDITION_ABLATIONS),
+        default='none',
+        help='V5-TF inference-only ablation; original forecast is retained for reconstruction',
+    )
     args = parser.parse_args()
     print(f"Evaluation data split: {args.split}")
     
@@ -510,6 +562,19 @@ def main():
         config.setdefault('sampling', {})['reverse_variance_type'] = args.reverse_variance_type
         config.setdefault('model', {})['reverse_variance_type'] = args.reverse_variance_type
 
+    data_path = args.data_path or config.get('data', {}).get(
+        'data_path', './input_4.27/'
+    )
+    args.n_samples = (
+        args.n_samples if args.n_samples is not None
+        else int(config.get('evaluation', {}).get('n_samples', 10))
+    )
+    args.seed = (
+        args.seed if args.seed is not None
+        else int(config.get('evaluation', {}).get('generation_seed', 2026))
+    )
+    config.setdefault('data', {})['data_path'] = data_path
+
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -520,18 +585,21 @@ def main():
     generate_batch_size = args.batch_size or min(int(config['train']['batch_size']), 16)
     print(f"生成batch size: {generate_batch_size}")
     data_loader, _, max_values = get_dataloader_multivariate(
-        args.data_path, generate_batch_size, args.split, config['model']['n_intervals'],
+        data_path, generate_batch_size, args.split, config['model']['n_intervals'],
         build_kde=build_kde,
         residual_standardization=config.get('target', {}).get(
             'residual_standardization', {'enabled': False}
         ))
     
     # 模型
-    model = MultiChannelCSDI(config['model'], device).to(device)
+    architecture = resolve_architecture(config['model'])
+    if args.condition_ablation != 'none' and architecture != 'v5_tf':
+        raise ValueError("condition ablation is supported only for architecture='v5_tf'")
+    model = build_model(config['model'], device).to(device)
     checkpoint = torch.load(ckpt_path, map_location=device)
-    
-    # 使用strict=False，因为beta/alpha/alpha_hat是buffer，已在模型初始化时创建
-    missing_keys, unexpected_keys = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    missing_keys, unexpected_keys = load_model_checkpoint(
+        model, checkpoint, architecture=architecture
+    )
     
     if missing_keys:
         # 过滤掉buffer相关的missing keys（这些是正常的）
@@ -539,12 +607,16 @@ def main():
         real_missing = [k for k in missing_keys if k not in buffer_keys]
         if real_missing:
             print(f"警告: 缺失关键参数 {real_missing}")
+    if unexpected_keys:
+        print(f"警告: checkpoint包含未使用参数 {unexpected_keys}")
     
     print(f"模型epoch: {checkpoint.get('epoch', 'unknown')}")
     print(f"Reverse variance type: {model.diffusion.reverse_variance_type}")
     
     # 覆盖guidance_scale（如果命令行指定）
     if args.guidance_scale is not None:
+        if architecture != 'v4_legacy':
+            raise ValueError("V5 stage-1 architectures do not support legacy KDE guidance")
         original_gs = model.diffusion.guidance_scale
         model.diffusion.guidance_scale = args.guidance_scale
         model.diffusion.guidance_scales.fill_(args.guidance_scale)
@@ -557,6 +629,7 @@ def main():
         device,
         args.n_samples,
         max_batches=args.max_batches,
+        condition_ablation=args.condition_ablation,
     )
 
     result_folder = resolve_result_folder(
@@ -565,6 +638,8 @@ def main():
     os.makedirs(result_folder, exist_ok=True)
     config.setdefault('evaluation', {})['evaluated_split'] = args.split
     config['evaluation']['n_samples'] = args.n_samples
+    config['evaluation']['generation_seed'] = args.seed
+    config['evaluation']['condition_ablation'] = args.condition_ablation
     generation_config_path = os.path.join(result_folder, 'generation_config_used.yaml')
     with open(generation_config_path, 'w', encoding='utf-8') as f:
         yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
@@ -576,7 +651,7 @@ def main():
         residual,
         actual,
         max_values,
-        args.data_path,
+        data_path,
         result_folder,
         config=config,
         config_path=generation_config_path,

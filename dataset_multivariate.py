@@ -601,9 +601,10 @@ class MultiChannelWindScenarioDataset(Dataset):
             actual_3ch: (3, 168) 风、光、负荷真实值（默认扩散目标）
             residual_3ch: (3, 168) 仅风、光、负荷残差（可选扩散目标）
             forecast_3ch: (3, 168) 预测趋势（用于条件）
-            time_encoding: (8, 168) 时间编码
+            time_encoding/calendar_8ch: (8, 168) 真实日历sin/cos编码
             cond_matrix: (3, 168, 2) 条件矩阵 [c_down, c_up]（仅对前3维构建）
-            timepoints: (168,) 时间点索引
+            timepoints: (168,) V4兼容位置索引
+            relative_positions: (168,) V5窗口内相对位置，不代表真实日历
         """
         # 获取完整11维数据，转置为 (11, 168)
         forecast = self.forecast_norm[index].transpose(1, 0)  # (168, 11) -> (11, 168)
@@ -633,8 +634,10 @@ class MultiChannelWindScenarioDataset(Dataset):
             'residual_3ch': torch.FloatTensor(residual_3ch), # normalized-power residual for reconstruction/evaluation
             'forecast_3ch': torch.FloatTensor(forecast_3ch), # (3, 168) 预测趋势
             'time_encoding': torch.FloatTensor(time_encoding), # (8, 168) 时间编码
+            'calendar_8ch': torch.FloatTensor(time_encoding), # (8, 168) 真实calendar sin/cos
             'cond_matrix': torch.FloatTensor(cond_matrix),   # (3, 168, 2) 条件
             'timepoints': torch.FloatTensor(np.arange(self.seq_length)),
+            'relative_positions': torch.FloatTensor(np.arange(self.seq_length)),
         }
 
 
