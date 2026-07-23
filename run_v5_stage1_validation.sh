@@ -50,16 +50,20 @@ write_validation_metadata() {
 import json
 import sys
 from pathlib import Path
+import yaml
 
 (
     result_dir, run_dir, architecture, rank, epoch, val_loss, ablation,
     generation_seconds, checkpoint_path, commit,
 ) = sys.argv[1:]
+with (Path(run_dir) / "config_used.yaml").open("r", encoding="utf-8") as handle:
+    training_config = yaml.safe_load(handle)
 record = {
     "training_run_dir": str(Path(run_dir).resolve()),
     "training_run_name": Path(run_dir).name,
     "result_dir": str(Path(result_dir).resolve()),
     "architecture": architecture,
+    "training_seed": int(training_config["train"]["seed"]),
     "checkpoint_rank": int(rank),
     "checkpoint_epoch": int(epoch),
     "validation_epsilon_mse": float(val_loss),
@@ -148,22 +152,15 @@ for run_argument in "$@"; do
 import sys
 from pathlib import Path
 import yaml
+from src.eval.stage1_protocol import failed_checks, validation_protocol_checks
+
 with Path(sys.argv[1]).open("r", encoding="utf-8") as handle:
     config = yaml.safe_load(handle)
 architecture = config["model"].get("architecture", "v4_legacy")
 if architecture not in {"v4_legacy", "v5_t", "v5_tf"}:
     raise SystemExit(f"unsupported architecture: {architecture}")
-train = config["train"]
-evaluation = config.get("evaluation", {})
-checks = {
-    "training_seed": int(train["seed"]) == 2026,
-    "validation_seed": int(train["validation_seed"]) == 314159,
-    "top_k": int(train["top_k_checkpoints"]) == 3,
-    "ensemble": int(evaluation.get("n_samples", 20)) == 20,
-    "generation_seed": int(evaluation.get("generation_seed", 424242)) == 424242,
-    "posterior": config["sampling"]["reverse_variance_type"] == "posterior",
-}
-failed = [name for name, passed in checks.items() if not passed]
+checks = validation_protocol_checks(config)
+failed = failed_checks(checks)
 if failed:
     raise SystemExit(f"validation protocol mismatch: {failed}")
 print(architecture)

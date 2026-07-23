@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.models import build_model
+from src.eval.stage1_protocol import ALLOWED_STAGE1_TRAINING_SEEDS
 
 
 ARCHITECTURE_ORDER = {"v4_legacy": 0, "v5_t": 1, "v5_tf": 2}
@@ -149,6 +150,9 @@ def load_result(result_dir: Path, parameter_cache: dict[Path, int]) -> dict:
 
     row = {
         "architecture": metadata["architecture"],
+        "training_seed": int(metadata.get(
+            "training_seed", run_record.get("training_seed", -1)
+        )),
         "training_run": run_dir.name,
         "checkpoint_rank": int(metadata["checkpoint_rank"]),
         "checkpoint_epoch": int(metadata["checkpoint_epoch"]),
@@ -250,16 +254,23 @@ def validate_protocol(rows: list[dict]) -> None:
         }
         if mismatches:
             raise ValueError(f"protocol mismatch in {row['result_dir']}: {mismatches}")
+        if row["training_seed"] not in ALLOWED_STAGE1_TRAINING_SEEDS:
+            raise ValueError(
+                f"unsupported training seed in {row['result_dir']}: "
+                f"{row['training_seed']}"
+            )
 
 
 def add_baseline_deltas(rows: list[dict]) -> None:
-    baseline = next((
-        row for row in rows
+    baselines = {
+        row["training_seed"]: row
+        for row in rows
         if row["architecture"] == "v4_legacy"
         and row["checkpoint_rank"] == 1
         and row["condition_ablation"] == "none"
-    ), None)
+    }
     for row in rows:
+        baseline = baselines.get(row["training_seed"])
         for metric in ("total_crps", "multivariate_es", "total_acf_mae"):
             key = f"{metric}_delta_vs_v4_rank1_pct"
             row[key] = ""
@@ -295,9 +306,10 @@ def write_markdown(rows: list[dict], path: Path) -> None:
         "",
     ]
     lines.extend(markdown_table(
-        ["architecture", "rank", "epoch", "val MSE", "CRPS", "MV ES", "cov90 dev", "width90", "ACF", "ramp6h", "net-load MAE"],
+        ["architecture", "seed", "rank", "epoch", "val MSE", "CRPS", "MV ES", "cov90 dev", "width90", "ACF", "ramp6h", "net-load MAE"],
         [[
-            row["architecture"], row["checkpoint_rank"], row["checkpoint_epoch"],
+            row["architecture"], row["training_seed"], row["checkpoint_rank"],
+            row["checkpoint_epoch"],
             row["validation_epsilon_mse"], row["total_crps"], row["multivariate_es"],
             row["total_coverage_deviation_90_pct"], row["total_width_90_pct"],
             row["total_acf_mae"], row["net_load_ramp_6h_mae_mw"],
@@ -314,12 +326,13 @@ def write_markdown(rows: list[dict], path: Path) -> None:
         lines.append("")
         lines.extend(markdown_table(
             [
-                "architecture", "rank", "ablation", "CRPS", "MV ES",
+                "architecture", "seed", "rank", "ablation", "CRPS", "MV ES",
                 "cov90", "width90", "ACF", "ramp6h", "net-load MAE",
                 "any violation",
             ],
             [[
-                row["architecture"], row["checkpoint_rank"],
+                row["architecture"], row["training_seed"],
+                row["checkpoint_rank"],
                 row["condition_ablation"], row["constrained_total_crps"],
                 row["constrained_multivariate_es"],
                 row["constrained_total_coverage_90_pct"],
@@ -332,30 +345,34 @@ def write_markdown(rows: list[dict], path: Path) -> None:
         ))
     lines.extend(["", "## Raw physical-boundary diagnostics", ""])
     lines.extend(markdown_table(
-        ["architecture", "rank", "ablation", "wind<0", "wind>cap", "solar<0", "solar>cap", "load<0", "any violation"],
+        ["architecture", "seed", "rank", "ablation", "wind<0", "wind>cap", "solar<0", "solar>cap", "load<0", "any violation"],
         [[
-            row["architecture"], row["checkpoint_rank"], row["condition_ablation"],
+            row["architecture"], row["training_seed"], row["checkpoint_rank"],
+            row["condition_ablation"],
             row["wind_below_zero_pct"], row["wind_above_capacity_pct"],
             row["solar_below_zero_pct"], row["solar_above_capacity_pct"],
             row["load_below_zero_pct"], row["any_physical_violation_pct"],
         ] for row in rows]
     ))
     if ablations:
-        reference = next((
-            row for row in primary
+        references = {
+            row["training_seed"]: row
+            for row in primary
             if row["architecture"] == "v5_tf" and row["checkpoint_rank"] == 1
-        ), None)
+        }
         lines.extend(["", "## V5-TF rank-1 condition ablations", ""])
         ablation_rows = []
         for row in ablations:
+            reference = references.get(row["training_seed"])
             delta = "NA" if reference is None else row["total_crps"] - reference["total_crps"]
             ablation_rows.append([
-                row["condition_ablation"], row["total_crps"], delta,
+                row["training_seed"], row["condition_ablation"],
+                row["total_crps"], delta,
                 row["multivariate_es"], row["total_acf_mae"],
                 row["net_load_ramp_6h_mae_mw"], row["cross_variable_corr_mae"],
             ])
         lines.extend(markdown_table(
-            ["ablation", "CRPS", "CRPS delta", "MV ES", "ACF", "ramp6h", "corr error"],
+            ["seed", "ablation", "CRPS", "CRPS delta", "MV ES", "ACF", "ramp6h", "corr error"],
             ablation_rows,
         ))
     lines.extend([
@@ -378,6 +395,7 @@ def main() -> None:
     rows = [load_result(path.resolve(), parameter_cache) for path in args.result_dirs]
     validate_protocol(rows)
     rows.sort(key=lambda row: (
+        row["training_seed"],
         ARCHITECTURE_ORDER[row["architecture"]],
         row["checkpoint_rank"],
         row["condition_ablation"],

@@ -5,10 +5,56 @@ from pathlib import Path
 
 import numpy as np
 
-from tools.compare_v5_stage1_results import compute_saved_diagnostics
+from tools.compare_v5_stage1_results import (
+    add_baseline_deltas,
+    compute_saved_diagnostics,
+    validate_protocol,
+)
 
 
 class V5Stage1ComparisonTests(unittest.TestCase):
+    def test_baseline_deltas_are_matched_by_training_seed(self):
+        rows = []
+        for seed, baseline_value in ((2026, 10.0), (2027, 20.0)):
+            rows.extend([
+                {
+                    "training_seed": seed,
+                    "architecture": "v4_legacy",
+                    "checkpoint_rank": 1,
+                    "condition_ablation": "none",
+                    "total_crps": baseline_value,
+                    "multivariate_es": baseline_value,
+                    "total_acf_mae": baseline_value,
+                },
+                {
+                    "training_seed": seed,
+                    "architecture": "v5_tf",
+                    "checkpoint_rank": 1,
+                    "condition_ablation": "none",
+                    "total_crps": baseline_value / 2,
+                    "multivariate_es": baseline_value / 2,
+                    "total_acf_mae": baseline_value / 2,
+                },
+            ])
+
+        add_baseline_deltas(rows)
+
+        for row in rows:
+            if row["architecture"] == "v5_tf":
+                self.assertEqual(row["total_crps_delta_vs_v4_rank1_pct"], -50.0)
+
+    def test_protocol_rejects_unplanned_training_seed(self):
+        row = {
+            "training_seed": 2028,
+            "generation_seed": 424242,
+            "n_samples": 20,
+            "reverse_variance_type": "posterior",
+            "data_split": "val",
+            "result_dir": "test",
+        }
+        with self.assertRaisesRegex(ValueError, "unsupported training seed"):
+            validate_protocol([row])
+
     def test_saved_diagnostics_report_ramps_correlation_and_raw_boundaries(self):
         actual = np.array([[[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
                             [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],

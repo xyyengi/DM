@@ -139,33 +139,21 @@ import sys
 from pathlib import Path
 
 import yaml
+from src.eval.stage1_protocol import failed_checks, training_protocol_checks
 
 config_path, expected_arch, seed, batch, epochs, patience = sys.argv[1:]
 with Path(config_path).open("r", encoding="utf-8") as handle:
     config = yaml.safe_load(handle)
-model = config["model"]
-target = config["target"]
-sampling = config["sampling"]
-train = config["train"]
-checks = {
-    "architecture": model.get("architecture", "v4_legacy") == expected_arch,
-    "length_168": int(config["data"]["length"]) == 168,
-    "residual_target": target["type"] == "residual",
-    "residual_standardization": bool(target["residual_standardization"]["enabled"]),
-    "num_steps_500": int(model["num_steps"]) == 500,
-    "linear_schedule": model["schedule"] == "linear",
-    "posterior_variance": sampling["reverse_variance_type"] == "posterior",
-    "validation_seed": int(train["validation_seed"]) == 314159,
-    "top_k_three": int(train["top_k_checkpoints"]) == 3,
-    "config_seed": int(train["seed"]) == int(seed),
-    "runtime_batch_positive": int(batch) > 0,
-    "runtime_epochs_positive": int(epochs) > 0,
-    "runtime_patience_positive": int(patience) > 0,
-}
-failed = [name for name, passed in checks.items() if not passed]
+checks = training_protocol_checks(
+    config, expected_arch, int(seed), int(batch), int(epochs), int(patience)
+)
+failed = failed_checks(checks)
 if failed:
     raise SystemExit(f"paired protocol check failed for {config_path}: {failed}")
-print(f"PAIRED_PROTOCOL_OK config={config_path} architecture={expected_arch}")
+print(
+    f"PAIRED_PROTOCOL_OK config={config_path} "
+    f"architecture={expected_arch} runtime_seed={seed}"
+)
 PY
 }
 
@@ -181,8 +169,8 @@ stage1_run_training() {
   local batch=${BATCH:-64}
   local save_every=${SAVE_EVERY:-50}
 
-  [[ "${seed}" == "2026" ]] \
-    || stage1_die "stage-1 paired experiments are locked to SEED=2026"
+  [[ "${seed}" == "2026" || "${seed}" == "2027" ]] \
+    || stage1_die "stage-1 paired experiments allow only SEED=2026 or SEED=2027"
   [[ -f "${config_path}" ]] || stage1_die "config not found: ${config_path}"
   stage1_require_data "${data_path}"
   stage1_assert_training_protocol \
