@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 import numpy as np
 import torch
 import yaml
@@ -27,6 +28,11 @@ from src.eval.experiment_logger import (
     timestamp_now,
 )
 from src.training.residual_standardization import inverse_standardize_residual
+from src.eval.physical_projection import (
+    daylight_mask_from_export_metadata,
+    daylight_mask_from_train_support,
+    project_power_scenarios,
+)
 
 
 def apply_experiment_switches(config):
@@ -309,14 +315,14 @@ def denormalize_channels(values, scales):
     return (values * scales.reshape(shape)).astype(values.dtype, copy=False)
 
 
-def save_scenarios_npz(actual_samples, forecast, save_path):
+def save_scenarios_npz(actual_samples, forecast, save_path, filename='scenarios.npz'):
     """Save UC-facing scenario file with flattened equal-probability scenarios."""
     N, n_samples, C, L = actual_samples.shape
     flat = actual_samples.reshape(N * n_samples, C, L)
     prob = np.ones(N * n_samples, dtype=np.float64) / float(N * n_samples)
     samples_dir = os.path.join(save_path, 'samples')
     os.makedirs(samples_dir, exist_ok=True)
-    scenario_path = os.path.join(samples_dir, 'scenarios.npz')
+    scenario_path = os.path.join(samples_dir, filename)
     np.savez(
         scenario_path,
         wind=flat[:, 0, :],
@@ -381,6 +387,49 @@ def evaluate_and_save(
     forecast_physical = denormalize_channels(forecast, scales)
     residual_physical = denormalize_channels(residual, scales)
     target = denormalize_channels(actual, scales)
+    evaluation_config = config.get('evaluation', {})
+    solar_night_mode = evaluation_config.get(
+        'solar_night_mode', 'forecast_threshold'
+    )
+    solar_daylight_mask = None
+    solar_daylight_metadata = None
+    data_path = Path(config.get('data', {}).get('data_path', '.'))
+    if solar_night_mode == 'train_support':
+        solar_daylight_mask, solar_daylight_metadata = (
+            daylight_mask_from_train_support(
+                data_path,
+                data_split=data_split,
+                window_count=actual_samples.shape[0],
+                sequence_length=actual_samples.shape[3],
+            )
+        )
+    elif solar_night_mode == 'astronomical_shandong':
+        solar_daylight_mask, solar_daylight_metadata = (
+            daylight_mask_from_export_metadata(
+                data_path / 'export_metadata.json',
+                data_split=data_split,
+                window_count=actual_samples.shape[0],
+                sequence_length=actual_samples.shape[3],
+            )
+        )
+    elif solar_night_mode != 'forecast_threshold':
+        raise ValueError(
+            "evaluation.solar_night_mode must be "
+            "'train_support', 'astronomical_shandong', or 'forecast_threshold'"
+        )
+    constrained_samples, projection_report = project_power_scenarios(
+        actual_samples,
+        forecast_physical,
+        scales,
+        solar_night_threshold_mw=float(
+            evaluation_config.get('solar_night_threshold_mw', 1.0)
+        ),
+        solar_daylight_mask=solar_daylight_mask,
+        solar_daylight_metadata=solar_daylight_metadata,
+    )
+    constrained_samples_norm = (
+        constrained_samples / scales.reshape(1, 1, 3, 1)
+    ).astype(constrained_samples.dtype, copy=False)
 
     print(
         'Denormalization: '
@@ -394,13 +443,25 @@ def evaluate_and_save(
     )
     metrics = evaluate_multichannel(actual_samples, target, quantiles=quantiles)
     metrics = add_basic_mae(metrics, actual_samples, target)
+    constrained_metrics = evaluate_multichannel(
+        constrained_samples, target, quantiles=quantiles
+    )
+    constrained_metrics = add_basic_mae(
+        constrained_metrics, constrained_samples, target
+    )
     print_metrics(metrics)
+    print("Physical-projection metrics:")
+    print_metrics(constrained_metrics)
     
     # 保存结果
     os.makedirs(save_path, exist_ok=True)
     # Canonical result files are in physical power units (MW).
     np.save(os.path.join(save_path, 'generated_samples.npy'), samples_physical)
     np.save(os.path.join(save_path, 'actual_scenarios.npy'), actual_samples)
+    np.save(
+        os.path.join(save_path, 'actual_scenarios_constrained.npy'),
+        constrained_samples,
+    )
     np.save(os.path.join(save_path, 'forecast_data.npy'), forecast_physical)
     np.save(os.path.join(save_path, 'residual_data.npy'), residual_physical)
     np.save(os.path.join(save_path, 'actual_data.npy'), target)
@@ -410,6 +471,10 @@ def evaluate_and_save(
     if residual_standardizer is not None:
         np.save(os.path.join(save_path, 'generated_samples_standardized.npy'), samples)
     np.save(os.path.join(save_path, 'actual_scenarios_normalized.npy'), actual_samples_norm)
+    np.save(
+        os.path.join(save_path, 'actual_scenarios_constrained_normalized.npy'),
+        constrained_samples_norm,
+    )
     np.save(os.path.join(save_path, 'forecast_data_normalized.npy'), forecast)
     np.save(os.path.join(save_path, 'residual_data_normalized.npy'), residual)
     np.save(os.path.join(save_path, 'actual_data_normalized.npy'), actual)
@@ -424,9 +489,19 @@ def evaluate_and_save(
             'residual_standardization': residual_standardizer,
             'generated_samples_normalized_semantics': 'forecast_minus_actual residual in normalized power coordinates',
             'data_split': data_split,
+            'physical_projection': projection_report,
         }, f, ensure_ascii=False, indent=2)
 
-    scenario_path = save_scenarios_npz(actual_samples, forecast_physical, save_path)
+    raw_scenario_path = save_scenarios_npz(
+        actual_samples, forecast_physical, save_path, filename='scenarios_raw.npz'
+    )
+    scenario_path = save_scenarios_npz(
+        constrained_samples, forecast_physical, save_path, filename='scenarios.npz'
+    )
+    with open(
+        os.path.join(save_path, 'physical_projection.json'), 'w', encoding='utf-8'
+    ) as f:
+        json.dump(projection_report, f, ensure_ascii=False, indent=2)
     
     # 保存ACF数据
     for c, name in enumerate(['wind', 'solar', 'load']):
@@ -455,7 +530,8 @@ def evaluate_and_save(
         'run_id': run_id,
         'timestamp': timestamp,
         'checkpoint_path': checkpoint_path or 'NA',
-        'scenario_path': scenario_path,
+        'scenario_path': raw_scenario_path,
+        'scenario_profile': 'raw',
         'figure_dir': figure_dir,
         'scenario_shape': str([int(N * n_samples), int(C), int(L)]),
         'reverse_variance_type': config.get('model', {}).get('reverse_variance_type', 'beta'),
@@ -465,7 +541,34 @@ def evaluate_and_save(
             'condition_ablation', 'none'
         ),
     })
+    constrained_metrics.update({
+        'run_id': run_id,
+        'timestamp': timestamp,
+        'checkpoint_path': checkpoint_path or 'NA',
+        'scenario_path': scenario_path,
+        'scenario_profile': 'physical_projection',
+        'scenario_shape': str([int(N * n_samples), int(C), int(L)]),
+        'reverse_variance_type': config.get('model', {}).get(
+            'reverse_variance_type', 'beta'
+        ),
+        'residual_standardization_enabled': residual_standardizer is not None,
+        'data_split': data_split,
+        'condition_ablation': config.get('evaluation', {}).get(
+            'condition_ablation', 'none'
+        ),
+        'physical_projection': projection_report,
+    })
     metrics_path = save_metrics_json(metrics, save_path)
+    constrained_metrics_path = os.path.join(save_path, 'metrics_constrained.json')
+    with open(constrained_metrics_path, 'w', encoding='utf-8') as f:
+        json.dump(
+            constrained_metrics,
+            f,
+            ensure_ascii=False,
+            indent=2,
+            default=lambda value: value.item()
+            if isinstance(value, np.generic) else value.tolist(),
+        )
     summary_row = build_summary_row(
         config=config,
         run_id=run_id,
@@ -474,13 +577,14 @@ def evaluate_and_save(
         checkpoint_path=checkpoint_path,
         scenario_path=scenario_path,
         figure_dir=figure_dir,
-        metrics=metrics,
-        notes=f'evaluated split={data_split}',
+        metrics=constrained_metrics,
+        notes=f'evaluated split={data_split}; scenario_profile=physical_projection',
     )
     summary_path = append_summary(os.path.dirname(os.path.abspath(save_path)), summary_row)
     
     print(f"\n结果保存至: {save_path}")
     print(f"metrics.json: {metrics_path}")
+    print(f"metrics_constrained.json: {constrained_metrics_path}")
     print(f"实验汇总已追加: {summary_path}")
 
 

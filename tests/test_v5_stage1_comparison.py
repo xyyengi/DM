@@ -28,6 +28,13 @@ class V5Stage1ComparisonTests(unittest.TestCase):
                 json.dump({"scales": [10.0, 10.0, 100.0]}, handle)
 
             diagnostics = compute_saved_diagnostics(result_dir)
+            np.save(
+                result_dir / "actual_scenarios_constrained.npy",
+                np.maximum(scenarios, 0.0),
+            )
+            constrained = compute_saved_diagnostics(
+                result_dir, "actual_scenarios_constrained.npy"
+            )
 
         self.assertGreater(diagnostics["wind_below_zero_pct"], 0.0)
         self.assertGreater(diagnostics["solar_above_capacity_pct"], 0.0)
@@ -35,6 +42,8 @@ class V5Stage1ComparisonTests(unittest.TestCase):
         self.assertGreater(diagnostics["any_physical_violation_pct"], 0.0)
         self.assertGreaterEqual(diagnostics["net_load_ramp_1h_mae_mw"], 0.0)
         self.assertGreaterEqual(diagnostics["cross_variable_corr_mae"], 0.0)
+        self.assertEqual(constrained["wind_below_zero_pct"], 0.0)
+        self.assertEqual(constrained["load_below_zero_pct"], 0.0)
 
 
 if __name__ == "__main__":

@@ -71,4 +71,5 @@ lr_scheduler:
 evaluation:
   n_samples: 20
   generation_seed: 424242
+  solar_night_mode: "train_support"
   quantiles: [0.8, 0.9, 0.95, 1.0]

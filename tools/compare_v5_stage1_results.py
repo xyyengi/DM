@@ -39,8 +39,11 @@ def _correlation_matrix(values: np.ndarray) -> np.ndarray:
     return np.corrcoef(flattened)
 
 
-def compute_saved_diagnostics(result_dir: Path) -> dict[str, float]:
-    scenarios = np.load(result_dir / "actual_scenarios.npy", mmap_mode="r")
+def compute_saved_diagnostics(
+    result_dir: Path,
+    scenarios_filename: str = "actual_scenarios.npy",
+) -> dict[str, float]:
+    scenarios = np.load(result_dir / scenarios_filename, mmap_mode="r")
     actual = np.load(result_dir / "actual_data.npy", mmap_mode="r")
     if scenarios.ndim != 4 or scenarios.shape[2] != 3:
         raise ValueError(f"actual_scenarios must be [N,S,3,L], got {scenarios.shape}")
@@ -175,6 +178,62 @@ def load_result(result_dir: Path, parameter_cache: dict[Path, int]) -> dict:
         row[f"total_coverage_deviation_{nominal}_pct"] = coverage - nominal
         row[f"total_width_{nominal}_pct"] = float(metrics[f"total_width_{nominal}%"])
     row.update(diagnostics)
+    constrained_metrics_path = result_dir / "metrics_constrained.json"
+    constrained_scenarios_path = result_dir / "actual_scenarios_constrained.npy"
+    row["physical_projection_available"] = bool(
+        constrained_metrics_path.is_file() and constrained_scenarios_path.is_file()
+    )
+    constrained_fields = (
+        "multivariate_es",
+        "total_crps",
+        "total_energy_score",
+        "total_acf_mae",
+        "total_coverage_90_pct",
+        "total_width_90_pct",
+        "any_physical_violation_pct",
+        "net_load_mae_mw",
+        "net_load_ramp_6h_mae_mw",
+        "cross_variable_corr_mae",
+    )
+    for field in constrained_fields:
+        row[f"constrained_{field}"] = ""
+    if row["physical_projection_available"]:
+        with constrained_metrics_path.open("r", encoding="utf-8") as handle:
+            constrained_metrics = json.load(handle)
+        constrained_diagnostics = compute_saved_diagnostics(
+            result_dir,
+            scenarios_filename="actual_scenarios_constrained.npy",
+        )
+        row.update({
+            "constrained_multivariate_es": float(
+                constrained_metrics["multivariate_es"]
+            ),
+            "constrained_total_crps": float(constrained_metrics["total_crps"]),
+            "constrained_total_energy_score": float(
+                constrained_metrics["total_energy_score"]
+            ),
+            "constrained_total_acf_mae": float(
+                constrained_metrics["total_acf_mae"]
+            ),
+            "constrained_total_coverage_90_pct": float(
+                constrained_metrics["total_coverage_90%"]
+            ),
+            "constrained_total_width_90_pct": float(
+                constrained_metrics["total_width_90%"]
+            ),
+            "constrained_any_physical_violation_pct": float(
+                constrained_diagnostics["any_physical_violation_pct"]
+            ),
+            "constrained_net_load_mae_mw": float(
+                constrained_diagnostics["net_load_mae_mw"]
+            ),
+            "constrained_net_load_ramp_6h_mae_mw": float(
+                constrained_diagnostics["net_load_ramp_6h_mae_mw"]
+            ),
+            "constrained_cross_variable_corr_mae": float(
+                constrained_diagnostics["cross_variable_corr_mae"]
+            ),
+        })
     return row
 
 
@@ -245,6 +304,32 @@ def write_markdown(rows: list[dict], path: Path) -> None:
             row["net_load_mae_mw"],
         ] for row in primary]
     ))
+    constrained = [row for row in rows if row["physical_projection_available"]]
+    if constrained:
+        lines.extend(["", "## Physical-projection results", ""])
+        lines.append(
+            "Raw artifacts remain unchanged. These columns use the separately "
+            "saved constrained scenarios."
+        )
+        lines.append("")
+        lines.extend(markdown_table(
+            [
+                "architecture", "rank", "ablation", "CRPS", "MV ES",
+                "cov90", "width90", "ACF", "ramp6h", "net-load MAE",
+                "any violation",
+            ],
+            [[
+                row["architecture"], row["checkpoint_rank"],
+                row["condition_ablation"], row["constrained_total_crps"],
+                row["constrained_multivariate_es"],
+                row["constrained_total_coverage_90_pct"],
+                row["constrained_total_width_90_pct"],
+                row["constrained_total_acf_mae"],
+                row["constrained_net_load_ramp_6h_mae_mw"],
+                row["constrained_net_load_mae_mw"],
+                row["constrained_any_physical_violation_pct"],
+            ] for row in constrained],
+        ))
     lines.extend(["", "## Raw physical-boundary diagnostics", ""])
     lines.extend(markdown_table(
         ["architecture", "rank", "ablation", "wind<0", "wind>cap", "solar<0", "solar>cap", "load<0", "any violation"],
