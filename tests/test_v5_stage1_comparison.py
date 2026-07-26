@@ -55,6 +55,23 @@ class V5Stage1ComparisonTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported training seed"):
             validate_protocol([row])
 
+    def test_protocol_accepts_explicit_80_member_comparison(self):
+        rows = [
+            {
+                "training_seed": 2027,
+                "generation_seed": 424242,
+                "n_samples": 80,
+                "reverse_variance_type": "posterior",
+                "data_split": "val",
+                "result_dir": architecture,
+            }
+            for architecture in ("v5_tf", "v5_tf_va")
+        ]
+
+        validate_protocol(rows, expected_n_samples=80)
+        with self.assertRaisesRegex(ValueError, "protocol mismatch"):
+            validate_protocol(rows)
+
     def test_saved_diagnostics_report_ramps_correlation_and_raw_boundaries(self):
         actual = np.array([[[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
                             [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],

@@ -55,6 +55,91 @@ class DiffusionTimestepEmbedding(nn.Module):
         return self.mlp(sinusoidal_embedding(timestep, self.embedding_dim))
 
 
+class VariableAwareProjection(nn.Module):
+    """Encode wind/PV/load separately, then mix them with gated attention.
+
+    Attention is applied across the three variable tokens independently at
+    every sequence position.  The temporal axis is therefore preserved for the
+    downstream 1-D UNet.
+    """
+
+    variable_names = ("wind", "pv", "load")
+
+    def __init__(
+        self,
+        out_channels: int,
+        variable_channels: int = 16,
+        group_norm_groups: int = 8,
+        gate_init: float = -2.0,
+    ):
+        super().__init__()
+        self.num_variables = len(self.variable_names)
+        self.variable_channels = int(variable_channels)
+        if self.variable_channels < 2:
+            raise ValueError("variable_channels must be at least 2")
+
+        self.variable_stems = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(1, self.variable_channels, kernel_size=3, padding=1),
+                nn.GroupNorm(
+                    _group_count(self.variable_channels, group_norm_groups),
+                    self.variable_channels,
+                ),
+                nn.SiLU(),
+            )
+            for _ in range(self.num_variables)
+        ])
+        self.variable_embedding = nn.Parameter(
+            torch.zeros(self.num_variables, self.variable_channels)
+        )
+        nn.init.normal_(self.variable_embedding, mean=0.0, std=0.02)
+        self.token_norm = nn.LayerNorm(self.variable_channels)
+        self.qkv = nn.Linear(self.variable_channels, self.variable_channels * 3)
+        self.attention_output = nn.Linear(self.variable_channels, self.variable_channels)
+        self.gate_logits = nn.Parameter(
+            torch.full((self.num_variables, self.variable_channels), float(gate_init))
+        )
+        self.fuse = nn.Conv1d(
+            self.num_variables * self.variable_channels,
+            int(out_channels),
+            kernel_size=1,
+        )
+        self.last_input_shape: tuple[int, ...] | None = None
+        self.last_attention_shape: tuple[int, ...] | None = None
+        self.last_mean_attention: torch.Tensor | None = None
+        self.last_gate_values: torch.Tensor | None = None
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        if values.ndim != 3 or values.shape[1] != self.num_variables:
+            raise ValueError(
+                f"variable-aware input must be [B,3,L], got {tuple(values.shape)}"
+            )
+        self.last_input_shape = tuple(values.shape)
+        encoded = torch.stack([
+            stem(values[:, index:index + 1, :])
+            for index, stem in enumerate(self.variable_stems)
+        ], dim=1)
+        encoded = encoded + self.variable_embedding[None, :, :, None]
+
+        # [B,V,D,L] -> [B,L,V,D], so attention mixes variables but not hours.
+        tokens = encoded.permute(0, 3, 1, 2)
+        query, key, value = self.qkv(self.token_norm(tokens)).chunk(3, dim=-1)
+        scores = torch.matmul(query, key.transpose(-2, -1))
+        scores = scores / math.sqrt(self.variable_channels)
+        attention = torch.softmax(scores, dim=-1)
+        mixed = self.attention_output(torch.matmul(attention, value))
+        gate = torch.sigmoid(self.gate_logits)[None, None, :, :]
+        tokens = tokens + gate * mixed
+
+        self.last_attention_shape = tuple(attention.shape)
+        self.last_mean_attention = attention.detach().mean(dim=(0, 1))
+        self.last_gate_values = torch.sigmoid(self.gate_logits.detach())
+
+        encoded = tokens.permute(0, 2, 3, 1).contiguous()
+        batch, variables, channels, length = encoded.shape
+        return self.fuse(encoded.reshape(batch, variables * channels, length))
+
+
 class SequenceConditionEncoder(nn.Module):
     """Encode forecast, real calendar, and relative position independently."""
 
@@ -63,6 +148,8 @@ class SequenceConditionEncoder(nn.Module):
         channels: Sequence[int],
         position_dim: int = 32,
         group_norm_groups: int = 8,
+        variable_aware: bool = False,
+        variable_channels: int = 16,
     ):
         super().__init__()
         channels = tuple(int(value) for value in channels)
@@ -70,7 +157,16 @@ class SequenceConditionEncoder(nn.Module):
             raise ValueError("condition encoder requires at least one resolution")
         stem_channels = channels[0]
         self.position_dim = int(position_dim)
-        self.forecast_stem = nn.Conv1d(3, stem_channels, kernel_size=3, padding=1)
+        self.variable_aware = bool(variable_aware)
+        self.forecast_stem = (
+            VariableAwareProjection(
+                stem_channels,
+                variable_channels=variable_channels,
+                group_norm_groups=group_norm_groups,
+            )
+            if self.variable_aware
+            else nn.Conv1d(3, stem_channels, kernel_size=3, padding=1)
+        )
         self.calendar_stem = nn.Conv1d(8, stem_channels, kernel_size=3, padding=1)
         self.position_stem = nn.Conv1d(self.position_dim, stem_channels, kernel_size=1)
         self.fuse = nn.Sequential(
@@ -239,6 +335,8 @@ class V5ConditionalUNet1D(nn.Module):
         groups = int(config.get("group_norm_groups", 8))
         dropout = float(config.get("dropout", 0.0))
         timestep_dim = int(config.get("timestep_embedding_dim", 128))
+        self.variable_aware = bool(config.get("variable_aware", False))
+        variable_channels = int(config.get("variable_feature_channels", 16))
 
         self.timestep_embedding = DiffusionTimestepEmbedding(timestep_dim, timestep_dim)
         self.condition_encoder = (
@@ -246,10 +344,20 @@ class V5ConditionalUNet1D(nn.Module):
                 self.channels,
                 position_dim=int(config.get("position_embedding_dim", 32)),
                 group_norm_groups=groups,
+                variable_aware=self.variable_aware,
+                variable_channels=variable_channels,
             )
             if self.use_sequence_condition else None
         )
-        self.state_stem = nn.Conv1d(3, self.channels[0], kernel_size=3, padding=1)
+        self.state_stem = (
+            VariableAwareProjection(
+                self.channels[0],
+                variable_channels=variable_channels,
+                group_norm_groups=groups,
+            )
+            if self.variable_aware
+            else nn.Conv1d(3, self.channels[0], kernel_size=3, padding=1)
+        )
 
         condition_channels = self.channels if self.use_sequence_condition else (None,) * self.num_layers
         self.encoder_blocks = nn.ModuleList([
@@ -501,7 +609,7 @@ class V5Stage1Model(nn.Module):
         self.config = dict(config)
         self.device = device
         self.architecture = str(self.config["architecture"])
-        if self.architecture not in {"v5_t", "v5_tf"}:
+        if self.architecture not in {"v5_t", "v5_tf", "v5_tf_va"}:
             raise ValueError(f"Unsupported V5 architecture={self.architecture!r}")
         self.target_type = str(self.config.get("target_type", "residual"))
         if self.target_type != "residual":
@@ -510,7 +618,14 @@ class V5Stage1Model(nn.Module):
         self.use_forecast = True
         self.use_network_condition = self.use_sequence_condition
         self.use_guidance = False
-        self.condition_mode = "sequence_film" if self.use_sequence_condition else "timestep_only"
+        if self.architecture == "v5_tf_va":
+            self.condition_mode = "sequence_film_variable_aware"
+        else:
+            self.condition_mode = (
+                "sequence_film"
+                if self.use_sequence_condition
+                else "timestep_only"
+            )
         self.cond_mask = [1, 1, 1]
         self.denoiser = V5ConditionalUNet1D(self.config)
         self.diffusion = V5GaussianDiffusion(

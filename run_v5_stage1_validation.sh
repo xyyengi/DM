@@ -157,7 +157,7 @@ from src.eval.stage1_protocol import failed_checks, validation_protocol_checks
 with Path(sys.argv[1]).open("r", encoding="utf-8") as handle:
     config = yaml.safe_load(handle)
 architecture = config["model"].get("architecture", "v4_legacy")
-if architecture not in {"v4_legacy", "v5_t", "v5_tf"}:
+if architecture not in {"v4_legacy", "v5_t", "v5_tf", "v5_tf_va"}:
     raise SystemExit(f"unsupported architecture: {architecture}")
 checks = validation_protocol_checks(config)
 failed = failed_checks(checks)
@@ -191,8 +191,9 @@ PY
     generate_one \
       "${run_dir}" "${run_parent}" "${run_name}" "${architecture}" \
       "${rank}" "${epoch}" "${val_loss}" "none"
-    if [[ "${architecture}" == "v5_tf" && "${rank}" == "1" \
-          && "${RUN_ABLATIONS}" == "1" ]]; then
+    if [[ "${rank}" == "1" && "${RUN_ABLATIONS}" == "1" ]] \
+          && [[ "${architecture}" == "v5_tf" \
+                || "${architecture}" == "v5_tf_va" ]]; then
       generate_one \
         "${run_dir}" "${run_parent}" "${run_name}" "${architecture}" \
         "${rank}" "${epoch}" "${val_loss}" "forecast"

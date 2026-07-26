@@ -6,7 +6,7 @@ from typing import Mapping
 
 
 LEGACY_ARCHITECTURE = "v4_legacy"
-V5_ARCHITECTURES = {"v5_t", "v5_tf"}
+V5_ARCHITECTURES = {"v5_t", "v5_tf", "v5_tf_va"}
 SUPPORTED_ARCHITECTURES = {LEGACY_ARCHITECTURE, *V5_ARCHITECTURES}
 
 
@@ -43,7 +43,7 @@ def build_model(model_config: Mapping[str, object], device):
     from .v5_conditioned_diffusion import V5Stage1Model
 
     config = dict(model_config)
-    expected_sequence_condition = architecture == "v5_tf"
+    expected_sequence_condition = architecture in {"v5_tf", "v5_tf_va"}
     configured = bool(config.get("use_sequence_condition", expected_sequence_condition))
     if configured != expected_sequence_condition:
         raise ValueError(
@@ -59,8 +59,18 @@ def build_model(model_config: Mapping[str, object], device):
             )
     if bool(config.get("use_guidance", False)):
         raise ValueError("V5 stage-1 architectures require use_guidance=False")
+    expected_variable_aware = architecture == "v5_tf_va"
+    configured_variable_aware = bool(
+        config.get("variable_aware", expected_variable_aware)
+    )
+    if configured_variable_aware != expected_variable_aware:
+        raise ValueError(
+            f"architecture={architecture!r} requires "
+            f"variable_aware={expected_variable_aware}"
+        )
     config["architecture"] = architecture
     config["use_sequence_condition"] = expected_sequence_condition
+    config["variable_aware"] = expected_variable_aware
     return V5Stage1Model(config, device)
 
 

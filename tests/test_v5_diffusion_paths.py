@@ -78,11 +78,10 @@ class V5DiffusionPathTests(unittest.TestCase):
         self.assertEqual(actual[0].item(), 0.0)
         self.assertTrue(torch.allclose(actual[1], expected_t2))
 
-    def test_v5_tf_forward_backward_and_strict_state_roundtrip(self):
+    def test_conditioned_v5_forward_backward_and_strict_state_roundtrip(self):
         from src.models import build_model, load_model_checkpoint
 
-        config = {
-            "architecture": "v5_tf",
+        base_config = {
             "in_channels": 3,
             "out_channels": 3,
             "sequence_length": 168,
@@ -98,30 +97,44 @@ class V5DiffusionPathTests(unittest.TestCase):
             "num_steps": 3,
             "reverse_variance_type": "posterior",
         }
-        batch = {
-            "residual_target_3ch": torch.randn(2, 3, 168),
-            "forecast_3ch": torch.randn(2, 3, 168),
-            "calendar_8ch": torch.randn(2, 8, 168),
-            "relative_positions": torch.arange(168).float().repeat(2, 1),
-        }
-        model = build_model(config, torch.device("cpu"))
+        for architecture, variable_aware in (
+            ("v5_tf", False),
+            ("v5_tf_va", True),
+        ):
+            with self.subTest(architecture=architecture):
+                config = dict(base_config)
+                config.update({
+                    "architecture": architecture,
+                    "variable_aware": variable_aware,
+                    "variable_feature_channels": 4,
+                })
+                batch = {
+                    "residual_target_3ch": torch.randn(2, 3, 168),
+                    "forecast_3ch": torch.randn(2, 3, 168),
+                    "calendar_8ch": torch.randn(2, 8, 168),
+                    "relative_positions": torch.arange(168).float().repeat(2, 1),
+                }
+                model = build_model(config, torch.device("cpu"))
 
-        loss = model(batch)
-        loss.backward()
+                loss = model(batch)
+                loss.backward()
 
-        self.assertTrue(any(
-            parameter.grad is not None for parameter in model.parameters()
-        ))
-        with tempfile.TemporaryDirectory() as directory:
-            checkpoint_path = Path(directory) / "v5_smoke.pt"
-            torch.save({"model_state_dict": model.state_dict()}, checkpoint_path)
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        clone = build_model(config, torch.device("cpu"))
-        missing, unexpected = load_model_checkpoint(clone, checkpoint)
-        self.assertEqual(missing, [])
-        self.assertEqual(unexpected, [])
-        samples = clone.generate(batch, n_samples=2)
-        self.assertEqual(tuple(samples.shape), (2, 2, 3, 168))
+                self.assertTrue(any(
+                    parameter.grad is not None for parameter in model.parameters()
+                ))
+                with tempfile.TemporaryDirectory() as directory:
+                    checkpoint_path = Path(directory) / "v5_smoke.pt"
+                    torch.save(
+                        {"model_state_dict": model.state_dict()},
+                        checkpoint_path,
+                    )
+                    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+                clone = build_model(config, torch.device("cpu"))
+                missing, unexpected = load_model_checkpoint(clone, checkpoint)
+                self.assertEqual(missing, [])
+                self.assertEqual(unexpected, [])
+                samples = clone.generate(batch, n_samples=2)
+                self.assertEqual(tuple(samples.shape), (2, 2, 3, 168))
 
 
 if __name__ == "__main__":

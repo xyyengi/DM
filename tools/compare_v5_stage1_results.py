@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Compare fixed-protocol V4-RS, V5-T, and V5-TF validation artifacts."""
+"""Compare fixed-protocol V4-RS and explicit V5 validation artifacts."""
 
 from __future__ import annotations
 
@@ -22,7 +22,12 @@ from src.models import build_model
 from src.eval.stage1_protocol import ALLOWED_STAGE1_TRAINING_SEEDS
 
 
-ARCHITECTURE_ORDER = {"v4_legacy": 0, "v5_t": 1, "v5_tf": 2}
+ARCHITECTURE_ORDER = {
+    "v4_legacy": 0,
+    "v5_t": 1,
+    "v5_tf": 2,
+    "v5_tf_va": 3,
+}
 
 
 def _percentage(mask: np.ndarray) -> float:
@@ -241,10 +246,13 @@ def load_result(result_dir: Path, parameter_cache: dict[Path, int]) -> dict:
     return row
 
 
-def validate_protocol(rows: list[dict]) -> None:
+def validate_protocol(
+    rows: list[dict],
+    expected_n_samples: int = 20,
+) -> None:
     expected = {
         "generation_seed": 424242,
-        "n_samples": 20,
+        "n_samples": int(expected_n_samples),
         "reverse_variance_type": "posterior",
         "data_split": "val",
     }
@@ -294,13 +302,21 @@ def markdown_table(headers: list[str], rows: list[list[object]]) -> list[str]:
     return lines
 
 
-def write_markdown(rows: list[dict], path: Path) -> None:
+def write_markdown(
+    rows: list[dict],
+    path: Path,
+    ensemble_size: int = 20,
+) -> None:
     primary = [row for row in rows if row["condition_ablation"] == "none"]
     ablations = [row for row in rows if row["condition_ablation"] != "none"]
     lines = [
         "# V5 Stage-1 validation comparison",
         "",
-        "All rows use validation data, posterior reverse variance, 20 ensemble members, and generation seed 424242. Lower is better for MSE, CRPS, Energy Score, ACF error, ramp error, correlation error, and boundary violations. Coverage deviations should approach zero.",
+        f"All rows use validation data, posterior reverse variance, "
+        f"{int(ensemble_size)} ensemble members, and generation seed 424242. "
+        "Lower is better for MSE, CRPS, Energy Score, ACF error, ramp error, "
+        "correlation error, and boundary violations. Coverage deviations "
+        "should approach zero.",
         "",
         "## Primary top-3 checkpoint results",
         "",
@@ -387,13 +403,16 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("result_dirs", nargs="+", type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--expected-n-samples", type=int, default=20)
     args = parser.parse_args()
+    if args.expected_n_samples < 2:
+        raise ValueError("--expected-n-samples must be at least 2")
     if args.output_dir.exists():
         raise FileExistsError(f"refusing to overwrite {args.output_dir}")
 
     parameter_cache: dict[Path, int] = {}
     rows = [load_result(path.resolve(), parameter_cache) for path in args.result_dirs]
-    validate_protocol(rows)
+    validate_protocol(rows, expected_n_samples=args.expected_n_samples)
     rows.sort(key=lambda row: (
         row["training_seed"],
         ARCHITECTURE_ORDER[row["architecture"]],
@@ -413,7 +432,11 @@ def main() -> None:
         "w", encoding="utf-8"
     ) as handle:
         json.dump(rows, handle, ensure_ascii=False, indent=2)
-    write_markdown(rows, args.output_dir / "v5_stage1_comparison.md")
+    write_markdown(
+        rows,
+        args.output_dir / "v5_stage1_comparison.md",
+        ensemble_size=args.expected_n_samples,
+    )
     print(f"WROTE_COMPARISON rows={len(rows)} output={args.output_dir}")
 
 

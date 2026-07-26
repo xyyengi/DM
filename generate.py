@@ -697,8 +697,11 @@ def main():
     
     # 模型
     architecture = resolve_architecture(config['model'])
-    if args.condition_ablation != 'none' and architecture != 'v5_tf':
-        raise ValueError("condition ablation is supported only for architecture='v5_tf'")
+    if args.condition_ablation != 'none' and architecture not in {'v5_tf', 'v5_tf_va'}:
+        raise ValueError(
+            "condition ablation is supported only for "
+            "architecture='v5_tf' or 'v5_tf_va'"
+        )
     model = build_model(config['model'], device).to(device)
     checkpoint = torch.load(ckpt_path, map_location=device)
     missing_keys, unexpected_keys = load_model_checkpoint(

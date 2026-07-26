@@ -46,7 +46,7 @@ class ModelFactoryCompatibilityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "in_channels=3"):
             build_model(config, torch.device("cpu"))
 
-    def test_v5_t_and_v5_tf_require_matching_condition_contracts(self):
+    def test_v5_architectures_require_matching_condition_contracts(self):
         from src.models import build_model
 
         base = {
@@ -59,15 +59,23 @@ class ModelFactoryCompatibilityTests(unittest.TestCase):
             "target_type": "residual",
             "num_steps": 3,
         }
-        for architecture, condition_enabled in (("v5_t", False), ("v5_tf", True)):
+        cases = (
+            ("v5_t", False, False),
+            ("v5_tf", True, False),
+            ("v5_tf_va", True, True),
+        )
+        for architecture, condition_enabled, variable_aware in cases:
             config = dict(base)
             config.update({
                 "architecture": architecture,
                 "use_sequence_condition": condition_enabled,
+                "variable_aware": variable_aware,
+                "variable_feature_channels": 4,
             })
             model = build_model(config, torch.device("cpu"))
             self.assertEqual(model.architecture, architecture)
             self.assertEqual(model.use_sequence_condition, condition_enabled)
+            self.assertEqual(model.denoiser.variable_aware, variable_aware)
 
         invalid = dict(base)
         invalid.update({
@@ -76,6 +84,15 @@ class ModelFactoryCompatibilityTests(unittest.TestCase):
         })
         with self.assertRaisesRegex(ValueError, "use_sequence_condition=True"):
             build_model(invalid, torch.device("cpu"))
+
+        invalid_variable_aware = dict(base)
+        invalid_variable_aware.update({
+            "architecture": "v5_tf_va",
+            "use_sequence_condition": True,
+            "variable_aware": False,
+        })
+        with self.assertRaisesRegex(ValueError, "variable_aware=True"):
+            build_model(invalid_variable_aware, torch.device("cpu"))
 
     def test_unknown_architecture_fails_instead_of_guessing(self):
         from src.models import resolve_architecture

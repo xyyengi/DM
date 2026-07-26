@@ -24,6 +24,7 @@ class Stage1ProtocolTests(unittest.TestCase):
             ("v4rs_reproducible_no_guidance_168h.yaml", "v4_legacy"),
             ("v5_t_stage1_168h.yaml", "v5_t"),
             ("v5_tf_stage1_168h.yaml", "v5_tf"),
+            ("v5_tf_va_stage2_168h.yaml", "v5_tf_va"),
         )
         for filename, architecture in cases:
             config = self.load_config(filename)

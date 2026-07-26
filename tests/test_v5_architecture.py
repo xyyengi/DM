@@ -4,6 +4,7 @@ import torch
 
 
 def tiny_config(architecture="v5_tf"):
+    conditioned = architecture in {"v5_tf", "v5_tf_va"}
     return {
         "architecture": architecture,
         "in_channels": 3,
@@ -16,7 +17,9 @@ def tiny_config(architecture="v5_tf"):
         "dropout": 0.0,
         "timestep_embedding_dim": 16,
         "position_embedding_dim": 8,
-        "use_sequence_condition": architecture == "v5_tf",
+        "use_sequence_condition": conditioned,
+        "variable_aware": architecture == "v5_tf_va",
+        "variable_feature_channels": 4,
         "target_type": "residual",
         "num_steps": 4,
     }
@@ -129,6 +132,48 @@ class V5ArchitectureTests(unittest.TestCase):
         self.assertEqual(model.last_condition_shapes, [])
         for block in model.residual_blocks:
             self.assertIsNone(block.last_modulation_shapes["condition_feature"])
+
+    def test_variable_aware_architecture_encodes_and_fuses_both_three_channel_paths(self):
+        model = self.make_denoiser("v5_tf_va")
+
+        output = self.forward_tf(model)
+
+        self.assertEqual(tuple(output.shape), (2, 3, 168))
+        self.assertTrue(model.variable_aware)
+        state_projection = model.state_stem
+        forecast_projection = model.condition_encoder.forecast_stem
+        for projection in (state_projection, forecast_projection):
+            self.assertEqual(len(projection.variable_stems), 3)
+            self.assertEqual(tuple(projection.variable_embedding.shape), (3, 4))
+            self.assertEqual(projection.last_input_shape, (2, 3, 168))
+            self.assertEqual(projection.last_attention_shape, (2, 168, 3, 3))
+            self.assertEqual(tuple(projection.last_mean_attention.shape), (3, 3))
+            self.assertTrue(torch.allclose(
+                projection.last_mean_attention.sum(dim=-1),
+                torch.ones(3),
+                atol=1e-6,
+            ))
+            self.assertTrue(torch.all(
+                (projection.last_gate_values > 0.0)
+                & (projection.last_gate_values < 0.5)
+            ))
+
+    def test_variable_aware_attention_preserves_hours_and_mixes_variables(self):
+        model = self.make_denoiser("v5_tf_va")
+        baseline = self.forward_tf(model)
+        changed_wind = self.x_t.clone()
+        changed_wind[:, 0, 50] += 2.0
+
+        changed = model(
+            changed_wind,
+            torch.tensor([1, 1]),
+            forecast=self.forecast,
+            calendar=self.calendar,
+            relative_positions=self.positions,
+        )
+
+        self.assertFalse(torch.allclose(baseline, changed))
+        self.assertEqual(model.state_stem.last_attention_shape[1], 168)
 
     def test_num_layers_controls_topology_and_must_match_multipliers(self):
         from src.models.v5_conditioned_diffusion import V5ConditionalUNet1D

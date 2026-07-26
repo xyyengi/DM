@@ -804,7 +804,9 @@ def main():
         sample_batch = next(val_iter)
         record_steps = [model.diffusion.num_steps - 1, model.diffusion.num_steps // 2,
                         max(0, model.diffusion.num_steps // 5), max(0, model.diffusion.num_steps // 10), 0]
-        if getattr(model, 'architecture', 'v4_legacy') in {'v5_t', 'v5_tf'}:
+        if getattr(model, 'architecture', 'v4_legacy') in {
+            'v5_t', 'v5_tf', 'v5_tf_va'
+        }:
             visualize_v5_final_sample(model, sample_batch, exp_folder, n_samples=1)
         else:
             visualize_sampling_progress(
