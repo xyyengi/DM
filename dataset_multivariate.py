@@ -525,15 +525,21 @@ class MultiChannelWindScenarioDataset(Dataset):
                 residual_definition=self.residual_definition,
                 normalization_divisors=self.max_values[:3],
                 epsilon=float(settings.get('epsilon', 1e-6)),
+                train_forecast_windows=self.train_pred,
+                mode=settings.get('mode', 'global_channelwise'),
+                solar_conditioning=settings.get('solar_conditioning', {}),
             )
         self.residual_standardizer = validate_standardizer(fitted)
         self.residual_target_norm = standardize_residual(
             self.residual_norm[:, :, :3],
             self.residual_standardizer,
             channel_axis=2,
+            forecast=self.forecast_norm[:, :, :3],
+            forecast_channel_axis=2,
         ).astype(np.float32, copy=False)
         print(
             "  [Dataset] standardized residual target from train unique hours: "
+            f"mode={self.residual_standardizer.get('mode')}, "
             f"mean={self.residual_standardizer['mean']}, "
             f"std={self.residual_standardizer['std']}"
         )

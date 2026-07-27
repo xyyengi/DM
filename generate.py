@@ -258,7 +258,12 @@ def generate_scenarios(
     )
 
 
-def model_output_to_residual(samples, target_type, residual_standardizer=None):
+def model_output_to_residual(
+    samples,
+    target_type,
+    residual_standardizer=None,
+    forecast=None,
+):
     """Convert model-space output to normalized-power residual coordinates."""
     if target_type != 'residual':
         return samples
@@ -268,6 +273,8 @@ def model_output_to_residual(samples, target_type, residual_standardizer=None):
         samples,
         residual_standardizer,
         channel_axis=2,
+        forecast=forecast,
+        forecast_channel_axis=1 if forecast is not None else None,
     ).astype(samples.dtype, copy=False)
 
 
@@ -280,7 +287,10 @@ def model_output_to_actual(
     """Convert model output to normalized-power actual scenarios."""
     if target_type == 'residual':
         residual_samples = model_output_to_residual(
-            samples, target_type, residual_standardizer
+            samples,
+            target_type,
+            residual_standardizer,
+            forecast=forecast,
         )
         # residual = forecast - actual, therefore actual = forecast - residual.
         return forecast[:, None, :, :] - residual_samples
@@ -375,7 +385,10 @@ def evaluate_and_save(
     """评估并保存结果（使用论文公式12-15）"""
     N, n_samples, C, L = samples.shape
     residual_samples_norm = model_output_to_residual(
-        samples, target_type, residual_standardizer
+        samples,
+        target_type,
+        residual_standardizer,
+        forecast=forecast,
     )
     actual_samples_norm = model_output_to_actual(
         samples, forecast, target_type, residual_standardizer

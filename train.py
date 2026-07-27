@@ -129,6 +129,10 @@ def print_experiment_summary(config):
         "  residual_standardization.enabled: "
         f"{target.get('residual_standardization', {}).get('enabled', False)}"
     )
+    print(
+        "  residual_standardization.mode: "
+        f"{target.get('residual_standardization', {}).get('mode', 'global_channelwise')}"
+    )
     forecast_features = condition.get('forecast_features', {})
     print(f"  forecast_features.enabled: {forecast_features.get('enabled', False)}")
     if forecast_features.get('enabled', False):
