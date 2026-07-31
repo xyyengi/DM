@@ -1,35 +1,34 @@
-# 大文件 - 数据和缓存（不上传到 GitHub）
-input_4.27/*.npy
-input_4.27/*.pkl
+# Local datasets (never commit)
+diffusion_input_station/
+diffusion_npy_normalized/
+input_4.27/
 
-# 训练结果（本地保留）
-save/run_*/
-
-# Experiment outputs and local report/build artifacts
+# Experiment outputs and local analysis artifacts
+save/
+logs/
+reports/
+outputs/
 outputs_shandong/
-outputs/docx_build_*/
-outputs/docx_extreme_*/
-outputs/*.docx
-outputs/*brief*.md
 tmp/
 *.tar.gz
 
-# Python 缓存
+# Python caches
 __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
 
-# IDE
+# Editors
 .vscode/
 .idea/
 
-# 调试文件
-debug/
-debug_*.py
-
-# 日志和输出
+# Logs and transient text
 *.log
-*.txt
-logs/**/*.pid
-logs/**/*.status
+*.pid
+*.status
+
+# Preserved local legacy files from earlier branches
+/doc_structure_utf8.txt
+/tests/test_joint_calibration.py
+/tools/analyze_solar_crs_joint_calibration.py
+/tools/evaluate_v5tf_extreme_events.py

@@ -1,10 +1,6 @@
 torch
-pandas
 numpy
+pandas
 scipy
-tqdm
 pyyaml
 matplotlib
-wget
-linear_attention_transformer
-scikit-learn  # 新增：用于R²、RMSE、MAE计算

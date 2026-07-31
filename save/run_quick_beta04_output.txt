@@ -1,4 +1,0 @@
-﻿配置文件: config/wind_scenario.yaml
-当前 beta_end: 0.04
-当前 schedule: quad
-设备: cpu

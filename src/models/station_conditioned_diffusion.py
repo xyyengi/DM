@@ -6,19 +6,62 @@ across stations; optional graph propagation is applied once at the bottleneck.
 
 from __future__ import annotations
 
+import math
 from typing import Mapping, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .v5_conditioned_diffusion import (
-    DiffusionTimestepEmbedding,
-    _group_count,
-)
-
 
 SPATIAL_MODES = {"none", "fixed_graph", "type_gated_graph"}
+
+
+def _group_count(channels: int, requested: int) -> int:
+    """Choose the largest valid GroupNorm divisor up to ``requested``."""
+    for groups in range(min(int(requested), int(channels)), 0, -1):
+        if channels % groups == 0:
+            return groups
+    return 1
+
+
+def _sinusoidal_embedding(
+    values: torch.Tensor,
+    dimension: int,
+    max_period: float = 10000.0,
+) -> torch.Tensor:
+    if dimension < 2:
+        raise ValueError(f"sinusoidal embedding dimension must be >=2, got {dimension}")
+    half = dimension // 2
+    exponent = -math.log(max_period) * torch.arange(
+        half, dtype=torch.float32, device=values.device
+    ) / max(half - 1, 1)
+    frequencies = torch.exp(exponent)
+    angles = values.float().unsqueeze(-1) * frequencies
+    embedding = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+    if dimension % 2:
+        embedding = F.pad(embedding, (0, 1))
+    return embedding
+
+
+class DiffusionTimestepEmbedding(nn.Module):
+    """Embed the reverse-diffusion timestep independently of real time."""
+
+    def __init__(self, embedding_dim: int, output_dim: int):
+        super().__init__()
+        self.embedding_dim = int(embedding_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.embedding_dim, output_dim),
+            nn.SiLU(),
+            nn.Linear(output_dim, output_dim),
+        )
+
+    def forward(self, timestep: torch.Tensor) -> torch.Tensor:
+        if timestep.ndim != 1:
+            raise ValueError(
+                f"diffusion timestep must be [B], got {tuple(timestep.shape)}"
+            )
+        return self.mlp(_sinusoidal_embedding(timestep, self.embedding_dim))
 
 
 def _normalize_adjacency(adjacency: torch.Tensor) -> torch.Tensor:

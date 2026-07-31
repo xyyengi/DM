@@ -1,5 +1,5 @@
-"""Model construction entry points for legacy V4 and explicit V5 architectures."""
+"""Model entry points for the 24-station wind/solar experiment branch."""
 
-from .factory import build_model, load_model_checkpoint, resolve_architecture
+from .station_conditioned_diffusion import Station24DiffusionModel
 
-__all__ = ["build_model", "load_model_checkpoint", "resolve_architecture"]
+__all__ = ["Station24DiffusionModel"]
