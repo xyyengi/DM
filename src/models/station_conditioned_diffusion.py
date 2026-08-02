@@ -83,7 +83,7 @@ def _restore_stations(value: torch.Tensor, batch: int, stations: int) -> torch.T
 
 
 class StationConditionEncoder(nn.Module):
-    """Encode local forecast, temporal marks, lead marks, and station metadata."""
+    """Encode forecast plus optional ramp, revision, and recent-error context."""
 
     def __init__(
         self,
@@ -91,11 +91,29 @@ class StationConditionEncoder(nn.Module):
         station_count: int,
         station_feature_dim: int,
         groups: int,
+        condition_config: Mapping[str, object] | None = None,
     ) -> None:
         super().__init__()
+        condition_config = dict(condition_config or {})
         channels = tuple(int(value) for value in channels)
         stem_channels = channels[0]
         self.station_count = int(station_count)
+        self.use_forecast_ramps = bool(
+            condition_config.get("use_forecast_ramps", False)
+        )
+        self.use_forecast_revision = bool(
+            condition_config.get("use_forecast_revision", False)
+        )
+        self.use_recent_error = bool(
+            condition_config.get("use_recent_error", False)
+        )
+        self.forecast_ramp_lags = tuple(
+            int(value)
+            for value in condition_config.get("forecast_ramp_lags", [1, 3, 6])
+        )
+        self.recent_error_hours = int(
+            condition_config.get("recent_error_hours", 24)
+        )
         self.forecast_stem = nn.Conv1d(1, stem_channels, kernel_size=3, padding=1)
         self.temporal_stem = nn.Conv1d(10, stem_channels, kernel_size=3, padding=1)
         self.station_feature_projection = nn.Linear(station_feature_dim, stem_channels)
@@ -105,6 +123,39 @@ class StationConditionEncoder(nn.Module):
             nn.GroupNorm(_group_count(stem_channels, groups), stem_channels),
             nn.SiLU(),
         )
+        self.extra_stems = nn.ModuleDict()
+        self.extra_norms = nn.ModuleDict()
+        self.condition_gates = nn.ParameterDict()
+        gate_init = float(condition_config.get("condition_gate_init", -1.0))
+        if self.use_forecast_ramps:
+            self.extra_stems["ramp"] = nn.Conv1d(
+                len(self.forecast_ramp_lags), stem_channels, kernel_size=3, padding=1
+            )
+            self.extra_norms["ramp"] = nn.GroupNorm(
+                _group_count(stem_channels, groups), stem_channels
+            )
+            self.condition_gates["ramp"] = nn.Parameter(torch.tensor(gate_init))
+        if self.use_forecast_revision:
+            self.extra_stems["revision"] = nn.Conv1d(
+                2, stem_channels, kernel_size=3, padding=1
+            )
+            self.extra_norms["revision"] = nn.GroupNorm(
+                _group_count(stem_channels, groups), stem_channels
+            )
+            self.condition_gates["revision"] = nn.Parameter(torch.tensor(gate_init))
+        if self.use_recent_error:
+            self.extra_stems["recent_error"] = nn.Sequential(
+                nn.Conv1d(1, stem_channels, kernel_size=3, padding=1),
+                nn.SiLU(),
+                nn.Conv1d(stem_channels, stem_channels, kernel_size=3, padding=1),
+                nn.SiLU(),
+            )
+            self.extra_norms["recent_error"] = nn.GroupNorm(
+                _group_count(stem_channels, groups), stem_channels
+            )
+            self.condition_gates["recent_error"] = nn.Parameter(
+                torch.tensor(gate_init)
+            )
         self.down_blocks = nn.ModuleList()
         for in_channels, out_channels in zip(channels[:-1], channels[1:]):
             self.down_blocks.append(
@@ -128,6 +179,11 @@ class StationConditionEncoder(nn.Module):
         calendar: torch.Tensor,
         lead: torch.Tensor,
         station_features: torch.Tensor,
+        forecast_ramps: torch.Tensor | None = None,
+        forecast_revision: torch.Tensor | None = None,
+        revision_mask: torch.Tensor | None = None,
+        recent_error: torch.Tensor | None = None,
+        recent_error_mask: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
         if forecast.ndim != 3:
             raise ValueError(f"forecast must be [B,S,L], got {tuple(forecast.shape)}")
@@ -153,11 +209,67 @@ class StationConditionEncoder(nn.Module):
         station = station.reshape(batch * stations, station.shape[2], length)
 
         feature = self.fuse(torch.cat([local, temporal, station], dim=1))
+        extras: dict[str, torch.Tensor] = {}
+        if self.use_forecast_ramps:
+            expected = (batch, stations, len(self.forecast_ramp_lags), length)
+            if forecast_ramps is None or forecast_ramps.shape != expected:
+                raise ValueError(
+                    f"forecast_ramps must be {expected}, got "
+                    f"{None if forecast_ramps is None else tuple(forecast_ramps.shape)}"
+                )
+            extras["ramp"] = self.extra_stems["ramp"](
+                forecast_ramps.reshape(
+                    batch * stations, len(self.forecast_ramp_lags), length
+                )
+            )
+        if self.use_forecast_revision:
+            expected = (batch, stations, length)
+            if (
+                forecast_revision is None
+                or revision_mask is None
+                or forecast_revision.shape != expected
+                or revision_mask.shape != expected
+            ):
+                raise ValueError("forecast_revision/revision_mask must be [B,S,L]")
+            revision_input = torch.stack(
+                [forecast_revision, revision_mask], dim=2
+            ).reshape(batch * stations, 2, length)
+            extras["revision"] = self.extra_stems["revision"](revision_input)
+        if self.use_recent_error:
+            expected_error = (batch, stations, self.recent_error_hours)
+            expected_mask = (batch, stations, 1)
+            if (
+                recent_error is None
+                or recent_error_mask is None
+                or recent_error.shape != expected_error
+                or recent_error_mask.shape != expected_mask
+            ):
+                raise ValueError(
+                    "recent_error must be [B,S,H] and recent_error_mask [B,S,1]"
+                )
+            recent = self.extra_stems["recent_error"](
+                recent_error.reshape(batch * stations, 1, self.recent_error_hours)
+            )
+            recent = 0.5 * (recent.mean(dim=-1) + recent[:, :, -1])
+            recent = recent * recent_error_mask.reshape(batch * stations, 1)
+            extras["recent_error"] = recent[:, :, None].expand(-1, -1, length)
+
+        for name, extra in extras.items():
+            normalized = self.extra_norms[name](extra)
+            feature = feature + torch.sigmoid(self.condition_gates[name]) * F.silu(
+                normalized
+            )
         outputs = [_restore_stations(feature, batch, stations)]
         for block in self.down_blocks:
             feature = block(feature)
             outputs.append(_restore_stations(feature, batch, stations))
         return outputs
+
+    def gate_values(self) -> dict[str, float]:
+        return {
+            name: float(torch.sigmoid(value.detach()).cpu())
+            for name, value in self.condition_gates.items()
+        }
 
 
 class StationResBlock(nn.Module):
@@ -336,6 +448,7 @@ class StationConditionalResUNet1D(nn.Module):
             self.station_count,
             int(station_features.shape[1]),
             groups,
+            condition_config=config,
         )
         self.state_stem = nn.Conv1d(1, self.channels[0], kernel_size=3, padding=1)
         self.encoder_blocks = nn.ModuleList(
@@ -418,6 +531,11 @@ class StationConditionalResUNet1D(nn.Module):
         forecast: torch.Tensor,
         calendar: torch.Tensor,
         lead: torch.Tensor,
+        forecast_ramps: torch.Tensor | None = None,
+        forecast_revision: torch.Tensor | None = None,
+        revision_mask: torch.Tensor | None = None,
+        recent_error: torch.Tensor | None = None,
+        recent_error_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if noisy_residual.shape[1:] != (self.station_count, self.sequence_length):
             raise ValueError(
@@ -427,7 +545,15 @@ class StationConditionalResUNet1D(nn.Module):
         batch, stations, length = noisy_residual.shape
         time_embedding = self.timestep_embedding(timestep)
         conditions = self.condition_encoder(
-            forecast, calendar, lead, self.station_features
+            forecast,
+            calendar,
+            lead,
+            self.station_features,
+            forecast_ramps=forecast_ramps,
+            forecast_revision=forecast_revision,
+            revision_mask=revision_mask,
+            recent_error=recent_error,
+            recent_error_mask=recent_error_mask,
         )
         hidden = self.state_stem(noisy_residual.reshape(batch * stations, 1, length))
         hidden = _restore_stations(hidden, batch, stations)
@@ -502,6 +628,11 @@ class StationGaussianDiffusion(nn.Module):
         calendar: torch.Tensor,
         lead: torch.Tensor,
         valid_mask: torch.Tensor,
+        forecast_ramps: torch.Tensor | None = None,
+        forecast_revision: torch.Tensor | None = None,
+        revision_mask: torch.Tensor | None = None,
+        recent_error: torch.Tensor | None = None,
+        recent_error_mask: torch.Tensor | None = None,
         timestep: torch.Tensor | None = None,
         noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -510,7 +641,18 @@ class StationGaussianDiffusion(nn.Module):
                 0, self.num_steps, (clean.shape[0],), device=clean.device
             )
         noisy, noise = self.add_noise(clean, timestep.long(), noise=noise)
-        prediction = self.denoiser(noisy, timestep.long(), forecast, calendar, lead)
+        prediction = self.denoiser(
+            noisy,
+            timestep.long(),
+            forecast,
+            calendar,
+            lead,
+            forecast_ramps=forecast_ramps,
+            forecast_revision=forecast_revision,
+            revision_mask=revision_mask,
+            recent_error=recent_error,
+            recent_error_mask=recent_error_mask,
+        )
         squared_error = (prediction - noise) ** 2
         valid_mask = valid_mask.to(squared_error.dtype)
         return (squared_error * valid_mask).sum() / valid_mask.sum().clamp(min=1.0)
@@ -532,9 +674,23 @@ class StationGaussianDiffusion(nn.Module):
         forecast: torch.Tensor,
         calendar: torch.Tensor,
         lead: torch.Tensor,
+        forecast_ramps: torch.Tensor | None = None,
+        forecast_revision: torch.Tensor | None = None,
+        revision_mask: torch.Tensor | None = None,
+        recent_error: torch.Tensor | None = None,
+        recent_error_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         predicted_noise = self.denoiser(
-            noisy, timestep, forecast, calendar, lead
+            noisy,
+            timestep,
+            forecast,
+            calendar,
+            lead,
+            forecast_ramps=forecast_ramps,
+            forecast_revision=forecast_revision,
+            revision_mask=revision_mask,
+            recent_error=recent_error,
+            recent_error_mask=recent_error_mask,
         )
         alpha = self.alpha[timestep].view(-1, 1, 1)
         alpha_hat = self.alpha_hat[timestep].view(-1, 1, 1)
@@ -552,12 +708,32 @@ class StationGaussianDiffusion(nn.Module):
         calendar: torch.Tensor,
         lead: torch.Tensor,
         n_samples: int,
+        forecast_ramps: torch.Tensor | None = None,
+        forecast_revision: torch.Tensor | None = None,
+        revision_mask: torch.Tensor | None = None,
+        recent_error: torch.Tensor | None = None,
+        recent_error_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, stations, length = forecast.shape
         n_samples = int(n_samples)
         forecast = forecast.repeat_interleave(n_samples, dim=0)
         calendar = calendar.repeat_interleave(n_samples, dim=0)
         lead = lead.repeat_interleave(n_samples, dim=0)
+        optional_conditions = {
+            "forecast_ramps": forecast_ramps,
+            "forecast_revision": forecast_revision,
+            "revision_mask": revision_mask,
+            "recent_error": recent_error,
+            "recent_error_mask": recent_error_mask,
+        }
+        optional_conditions = {
+            name: (
+                value.repeat_interleave(n_samples, dim=0)
+                if value is not None
+                else None
+            )
+            for name, value in optional_conditions.items()
+        }
         noisy = torch.randn(
             batch * n_samples,
             stations,
@@ -568,7 +744,14 @@ class StationGaussianDiffusion(nn.Module):
             timestep = torch.full(
                 (batch * n_samples,), step, device=forecast.device, dtype=torch.long
             )
-            noisy = self.denoise_step(noisy, timestep, forecast, calendar, lead)
+            noisy = self.denoise_step(
+                noisy,
+                timestep,
+                forecast,
+                calendar,
+                lead,
+                **optional_conditions,
+            )
         return noisy.reshape(batch, n_samples, stations, length)
 
 
@@ -599,6 +782,10 @@ class Station24DiffusionModel(nn.Module):
     def spatial_mode(self) -> str:
         return self.denoiser.spatial_mode
 
+    @property
+    def condition_gate_values(self) -> dict[str, float]:
+        return self.denoiser.condition_encoder.gate_values()
+
     def forward(
         self,
         batch: Mapping[str, torch.Tensor],
@@ -611,6 +798,11 @@ class Station24DiffusionModel(nn.Module):
             batch["calendar"],
             batch["lead"],
             batch["valid_mask"],
+            forecast_ramps=batch.get("forecast_ramps"),
+            forecast_revision=batch.get("forecast_revision"),
+            revision_mask=batch.get("revision_mask"),
+            recent_error=batch.get("recent_error"),
+            recent_error_mask=batch.get("recent_error_mask"),
             timestep=timestep,
             noise=noise,
         )
@@ -621,5 +813,13 @@ class Station24DiffusionModel(nn.Module):
         n_samples: int,
     ) -> torch.Tensor:
         return self.diffusion.sample(
-            batch["forecast"], batch["calendar"], batch["lead"], n_samples
+            batch["forecast"],
+            batch["calendar"],
+            batch["lead"],
+            n_samples,
+            forecast_ramps=batch.get("forecast_ramps"),
+            forecast_revision=batch.get("forecast_revision"),
+            revision_mask=batch.get("revision_mask"),
+            recent_error=batch.get("recent_error"),
+            recent_error_mask=batch.get("recent_error_mask"),
         )

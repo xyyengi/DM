@@ -73,11 +73,35 @@ def load_results(paths: list[str]) -> dict[str, dict[str, object]]:
     return results
 
 
+def array_source(result: dict[str, object]) -> Path:
+    path = result["path"]
+    if (path / "actual_data_normalized.npy").is_file():
+        return path
+    metrics = result["metrics"]
+    reevaluation = metrics.get("reevaluation", {})
+    source = reevaluation.get("source_result_dir")
+    if source:
+        source_path = Path(source)
+        if (source_path / "actual_data_normalized.npy").is_file():
+            return source_path
+    raise FileNotFoundError(f"cannot locate saved scenario arrays for {path}")
+
+
 def build_summary(results: dict[str, dict[str, object]]) -> pd.DataFrame:
     rows = []
     for mode in ORDER:
         metrics = results[mode]["metrics"]
         joint = metrics["joint"]
+        solar_scope = (
+            "solar_daylight"
+            if "solar_daylight" in metrics["station_average"]
+            else "solar"
+        )
+        aggregate_solar_scope = (
+            "solar_daylight"
+            if "solar_daylight" in metrics["aggregate_mw"]
+            else "solar"
+        )
         row = {
             "spatial_mode": mode,
             "label": LABELS[mode],
@@ -86,24 +110,29 @@ def build_summary(results: dict[str, dict[str, object]]) -> pd.DataFrame:
                 metrics["run"]["checkpoint_validation_mse"]
             ),
             "wind_crps": nested(metrics, "station_average", "wind", "crps"),
-            "solar_crps": nested(metrics, "station_average", "solar", "crps"),
+            "solar_crps": nested(
+                metrics, "station_average", solar_scope, "crps"
+            ),
             "wind_coverage_90": nested(
                 metrics, "station_average", "wind", "coverage_90"
             ),
             "solar_coverage_90": nested(
-                metrics, "station_average", "solar", "coverage_90"
+                metrics, "station_average", solar_scope, "coverage_90"
             ),
             "wind_width_90": nested(
                 metrics, "station_average", "wind", "width_90"
             ),
             "solar_width_90": nested(
-                metrics, "station_average", "solar", "width_90"
+                metrics, "station_average", solar_scope, "width_90"
             ),
             "renewable_mw_crps": nested(
                 metrics, "aggregate_mw", "renewable", "crps"
             ),
             "renewable_mw_coverage_90": nested(
                 metrics, "aggregate_mw", "renewable", "coverage_90"
+            ),
+            "solar_mw_coverage_90": nested(
+                metrics, "aggregate_mw", aggregate_solar_scope, "coverage_90"
             ),
             "energy_score_pu": float(joint["energy_score_pu"]),
             "variogram_score": float(joint["adjacency_variogram_score"]),
@@ -118,6 +147,18 @@ def build_summary(results: dict[str, dict[str, object]]) -> pd.DataFrame:
                 metrics, "physical", "raw_above_one_rate"
             ),
         }
+        for level in [80, 90, 95]:
+            for prefix, scope in [
+                ("wind", ("station_average", "wind")),
+                ("solar", ("station_average", solar_scope)),
+                ("renewable_mw", ("aggregate_mw", "renewable")),
+                ("solar_mw", ("aggregate_mw", aggregate_solar_scope)),
+            ]:
+                key = f"coverage_{level}"
+                if key in metrics[scope[0]][scope[1]]:
+                    row[f"{prefix}_coverage_{level}"] = nested(
+                        metrics, scope[0], scope[1], key
+                    )
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -176,12 +217,50 @@ def plot_joint(summary: pd.DataFrame, output: Path) -> None:
     plt.close(fig)
 
 
+def plot_interval_coverage(summary: pd.DataFrame, output: Path) -> None:
+    levels = [80, 90, 95]
+    if not all(f"wind_coverage_{level}" in summary for level in levels):
+        return
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.6), sharey=True)
+    x = np.arange(len(summary))
+    width = 0.22
+    for axis, prefix, title in [
+        (axes[0], "wind", "Wind stations"),
+        (axes[1], "solar", "Solar stations (daylight)"),
+        (axes[2], "renewable_mw", "Aggregated renewable MW"),
+    ]:
+        for offset, level, color in zip(
+            [-width, 0.0, width], levels, ["#90be6d", "#277da1", "#f94144"], strict=True
+        ):
+            axis.bar(
+                x + offset,
+                summary[f"{prefix}_coverage_{level}"],
+                width,
+                label=f"{level}% interval",
+                color=color,
+            )
+            axis.axhline(level / 100.0, color=color, linestyle=":", linewidth=0.8)
+        axis.set_xticks(x)
+        axis.set_xticklabels(summary.label, rotation=15, ha="right")
+        axis.set_title(title)
+        axis.set_ylim(0.0, 1.0)
+        axis.grid(axis="y", alpha=0.25)
+    axes[0].set_ylabel("Empirical coverage")
+    axes[2].legend(frameon=False, fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_lead(results: dict[str, dict[str, object]], output: Path) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), sharex=True)
     for axis, station_type in zip(axes, ["wind", "solar"], strict=True):
         for mode in ORDER:
             lead = results[mode]["lead"]
-            subset = lead.loc[lead.station_type.eq(station_type)].sort_values("lead_day")
+            scope = station_type
+            if station_type == "solar" and lead.station_type.eq("solar_daylight").any():
+                scope = "solar_daylight"
+            subset = lead.loc[lead.station_type.eq(scope)].sort_values("lead_day")
             axis.plot(
                 subset.lead_day,
                 subset.crps,
@@ -211,7 +290,7 @@ def plot_typical_scenarios(
     stations: pd.DataFrame,
     output: Path,
 ) -> int:
-    base_path = results["none"]["path"]
+    base_path = array_source(results["none"])
     actual = np.load(base_path / "actual_data_normalized.npy")
     forecast = np.load(base_path / "forecast_data_normalized.npy")
     typical = select_typical_issue(actual, forecast)
@@ -219,7 +298,7 @@ def plot_typical_scenarios(
     types = stations.data_type.to_numpy()
     fig, axes = plt.subplots(3, 2, figsize=(15, 11), sharex=True)
     for row, mode in enumerate(ORDER):
-        path = results[mode]["path"]
+        path = array_source(results[mode])
         scenarios = np.load(path / "actual_scenarios_normalized.npy", mmap_mode="r")
         for column, station_type in enumerate(["wind", "solar"]):
             indices = np.flatnonzero(types == station_type)
@@ -318,6 +397,7 @@ def main() -> None:
         "channel_index"
     ).reset_index(drop=True)
     plot_marginal(summary, figure_dir / "marginal_metrics.png")
+    plot_interval_coverage(summary, figure_dir / "interval_coverage_80_90_95.png")
     plot_joint(summary, figure_dir / "joint_metrics.png")
     plot_lead(results, figure_dir / "lead_crps.png")
     typical = plot_typical_scenarios(

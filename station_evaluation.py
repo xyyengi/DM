@@ -10,6 +10,13 @@ import pandas as pd
 from scipy.spatial.distance import pdist
 
 
+DEFAULT_INTERVAL_LEVELS = (0.80, 0.90, 0.95)
+
+
+def _mean_or_zero(values: np.ndarray) -> float:
+    return float(np.mean(values)) if values.size else 0.0
+
+
 def ensemble_crps(samples: np.ndarray, actual: np.ndarray) -> float:
     """Ensemble CRPS with samples on axis 1, using an O(K log K) formula."""
     samples = np.asarray(samples, dtype=np.float64)
@@ -52,18 +59,50 @@ def point_metrics(samples: np.ndarray, actual: np.ndarray) -> tuple[float, float
     return float(np.mean(np.abs(error))), float(np.sqrt(np.mean(error**2)))
 
 
-def metric_bundle(samples: np.ndarray, actual: np.ndarray) -> dict[str, float]:
-    coverage, width, below, above = interval_metrics(samples, actual, nominal=0.90)
+def _select_valid_points(
+    samples: np.ndarray,
+    actual: np.ndarray,
+    valid_mask: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    if valid_mask is None:
+        return samples, actual
+    valid_mask = np.asarray(valid_mask, dtype=bool)
+    if valid_mask.shape != actual.shape:
+        raise ValueError("valid_mask must have the same shape as actual")
+    if not np.any(valid_mask):
+        raise ValueError("valid_mask does not select any evaluation points")
+    # Move the member axis behind the observation axes so the observation mask
+    # selects the same points from every ensemble member.
+    selected_samples = np.moveaxis(samples, 1, -1)[valid_mask]
+    selected_actual = actual[valid_mask]
+    return selected_samples, selected_actual
+
+
+def metric_bundle(
+    samples: np.ndarray,
+    actual: np.ndarray,
+    interval_levels: tuple[float, ...] = DEFAULT_INTERVAL_LEVELS,
+    valid_mask: np.ndarray | None = None,
+) -> dict[str, float]:
+    samples, actual = _select_valid_points(samples, actual, valid_mask)
     mae, rmse = point_metrics(samples, actual)
-    return {
+    result = {
         "crps": ensemble_crps(samples, actual),
-        "coverage_90": coverage,
-        "width_90": width,
-        "below_90": below,
-        "above_90": above,
         "scenario_mean_mae": mae,
         "scenario_mean_rmse": rmse,
     }
+    for nominal in interval_levels:
+        if not 0.0 < nominal < 1.0:
+            raise ValueError(f"interval level must be in (0, 1), got {nominal}")
+        label = str(int(round(100 * nominal)))
+        coverage, width, below, above = interval_metrics(
+            samples, actual, nominal=nominal
+        )
+        result[f"coverage_{label}"] = coverage
+        result[f"width_{label}"] = width
+        result[f"below_{label}"] = below
+        result[f"above_{label}"] = above
+    return result
 
 
 def energy_score(samples: np.ndarray, actual: np.ndarray) -> float:
@@ -166,6 +205,82 @@ def temporal_metrics(
     return result
 
 
+def ramp_metric_bundle(
+    samples: np.ndarray,
+    actual: np.ndarray,
+    lag: int,
+    interval_levels: tuple[float, ...],
+    valid_mask: np.ndarray | None = None,
+) -> dict[str, float]:
+    scenario_ramp = samples[:, :, lag:, ...] - samples[:, :, :-lag, ...]
+    actual_ramp = actual[:, lag:, ...] - actual[:, :-lag, ...]
+    ramp_mask = None
+    if valid_mask is not None:
+        ramp_mask = valid_mask[:, lag:, ...] & valid_mask[:, :-lag, ...]
+    return metric_bundle(
+        scenario_ramp,
+        actual_ramp,
+        interval_levels=interval_levels,
+        valid_mask=ramp_mask,
+    )
+
+
+def extreme_ramp_metric_bundle(
+    samples: np.ndarray,
+    actual: np.ndarray,
+    lag: int,
+    interval_levels: tuple[float, ...],
+    valid_mask: np.ndarray | None = None,
+    quantile: float = 0.90,
+) -> dict[str, float]:
+    scenario_ramp = samples[:, :, lag:, ...] - samples[:, :, :-lag, ...]
+    actual_ramp = actual[:, lag:, ...] - actual[:, :-lag, ...]
+    candidate = np.ones_like(actual_ramp, dtype=bool)
+    if valid_mask is not None:
+        candidate &= valid_mask[:, lag:, ...] & valid_mask[:, :-lag, ...]
+    threshold = float(np.quantile(np.abs(actual_ramp[candidate]), quantile))
+    extreme_mask = candidate & (np.abs(actual_ramp) >= threshold)
+    result = metric_bundle(
+        scenario_ramp,
+        actual_ramp,
+        interval_levels=interval_levels,
+        valid_mask=extreme_mask,
+    )
+    result["absolute_ramp_threshold"] = threshold
+    result["selected_point_count"] = int(np.sum(extreme_mask))
+    return result
+
+
+def daily_peak_metric_bundle(
+    samples: np.ndarray,
+    actual: np.ndarray,
+    interval_levels: tuple[float, ...],
+) -> dict[str, float]:
+    if actual.shape[1] != 168:
+        raise ValueError("daily peak evaluation expects a 168-hour window")
+    issue_count, member_count = samples.shape[:2]
+    actual_days = actual.reshape(issue_count, 7, 24)
+    peak_hour = np.argmax(actual_days, axis=2)
+    issue_index = np.repeat(np.arange(issue_count), 7)
+    day_index = np.tile(np.arange(7), issue_count)
+    hour_index = peak_hour.reshape(-1) + day_index * 24
+    peak_actual = actual[issue_index, hour_index]
+    peak_samples = samples[issue_index, :, hour_index].reshape(-1, member_count)
+    result = metric_bundle(
+        peak_samples, peak_actual, interval_levels=interval_levels
+    )
+    result["peak_count"] = int(peak_actual.size)
+    for level in interval_levels:
+        label = int(round(100 * level))
+        upper = np.quantile(peak_samples, (1.0 + level) / 2.0, axis=1)
+        exceedance = np.maximum(peak_actual - upper, 0.0)
+        result[f"upper_exceedance_mean_{label}"] = float(np.mean(exceedance))
+        result[f"upper_exceedance_mean_when_missed_{label}"] = _mean_or_zero(
+            exceedance[exceedance > 0]
+        )
+    return result
+
+
 def evaluate_station_scenarios(
     samples: np.ndarray,
     raw_samples: np.ndarray,
@@ -173,6 +288,8 @@ def evaluate_station_scenarios(
     forecast: np.ndarray,
     stations: pd.DataFrame,
     adjacency: np.ndarray,
+    daylight_mask: np.ndarray | None = None,
+    interval_levels: tuple[float, ...] = DEFAULT_INTERVAL_LEVELS,
 ) -> tuple[dict[str, object], pd.DataFrame, pd.DataFrame]:
     """Evaluate arrays shaped samples=[N,K,T,S], actual/forecast=[N,T,S]."""
     if samples.ndim != 4 or actual.ndim != 3:
@@ -183,12 +300,41 @@ def evaluate_station_scenarios(
         raise ValueError("raw/projected/forecast shapes do not align")
     station_types = stations.data_type.to_numpy()
     capacities = stations.capacity_mw.to_numpy(dtype=np.float64)
+    if daylight_mask is not None:
+        daylight_mask = np.asarray(daylight_mask, dtype=bool)
+        if daylight_mask.shape != actual.shape:
+            raise ValueError("daylight_mask must have shape [N,T,S]")
+
+    interval_metric_names = [
+        f"{metric}_{int(round(100 * level))}"
+        for level in interval_levels
+        for metric in ["coverage", "width", "below", "above"]
+    ]
+    summary_metric_names = [
+        "crps",
+        *interval_metric_names,
+        "scenario_mean_mae",
+        "scenario_mean_rmse",
+    ]
 
     station_rows = []
     for station_index, station in stations.iterrows():
         metrics = metric_bundle(
-            samples[:, :, :, station_index], actual[:, :, station_index]
+            samples[:, :, :, station_index],
+            actual[:, :, station_index],
+            interval_levels=interval_levels,
         )
+        daylight_metrics = {}
+        if station.data_type == "solar" and daylight_mask is not None:
+            values = metric_bundle(
+                samples[:, :, :, station_index],
+                actual[:, :, station_index],
+                interval_levels=interval_levels,
+                valid_mask=daylight_mask[:, :, station_index],
+            )
+            daylight_metrics = {
+                f"{name}_daylight": value for name, value in values.items()
+            }
         station_rows.append(
             {
                 "channel_index": int(station.channel_index),
@@ -196,6 +342,7 @@ def evaluate_station_scenarios(
                 "station_type": station.data_type,
                 "station_name": station.FARM_NAME,
                 **metrics,
+                **daylight_metrics,
             }
         )
     station_frame = pd.DataFrame(station_rows)
@@ -211,10 +358,28 @@ def evaluate_station_scenarios(
             metrics = metric_bundle(
                 samples[:, :, hour_slice, :][:, :, :, station_indices],
                 actual[:, hour_slice, :][:, :, station_indices],
+                interval_levels=interval_levels,
             )
             lead_rows.append(
                 {
                     "station_type": station_type,
+                    "lead_day": lead_day,
+                    **metrics,
+                }
+            )
+    if daylight_mask is not None:
+        for lead_day in range(1, 8):
+            hour_slice = slice((lead_day - 1) * 24, lead_day * 24)
+            station_indices = np.flatnonzero(station_types == "solar")
+            metrics = metric_bundle(
+                samples[:, :, hour_slice, :][:, :, :, station_indices],
+                actual[:, hour_slice, :][:, :, station_indices],
+                interval_levels=interval_levels,
+                valid_mask=daylight_mask[:, hour_slice, :][:, :, station_indices],
+            )
+            lead_rows.append(
+                {
+                    "station_type": "solar_daylight",
                     "lead_day": lead_day,
                     **metrics,
                 }
@@ -227,9 +392,13 @@ def evaluate_station_scenarios(
             "actual": list(actual.shape),
             "forecast": list(forecast.shape),
         },
+        "interval_levels": list(interval_levels),
         "station_average": {},
         "aggregate_mw": {},
         "joint": {},
+        "ramps": {},
+        "extreme_ramps": {},
+        "extreme_high_daily_peak_mw": {},
         "physical": {
             "raw_below_zero_rate": float(np.mean(raw_samples < 0)),
             "raw_above_one_rate": float(np.mean(raw_samples > 1)),
@@ -237,6 +406,45 @@ def evaluate_station_scenarios(
             "projected_above_one_rate": float(np.mean(samples > 1)),
         },
     }
+    wind_indices = np.flatnonzero(station_types == "wind")
+    solar_indices = np.flatnonzero(station_types == "solar")
+    raw_wind = raw_samples[:, :, :, wind_indices]
+    summary["physical"].update(
+        {
+            "raw_wind_below_zero_rate": float(np.mean(raw_wind < 0)),
+            "raw_wind_above_one_rate": float(np.mean(raw_wind > 1)),
+        }
+    )
+    if daylight_mask is not None:
+        solar_daylight = daylight_mask[:, :, solar_indices]
+        raw_solar_by_point = np.moveaxis(
+            raw_samples[:, :, :, solar_indices], 1, -1
+        )
+        raw_solar_daylight = raw_solar_by_point[solar_daylight]
+        raw_solar_night = raw_solar_by_point[~solar_daylight]
+        actual_solar_night = actual[:, :, solar_indices][~solar_daylight]
+        summary["physical"].update(
+            {
+                "raw_solar_daylight_below_zero_rate": float(
+                    np.mean(raw_solar_daylight < 0)
+                ),
+                "raw_solar_daylight_above_one_rate": float(
+                    np.mean(raw_solar_daylight > 1)
+                ),
+                "raw_solar_night_nonzero_rate": _mean_or_zero(
+                    np.abs(raw_solar_night) > 1e-6
+                ),
+                "raw_solar_night_mean_absolute_pu": _mean_or_zero(
+                    np.abs(raw_solar_night)
+                ),
+                "actual_solar_night_positive_rate": _mean_or_zero(
+                    actual_solar_night > 0
+                ),
+                "actual_solar_night_mean_pu": _mean_or_zero(
+                    actual_solar_night
+                ),
+            }
+        )
     for station_type in ["wind", "solar", "all"]:
         subset = (
             station_frame
@@ -245,16 +453,47 @@ def evaluate_station_scenarios(
         )
         summary["station_average"][station_type] = {
             name: float(subset[name].mean())
-            for name in [
-                "crps",
-                "coverage_90",
-                "width_90",
-                "below_90",
-                "above_90",
-                "scenario_mean_mae",
-                "scenario_mean_rmse",
-            ]
+            for name in summary_metric_names
         }
+
+    if daylight_mask is not None:
+        summary["station_average"]["solar_daylight"] = metric_bundle(
+            samples[:, :, :, solar_indices],
+            actual[:, :, solar_indices],
+            interval_levels=interval_levels,
+            valid_mask=daylight_mask[:, :, solar_indices],
+        )
+
+    for station_type, station_indices in [
+        ("wind", np.flatnonzero(station_types == "wind")),
+        ("solar_daylight", np.flatnonzero(station_types == "solar")),
+    ]:
+        selected_samples = samples[:, :, :, station_indices]
+        selected_actual = actual[:, :, station_indices]
+        selected_mask = (
+            daylight_mask[:, :, station_indices]
+            if station_type == "solar_daylight" and daylight_mask is not None
+            else None
+        )
+        summary["ramps"][station_type] = {}
+        summary["extreme_ramps"][station_type] = {}
+        for lag in [1, 3, 6]:
+            summary["ramps"][station_type][f"lag_{lag}h"] = ramp_metric_bundle(
+                selected_samples,
+                selected_actual,
+                lag,
+                interval_levels,
+                valid_mask=selected_mask,
+            )
+            summary["extreme_ramps"][station_type][
+                f"lag_{lag}h"
+            ] = extreme_ramp_metric_bundle(
+                selected_samples,
+                selected_actual,
+                lag,
+                interval_levels,
+                valid_mask=selected_mask,
+            )
 
     for station_type in ["wind", "solar", "renewable"]:
         if station_type == "renewable":
@@ -270,8 +509,27 @@ def evaluate_station_scenarios(
             actual[:, :, station_indices] * selected_capacity[None, None, :], axis=-1
         )
         summary["aggregate_mw"][station_type] = metric_bundle(
-            scenario_mw, actual_mw
+            scenario_mw, actual_mw, interval_levels=interval_levels
         )
+        if station_type in {"wind", "solar"}:
+            peak_label = (
+                "solar_daylight" if station_type == "solar" else "wind"
+            )
+            summary["extreme_high_daily_peak_mw"][peak_label] = (
+                daily_peak_metric_bundle(
+                    scenario_mw, actual_mw, interval_levels=interval_levels
+                )
+            )
+        if station_type == "solar" and daylight_mask is not None:
+            aggregate_daylight = np.any(
+                daylight_mask[:, :, station_indices], axis=-1
+            )
+            summary["aggregate_mw"]["solar_daylight"] = metric_bundle(
+                scenario_mw,
+                actual_mw,
+                interval_levels=interval_levels,
+                valid_mask=aggregate_daylight,
+            )
 
     summary["joint"] = {
         "energy_score_pu": energy_score(samples, actual),

@@ -103,6 +103,7 @@ class StationForecastDataset(Dataset):
         data_dir: str | Path,
         split: str,
         residual_scale: Mapping[str, object],
+        condition_config: Mapping[str, object] | None = None,
     ) -> None:
         if split not in {"train", "val", "test"}:
             raise ValueError(f"unsupported split={split!r}")
@@ -115,6 +116,40 @@ class StationForecastDataset(Dataset):
         self.lead_mark = np.load(self.data_dir / f"{split}_lead_mark.npy")
         self.fill_mask = np.load(self.data_dir / f"{split}_fill_mask.npy")
         self.scale = validate_residual_scale(residual_scale)
+        self.condition_config = dict(condition_config or {})
+        self.ramp_lags = tuple(
+            int(value)
+            for value in self.condition_config.get("forecast_ramp_lags", [1, 3, 6])
+        )
+        if not self.ramp_lags or any(
+            lag <= 0 or lag >= EXPECTED_HOURS for lag in self.ramp_lags
+        ):
+            raise ValueError(f"invalid forecast_ramp_lags={self.ramp_lags}")
+        self.recent_error_hours = int(
+            self.condition_config.get("recent_error_hours", 24)
+        )
+        if not 1 <= self.recent_error_hours <= EXPECTED_HOURS:
+            raise ValueError("recent_error_hours must be between 1 and 168")
+        issue_frame = pd.read_csv(self.data_dir / f"{split}_issue_dates.csv")
+        if len(issue_frame) != len(self.forecast):
+            raise ValueError("issue date count does not match forecast sample count")
+        issue_days = pd.to_datetime(issue_frame["issue_date"]).dt.normalize()
+        lookup = {timestamp: index for index, timestamp in enumerate(issue_days)}
+        self.previous_issue_index = np.asarray(
+            [lookup.get(timestamp - pd.Timedelta(days=1), -1) for timestamp in issue_days],
+            dtype=np.int64,
+        )
+        self.condition_audit = {
+            "split": split,
+            "sample_count": int(len(self.forecast)),
+            "previous_issue_available_count": int(
+                np.sum(self.previous_issue_index >= 0)
+            ),
+            "revision_overlap_hours": 144,
+            "recent_error_hours": self.recent_error_hours,
+            "forecast_ramp_lags": list(self.ramp_lags),
+            "future_actual_used_as_condition": False,
+        }
         self._validate_shapes()
 
     def _validate_shapes(self) -> None:
@@ -153,6 +188,36 @@ class StationForecastDataset(Dataset):
         valid_mask = 1.0 - np.asarray(
             self.fill_mask[index], dtype=np.float32
         ).T.copy()
+        forecast_ramps = np.zeros(
+            (EXPECTED_STATIONS, len(self.ramp_lags), EXPECTED_HOURS),
+            dtype=np.float32,
+        )
+        for channel, lag in enumerate(self.ramp_lags):
+            forecast_ramps[:, channel, lag:] = (
+                forecast[:, lag:] - forecast[:, :-lag]
+            )
+
+        forecast_revision = np.zeros_like(forecast)
+        revision_mask = np.zeros_like(forecast)
+        recent_error = np.zeros(
+            (EXPECTED_STATIONS, self.recent_error_hours), dtype=np.float32
+        )
+        recent_error_mask = np.zeros((EXPECTED_STATIONS, 1), dtype=np.float32)
+        previous_index = int(self.previous_issue_index[index])
+        if previous_index >= 0:
+            overlap = EXPECTED_HOURS - 24
+            previous_forecast = np.asarray(
+                self.forecast[previous_index], dtype=np.float32
+            ).T
+            forecast_revision[:, :overlap] = (
+                forecast[:, :overlap] - previous_forecast[:, 24:]
+            )
+            revision_mask[:, :overlap] = 1.0
+            previous_residual = np.asarray(
+                self.residual[previous_index], dtype=np.float32
+            ).T
+            recent_error[:] = previous_residual[:, : self.recent_error_hours]
+            recent_error_mask[:] = 1.0
         return {
             "sample_index": torch.tensor(index, dtype=torch.long),
             "forecast": torch.from_numpy(forecast),
@@ -166,6 +231,11 @@ class StationForecastDataset(Dataset):
                 np.asarray(self.lead_mark[index], dtype=np.float32).T.copy()
             ),
             "valid_mask": torch.from_numpy(valid_mask),
+            "forecast_ramps": torch.from_numpy(forecast_ramps),
+            "forecast_revision": torch.from_numpy(forecast_revision),
+            "revision_mask": torch.from_numpy(revision_mask),
+            "recent_error": torch.from_numpy(recent_error),
+            "recent_error_mask": torch.from_numpy(recent_error_mask),
         }
 
 
@@ -241,8 +311,11 @@ def get_station_dataloader(
     batch_size: int,
     seed: int,
     num_workers: int = 0,
+    condition_config: Mapping[str, object] | None = None,
 ) -> tuple[DataLoader, StationForecastDataset]:
-    dataset = StationForecastDataset(data_dir, split, residual_scale)
+    dataset = StationForecastDataset(
+        data_dir, split, residual_scale, condition_config=condition_config
+    )
     generator = torch.Generator()
     split_offset = {"train": 0, "val": 10_000, "test": 20_000}[split]
     generator.manual_seed(int(seed) + split_offset)

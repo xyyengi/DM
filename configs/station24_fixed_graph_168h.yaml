@@ -59,6 +59,6 @@ evaluation:
   generation_seed: 424242
   issue_batch_size: 1
   member_chunk_size: 10
-  quantiles: [0.90]
+  quantiles: [0.80, 0.90, 0.95]
   physical_projection: "clip_0_1_and_station_astronomical_solar_night"
   test_locked: true

@@ -49,6 +49,11 @@ class Station24ModelTests(unittest.TestCase):
             "calendar": torch.randn(batch_size, 8, 16),
             "lead": torch.rand(batch_size, 2, 16),
             "valid_mask": torch.ones(batch_size, 24, 16),
+            "forecast_ramps": torch.randn(batch_size, 24, 3, 16),
+            "forecast_revision": torch.randn(batch_size, 24, 16),
+            "revision_mask": torch.ones(batch_size, 24, 16),
+            "recent_error": torch.randn(batch_size, 24, 24),
+            "recent_error_mask": torch.ones(batch_size, 24, 1),
         }
 
     def test_all_spatial_modes_forward_backward_and_sample(self):
@@ -80,6 +85,39 @@ class Station24ModelTests(unittest.TestCase):
             set(model.denoiser.spatial_block.gate_values()),
             {"wind_wind", "solar_solar", "wind_solar"},
         )
+
+    def test_condition_variants_forward_backward_and_sample(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        variants = {
+            "revision_ramp": (True, False, {"ramp", "revision"}),
+            "history_ramp": (False, True, {"ramp", "recent_error"}),
+            "revision_history_ramp": (
+                True,
+                True,
+                {"ramp", "revision", "recent_error"},
+            ),
+        }
+        for _, (use_revision, use_history, expected_gates) in variants.items():
+            config = self.config("fixed_graph")
+            config.update(
+                {
+                    "use_forecast_ramps": True,
+                    "forecast_ramp_lags": [1, 3, 6],
+                    "use_forecast_revision": use_revision,
+                    "use_recent_error": use_history,
+                    "recent_error_hours": 24,
+                    "condition_gate_init": -1.0,
+                }
+            )
+            model = Station24DiffusionModel(config, features, adjacency)
+            loss = model(self.batch())
+            self.assertTrue(torch.isfinite(loss))
+            loss.backward()
+            generated = model.generate(self.batch(batch_size=1), n_samples=2)
+            self.assertEqual(tuple(generated.shape), (1, 2, 24, 16))
+            self.assertEqual(set(model.condition_gate_values), expected_gates)
 
 
 class Station24DatasetTests(unittest.TestCase):
@@ -113,11 +151,12 @@ class Station24DatasetTests(unittest.TestCase):
             np.save(root / f"{split}_time_mark.npy", np.zeros((count, 168, 8), dtype=np.float32))
             np.save(root / f"{split}_lead_mark.npy", np.zeros((count, 168, 2), dtype=np.float32))
             np.save(root / f"{split}_fill_mask.npy", np.zeros((count, 168, 24), dtype=np.uint8))
+            issue_dates = pd.date_range("2025-01-01", periods=count, freq="D")
             pd.DataFrame(
                 {
-                    "issue_date": ["2025-01-01"] * count,
-                    "target_start": ["2025-01-01 00:00:00"] * count,
-                    "target_end": ["2025-01-07 23:00:00"] * count,
+                    "issue_date": issue_dates.strftime("%Y-%m-%d"),
+                    "target_start": issue_dates.strftime("%Y-%m-%d 00:00:00"),
+                    "target_end": (issue_dates + pd.Timedelta(days=6, hours=23)).strftime("%Y-%m-%d %H:%M:%S"),
                 }
             ).to_csv(
                 root / f"{split}_issue_dates.csv", index=False
@@ -141,6 +180,14 @@ class Station24DatasetTests(unittest.TestCase):
             self.assertEqual(tuple(item["forecast"].shape), (24, 168))
             self.assertEqual(tuple(item["calendar"].shape), (8, 168))
             self.assertEqual(tuple(item["lead"].shape), (2, 168))
+            self.assertEqual(tuple(item["forecast_ramps"].shape), (24, 3, 168))
+            self.assertEqual(tuple(item["forecast_revision"].shape), (24, 168))
+            self.assertEqual(tuple(item["recent_error"].shape), (24, 24))
+            train_dataset = StationForecastDataset(root, "train", scale)
+            conditioned = train_dataset[1]
+            self.assertEqual(float(conditioned["revision_mask"][:, :144].min()), 1.0)
+            self.assertEqual(float(conditioned["revision_mask"][:, 144:].max()), 0.0)
+            self.assertEqual(float(conditioned["recent_error_mask"].min()), 1.0)
             self.assertLess(
                 float(
                     torch.max(
@@ -297,6 +344,50 @@ class Station24DatasetTests(unittest.TestCase):
                 (comparison_dir / "figures" / "typical_scenario_envelopes.png").is_file()
             )
 
+            condition_inputs = []
+            for variant in [
+                "revision_ramp",
+                "history_ramp",
+                "revision_history_ramp",
+            ]:
+                copied = root / f"condition_{variant}"
+                shutil.copytree(output_dir, copied)
+                copied_metrics = json.loads(
+                    (copied / "metrics.json").read_text(encoding="utf-8")
+                )
+                copied_metrics["run"]["condition_variant"] = variant
+                copied_metrics["run"]["condition_gate_values"] = {}
+                (copied / "metrics.json").write_text(
+                    json.dumps(copied_metrics), encoding="utf-8"
+                )
+                condition_inputs.append(str(copied))
+            condition_comparison = root / "condition_comparison"
+            subprocess.run(
+                [
+                    sys.executable,
+                    "tools/compare_station24_condition_ablation.py",
+                    *condition_inputs,
+                    "--data-path",
+                    str(data_dir),
+                    "--output-dir",
+                    str(condition_comparison),
+                ],
+                check=True,
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+            )
+            self.assertTrue(
+                (condition_comparison / "comparison_summary.csv").is_file()
+            )
+            self.assertTrue(
+                (
+                    condition_comparison
+                    / "figures"
+                    / "ramp_and_extreme_metrics.png"
+                ).is_file()
+            )
+
 
 class Station24EvaluationTests(unittest.TestCase):
     def test_metrics_are_finite_and_perfect_interval_covers(self):
@@ -320,14 +411,26 @@ class Station24EvaluationTests(unittest.TestCase):
         adjacency[np.arange(23), np.arange(1, 24)] = 0.5
         adjacency[np.arange(1, 24), np.arange(23)] = 0.5
         metrics, station_frame, lead_frame = evaluate_station_scenarios(
-            samples, raw, actual, forecast, stations, adjacency
+            samples,
+            raw,
+            actual,
+            forecast,
+            stations,
+            adjacency,
+            daylight_mask=np.ones_like(actual, dtype=bool),
         )
         self.assertEqual(len(station_frame), 24)
-        self.assertEqual(len(lead_frame), 21)
+        self.assertEqual(len(lead_frame), 28)
         self.assertAlmostEqual(metrics["station_average"]["all"]["crps"], 0.0)
-        self.assertAlmostEqual(
-            metrics["station_average"]["all"]["coverage_90"], 1.0
-        )
+        for level in [80, 90, 95]:
+            self.assertAlmostEqual(
+                metrics["station_average"]["all"][f"coverage_{level}"], 1.0
+            )
+            self.assertAlmostEqual(
+                metrics["station_average"]["solar_daylight"][f"coverage_{level}"],
+                1.0,
+            )
+        self.assertIn("coverage_90_daylight", station_frame.columns)
         self.assertTrue(np.isfinite(metrics["joint"]["energy_score_pu"]))
 
 

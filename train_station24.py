@@ -145,6 +145,8 @@ def save_checkpoint(
         "residual_scale": dict(residual_scale),
         "config": copy.deepcopy(dict(config)),
         "spatial_gate_values": model.denoiser.spatial_block.gate_values(),
+        "condition_variant": str(config.get("experiment", {}).get("variant", "baseline")),
+        "condition_gate_values": model.condition_gate_values,
     }
     torch.save(payload, path)
 
@@ -213,21 +215,34 @@ def main() -> None:
         yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8"
     )
 
-    train_loader, _ = get_station_dataloader(
+    train_loader, train_dataset = get_station_dataloader(
         data_path,
         "train",
         residual_scale,
         batch_size=int(train_config["batch_size"]),
         seed=seed,
         num_workers=int(train_config.get("num_workers", 0)),
+        condition_config=config["model"],
     )
-    val_loader, _ = get_station_dataloader(
+    val_loader, val_dataset = get_station_dataloader(
         data_path,
         "val",
         residual_scale,
         batch_size=int(train_config["batch_size"]),
         seed=int(train_config.get("validation_seed", 314159)),
         num_workers=int(train_config.get("num_workers", 0)),
+        condition_config=config["model"],
+    )
+    (run_dir / "condition_feature_audit.json").write_text(
+        json.dumps(
+            {
+                "train": train_dataset.condition_audit,
+                "val": val_dataset.condition_audit,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
     )
     static = load_station_static_data(data_path)
     model = Station24DiffusionModel(
@@ -257,7 +272,9 @@ def main() -> None:
 
     print(
         f"MODEL architecture={model.architecture} spatial_mode={model.spatial_mode} "
-        f"parameters={parameter_count} trainable={trainable_count} device={device}"
+        f"condition_variant={config.get('experiment', {}).get('variant', 'baseline')} "
+        f"condition_gates={model.condition_gate_values} parameters={parameter_count} "
+        f"trainable={trainable_count} device={device}"
     )
     print(
         f"TRAIN samples={len(train_loader.dataset)} val={len(val_loader.dataset)} "
@@ -316,7 +333,8 @@ def main() -> None:
                 )
             print(
                 f"epoch={epoch:04d} train={train_loss:.7f} val={val_loss:.7f} "
-                f"best_epoch={best_epoch} gates={model.denoiser.spatial_block.gate_values()}"
+                f"best_epoch={best_epoch} spatial_gates={model.denoiser.spatial_block.gate_values()} "
+                f"condition_gates={model.condition_gate_values}"
             )
             if best_epoch and epoch - best_epoch >= patience:
                 history.append(row)
@@ -350,6 +368,10 @@ def main() -> None:
     final_record = {
         "architecture": model.architecture,
         "spatial_mode": model.spatial_mode,
+        "condition_variant": str(
+            config.get("experiment", {}).get("variant", "baseline")
+        ),
+        "condition_gate_values": model.condition_gate_values,
         "parameter_count": parameter_count,
         "best_epoch": best_epoch,
         "best_fixed_noise_validation_mse": best_val,

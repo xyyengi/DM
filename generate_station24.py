@@ -101,13 +101,14 @@ def main() -> None:
     model.load_state_dict(state, strict=True)
     model.eval()
 
-    loader, _ = get_station_dataloader(
+    loader, dataset = get_station_dataloader(
         data_path,
         args.split,
         residual_scale,
         batch_size=issue_batch_size,
         seed=seed,
         num_workers=0,
+        condition_config=config["model"],
     )
     daylight_mask, daylight_audit = build_station_daylight_mask(data_path, args.split)
     generated_standardized = []
@@ -176,6 +177,11 @@ def main() -> None:
         forecast_array,
         stations,
         adjacency,
+        daylight_mask=daylight_mask,
+        interval_levels=tuple(
+            float(value)
+            for value in evaluation_config.get("quantiles", [0.80, 0.90, 0.95])
+        ),
     )
     metrics["run"] = {
         "run_dir": str(run_dir),
@@ -186,6 +192,11 @@ def main() -> None:
         "spatial_mode": model.spatial_mode,
         "parameter_count": int(checkpoint["parameter_count"]),
         "spatial_gate_values": model.denoiser.spatial_block.gate_values(),
+        "condition_variant": str(
+            config.get("experiment", {}).get("variant", "baseline")
+        ),
+        "condition_gate_values": model.condition_gate_values,
+        "condition_feature_audit": dataset.condition_audit,
         "split": args.split,
         "n_samples": n_samples,
         "generation_seed": seed,

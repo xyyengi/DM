@@ -1,13 +1,14 @@
 experiment:
-  name: "station24_type_gated_graph_168h"
-  family: "station24_spatial_ablation"
-  description: "24-station conditional ResUNet with fixed geography and three type relation gates"
+  name: "station24_revision_ramp_168h"
+  family: "station24_condition_ablation"
+  variant: "revision_ramp"
+  description: "Fixed graph ResUNet with forecast ramps and forecast-vintage revisions"
 
 data:
   data_path: "./diffusion_input_station"
   station_count: 24
   sequence_length: 168
-  residual_definition: "actual_minus_forecast"
+  residual_definition: "actual_minus_current_forecast"
 
 target:
   type: "residual"
@@ -19,7 +20,7 @@ target:
 
 model:
   architecture: "station24_resunet"
-  spatial_mode: "type_gated_graph"
+  spatial_mode: "fixed_graph"
   spatial_gate_init: -1.0
   station_count: 24
   sequence_length: 168
@@ -34,6 +35,12 @@ model:
   beta_end: 0.04
   schedule: "linear"
   reverse_variance_type: "posterior"
+  use_forecast_ramps: true
+  forecast_ramp_lags: [1, 3, 6]
+  use_forecast_revision: true
+  use_recent_error: false
+  recent_error_hours: 24
+  condition_gate_init: -1.0
 
 train:
   batch_size: 8
@@ -62,3 +69,4 @@ evaluation:
   quantiles: [0.80, 0.90, 0.95]
   physical_projection: "clip_0_1_and_station_astronomical_solar_night"
   test_locked: true
+
