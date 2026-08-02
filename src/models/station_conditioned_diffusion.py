@@ -272,6 +272,93 @@ class StationConditionEncoder(nn.Module):
         }
 
 
+class StationStateEncoder(nn.Module):
+    """Lightweight multi-scale encoder for four causal state-v1 features."""
+
+    def __init__(
+        self,
+        state_channels: Sequence[int],
+        station_features: torch.Tensor,
+        station_capacities: torch.Tensor,
+        groups: int,
+        state_dim: int = 4,
+        global_gate_init: float = -1.0,
+    ) -> None:
+        super().__init__()
+        widths = tuple(int(value) for value in state_channels)
+        if not widths or any(value <= 0 for value in widths):
+            raise ValueError(f"invalid state_channels={widths}")
+        if station_capacities.shape != (station_features.shape[0],):
+            raise ValueError("station capacities must be [S]")
+        self.state_dim = int(state_dim)
+        self.widths = widths
+        self.stem = nn.Sequential(
+            nn.Conv1d(self.state_dim, widths[0], kernel_size=3, padding=1),
+            nn.GroupNorm(_group_count(widths[0], groups), widths[0]),
+            nn.SiLU(),
+        )
+        self.down_blocks = nn.ModuleList()
+        for input_width, output_width in zip(widths[:-1], widths[1:]):
+            self.down_blocks.append(
+                nn.Sequential(
+                    nn.Conv1d(
+                        input_width,
+                        output_width,
+                        kernel_size=4,
+                        stride=2,
+                        padding=1,
+                    ),
+                    nn.GroupNorm(_group_count(output_width, groups), output_width),
+                    nn.SiLU(),
+                    nn.Conv1d(output_width, output_width, kernel_size=3, padding=1),
+                )
+            )
+        self.global_projections = nn.ModuleList(
+            [nn.Conv1d(width * 2, width, kernel_size=1) for width in widths]
+        )
+        self.global_gates = nn.ParameterList(
+            [nn.Parameter(torch.tensor(float(global_gate_init))) for _ in widths]
+        )
+        wind = station_features[:, 0].float()
+        solar = station_features[:, 1].float()
+        capacity = station_capacities.float().clamp(min=1e-6)
+        wind_weight = wind * capacity
+        solar_weight = solar * capacity
+        wind_weight = wind_weight / wind_weight.sum().clamp(min=1e-8)
+        solar_weight = solar_weight / solar_weight.sum().clamp(min=1e-8)
+        self.register_buffer("wind_capacity_weight", wind_weight)
+        self.register_buffer("solar_capacity_weight", solar_weight)
+
+    def _fuse_global(self, node: torch.Tensor, level: int) -> torch.Tensor:
+        wind = torch.einsum("s,bsct->bct", self.wind_capacity_weight, node)
+        solar = torch.einsum("s,bsct->bct", self.solar_capacity_weight, node)
+        global_state = self.global_projections[level](torch.cat([wind, solar], dim=1))
+        return node + torch.sigmoid(self.global_gates[level]) * global_state[:, None]
+
+    def forward(self, node_state: torch.Tensor) -> list[torch.Tensor]:
+        if node_state.ndim != 4:
+            raise ValueError(
+                f"node_state must be [B,S,D,L], got {tuple(node_state.shape)}"
+            )
+        batch, stations, state_dim, length = node_state.shape
+        if state_dim != self.state_dim:
+            raise ValueError(f"expected state_dim={self.state_dim}, got {state_dim}")
+        feature = self.stem(node_state.reshape(batch * stations, state_dim, length))
+        node = _restore_stations(feature, batch, stations)
+        outputs = [self._fuse_global(node, 0)]
+        for level, block in enumerate(self.down_blocks, start=1):
+            feature = block(feature)
+            node = _restore_stations(feature, batch, stations)
+            outputs.append(self._fuse_global(node, level))
+        return outputs
+
+    def gate_values(self) -> dict[str, float]:
+        return {
+            f"global_level_{index}": float(torch.sigmoid(value.detach()).cpu())
+            for index, value in enumerate(self.global_gates)
+        }
+
+
 class StationResBlock(nn.Module):
     """Shared temporal residual block with diffusion-time and local FiLM."""
 
@@ -283,6 +370,8 @@ class StationResBlock(nn.Module):
         condition_channels: int,
         groups: int,
         dropout: float,
+        state_channels: int | None = None,
+        state_gate_init: float = -1.0,
     ) -> None:
         super().__init__()
         self.in_channels = int(in_channels)
@@ -298,6 +387,15 @@ class StationResBlock(nn.Module):
         self.condition_affine = nn.Conv1d(
             condition_channels, self.out_channels * 2, kernel_size=1
         )
+        self.state_affine = None
+        self.state_gate = None
+        if state_channels is not None:
+            self.state_affine = nn.Conv1d(
+                int(state_channels), self.out_channels * 2, kernel_size=1
+            )
+            nn.init.zeros_(self.state_affine.weight)
+            nn.init.zeros_(self.state_affine.bias)
+            self.state_gate = nn.Parameter(torch.tensor(float(state_gate_init)))
         self.dropout = nn.Dropout(float(dropout))
         self.conv2 = nn.Conv1d(self.out_channels, self.out_channels, 3, padding=1)
         self.residual = (
@@ -311,6 +409,7 @@ class StationResBlock(nn.Module):
         value: torch.Tensor,
         time_embedding: torch.Tensor,
         condition: torch.Tensor,
+        state_condition: torch.Tensor | None = None,
     ) -> torch.Tensor:
         flattened, batch, stations = _flatten_stations(value)
         condition_flattened, _, _ = _flatten_stations(condition)
@@ -324,6 +423,18 @@ class StationResBlock(nn.Module):
         ).chunk(2, dim=1)
         gamma = time_gamma[:, :, None] + condition_gamma
         beta = time_beta[:, :, None] + condition_beta
+        if self.state_affine is not None:
+            if state_condition is None:
+                raise ValueError("state_condition is required for a state-aware ResBlock")
+            state_flattened, state_batch, state_stations = _flatten_stations(
+                state_condition
+            )
+            if state_batch != batch or state_stations != stations:
+                raise ValueError("state_condition batch/station axes do not match")
+            state_gamma, state_beta = self.state_affine(state_flattened).chunk(2, dim=1)
+            state_weight = torch.sigmoid(self.state_gate)
+            gamma = gamma + state_weight * state_gamma
+            beta = beta + state_weight * state_beta
         hidden = hidden * (1.0 + gamma) + beta
         hidden = self.conv2(self.dropout(F.silu(hidden)))
         return _restore_stations(residual + hidden, batch, stations)
@@ -417,11 +528,13 @@ class StationConditionalResUNet1D(nn.Module):
         config: Mapping[str, object],
         station_features: torch.Tensor,
         adjacency: torch.Tensor,
+        station_capacities: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.sequence_length = int(config.get("sequence_length", 168))
         self.station_count = int(config.get("station_count", 24))
         self.spatial_mode = str(config.get("spatial_mode", "none"))
+        self.use_state_encoder = bool(config.get("use_state_encoder", False))
         if self.spatial_mode not in SPATIAL_MODES:
             raise ValueError(f"unsupported spatial_mode={self.spatial_mode!r}")
         if station_features.shape[0] != self.station_count:
@@ -450,6 +563,27 @@ class StationConditionalResUNet1D(nn.Module):
             groups,
             condition_config=config,
         )
+        self.state_encoder = None
+        state_widths: tuple[int, ...] = ()
+        if self.use_state_encoder:
+            state_widths = tuple(
+                int(value) for value in config.get("state_channels", [8, 16, 32])
+            )
+            if len(state_widths) != num_layers:
+                raise ValueError("state_channels length must equal num_layers")
+            capacities = (
+                station_capacities.float()
+                if station_capacities is not None
+                else torch.ones(self.station_count, dtype=torch.float32)
+            )
+            self.state_encoder = StationStateEncoder(
+                state_widths,
+                station_features,
+                capacities,
+                groups,
+                state_dim=int(config.get("state_feature_dim", 4)),
+                global_gate_init=float(config.get("state_global_gate_init", -1.0)),
+            )
         self.state_stem = nn.Conv1d(1, self.channels[0], kernel_size=3, padding=1)
         self.encoder_blocks = nn.ModuleList(
             [
@@ -460,6 +594,8 @@ class StationConditionalResUNet1D(nn.Module):
                     self.channels[level],
                     groups,
                     dropout,
+                    state_channels=(state_widths[level] if self.use_state_encoder else None),
+                    state_gate_init=float(config.get("state_film_gate_init", -1.0)),
                 )
                 for level in range(num_layers)
             ]
@@ -483,6 +619,8 @@ class StationConditionalResUNet1D(nn.Module):
             self.channels[-1],
             groups,
             dropout,
+            state_channels=(state_widths[-1] if self.use_state_encoder else None),
+            state_gate_init=float(config.get("state_film_gate_init", -1.0)),
         )
         self.spatial_block = StationSpatialBlock(
             self.channels[-1],
@@ -516,6 +654,8 @@ class StationConditionalResUNet1D(nn.Module):
                     self.channels[level],
                     groups,
                     dropout,
+                    state_channels=(state_widths[level] if self.use_state_encoder else None),
+                    state_gate_init=float(config.get("state_film_gate_init", -1.0)),
                 )
             )
             current_channels = self.channels[level]
@@ -536,6 +676,7 @@ class StationConditionalResUNet1D(nn.Module):
         revision_mask: torch.Tensor | None = None,
         recent_error: torch.Tensor | None = None,
         recent_error_mask: torch.Tensor | None = None,
+        node_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if noisy_residual.shape[1:] != (self.station_count, self.sequence_length):
             raise ValueError(
@@ -555,18 +696,33 @@ class StationConditionalResUNet1D(nn.Module):
             recent_error=recent_error,
             recent_error_mask=recent_error_mask,
         )
+        state_conditions = None
+        if self.use_state_encoder:
+            if node_state is None:
+                raise ValueError("node_state is required when use_state_encoder=true")
+            state_conditions = self.state_encoder(node_state)
         hidden = self.state_stem(noisy_residual.reshape(batch * stations, 1, length))
         hidden = _restore_stations(hidden, batch, stations)
         skips = []
         for level, block in enumerate(self.encoder_blocks):
-            hidden = block(hidden, time_embedding, conditions[level])
+            hidden = block(
+                hidden,
+                time_embedding,
+                conditions[level],
+                None if state_conditions is None else state_conditions[level],
+            )
             skips.append(hidden)
             if level < len(self.downsamples):
                 flattened, _, _ = _flatten_stations(hidden)
                 hidden = _restore_stations(
                     self.downsamples[level](flattened), batch, stations
                 )
-        hidden = self.bottleneck(hidden, time_embedding, conditions[-1])
+        hidden = self.bottleneck(
+            hidden,
+            time_embedding,
+            conditions[-1],
+            None if state_conditions is None else state_conditions[-1],
+        )
         hidden = self.spatial_block(hidden)
 
         for level, upsample, block in zip(
@@ -585,6 +741,7 @@ class StationConditionalResUNet1D(nn.Module):
                 torch.cat([hidden, skip], dim=2),
                 time_embedding,
                 conditions[level],
+                None if state_conditions is None else state_conditions[level],
             )
         flattened, _, _ = _flatten_stations(hidden)
         output = self.output(F.silu(self.output_norm(flattened)))
@@ -633,6 +790,7 @@ class StationGaussianDiffusion(nn.Module):
         revision_mask: torch.Tensor | None = None,
         recent_error: torch.Tensor | None = None,
         recent_error_mask: torch.Tensor | None = None,
+        node_state: torch.Tensor | None = None,
         timestep: torch.Tensor | None = None,
         noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -652,6 +810,7 @@ class StationGaussianDiffusion(nn.Module):
             revision_mask=revision_mask,
             recent_error=recent_error,
             recent_error_mask=recent_error_mask,
+            node_state=node_state,
         )
         squared_error = (prediction - noise) ** 2
         valid_mask = valid_mask.to(squared_error.dtype)
@@ -679,6 +838,7 @@ class StationGaussianDiffusion(nn.Module):
         revision_mask: torch.Tensor | None = None,
         recent_error: torch.Tensor | None = None,
         recent_error_mask: torch.Tensor | None = None,
+        node_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
         predicted_noise = self.denoiser(
             noisy,
@@ -691,6 +851,7 @@ class StationGaussianDiffusion(nn.Module):
             revision_mask=revision_mask,
             recent_error=recent_error,
             recent_error_mask=recent_error_mask,
+            node_state=node_state,
         )
         alpha = self.alpha[timestep].view(-1, 1, 1)
         alpha_hat = self.alpha_hat[timestep].view(-1, 1, 1)
@@ -713,6 +874,7 @@ class StationGaussianDiffusion(nn.Module):
         revision_mask: torch.Tensor | None = None,
         recent_error: torch.Tensor | None = None,
         recent_error_mask: torch.Tensor | None = None,
+        node_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, stations, length = forecast.shape
         n_samples = int(n_samples)
@@ -725,6 +887,7 @@ class StationGaussianDiffusion(nn.Module):
             "revision_mask": revision_mask,
             "recent_error": recent_error,
             "recent_error_mask": recent_error_mask,
+            "node_state": node_state,
         }
         optional_conditions = {
             name: (
@@ -765,11 +928,12 @@ class Station24DiffusionModel(nn.Module):
         config: Mapping[str, object],
         station_features: torch.Tensor,
         adjacency: torch.Tensor,
+        station_capacities: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.config = dict(config)
         self.denoiser = StationConditionalResUNet1D(
-            self.config, station_features, adjacency
+            self.config, station_features, adjacency, station_capacities
         )
         self.diffusion = StationGaussianDiffusion(
             self.denoiser,
@@ -785,6 +949,20 @@ class Station24DiffusionModel(nn.Module):
     @property
     def condition_gate_values(self) -> dict[str, float]:
         return self.denoiser.condition_encoder.gate_values()
+
+    @property
+    def state_gate_values(self) -> dict[str, float]:
+        if not self.denoiser.use_state_encoder:
+            return {}
+        values = self.denoiser.state_encoder.gate_values()
+        blocks = list(self.denoiser.encoder_blocks)
+        blocks.append(self.denoiser.bottleneck)
+        blocks.extend(self.denoiser.decoder_blocks)
+        for index, block in enumerate(blocks):
+            values[f"film_block_{index}"] = float(
+                torch.sigmoid(block.state_gate.detach()).cpu()
+            )
+        return values
 
     def forward(
         self,
@@ -803,6 +981,7 @@ class Station24DiffusionModel(nn.Module):
             revision_mask=batch.get("revision_mask"),
             recent_error=batch.get("recent_error"),
             recent_error_mask=batch.get("recent_error_mask"),
+            node_state=batch.get("node_state"),
             timestep=timestep,
             noise=noise,
         )
@@ -822,4 +1001,5 @@ class Station24DiffusionModel(nn.Module):
             revision_mask=batch.get("revision_mask"),
             recent_error=batch.get("recent_error"),
             recent_error_mask=batch.get("recent_error_mask"),
+            node_state=batch.get("node_state"),
         )

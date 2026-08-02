@@ -91,7 +91,10 @@ def main() -> None:
     scale = np.asarray(residual_scale["scale"], dtype=np.float32)
     static = load_station_static_data(data_path)
     model = Station24DiffusionModel(
-        config["model"], static["station_features"], static["station_adjacency"]
+        config["model"],
+        static["station_features"],
+        static["station_adjacency"],
+        static["station_capacities"],
     ).to(device)
     if checkpoint.get("architecture") != model.architecture:
         raise ValueError("checkpoint architecture does not match config")
@@ -109,6 +112,7 @@ def main() -> None:
         seed=seed,
         num_workers=0,
         condition_config=config["model"],
+        state_thresholds=checkpoint.get("state_thresholds"),
     )
     daylight_mask, daylight_audit = build_station_daylight_mask(data_path, args.split)
     generated_standardized = []
@@ -196,6 +200,12 @@ def main() -> None:
             config.get("experiment", {}).get("variant", "baseline")
         ),
         "condition_gate_values": model.condition_gate_values,
+        "state_gate_values": model.state_gate_values,
+        "state_thresholds_file": (
+            str(run_dir / "state_thresholds.json")
+            if (run_dir / "state_thresholds.json").is_file()
+            else None
+        ),
         "condition_feature_audit": dataset.condition_audit,
         "split": args.split,
         "n_samples": n_samples,

@@ -54,6 +54,7 @@ class Station24ModelTests(unittest.TestCase):
             "revision_mask": torch.ones(batch_size, 24, 16),
             "recent_error": torch.randn(batch_size, 24, 24),
             "recent_error_mask": torch.ones(batch_size, 24, 1),
+            "node_state": torch.rand(batch_size, 24, 4, 16),
         }
 
     def test_all_spatial_modes_forward_backward_and_sample(self):
@@ -119,6 +120,49 @@ class Station24ModelTests(unittest.TestCase):
             self.assertEqual(tuple(generated.shape), (1, 2, 24, 16))
             self.assertEqual(set(model.condition_gate_values), expected_gates)
 
+    def test_state_v1_lightweight_encoder_shapes_forward_and_zero_init(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        capacities = torch.linspace(10.0, 100.0, 24)
+        base = Station24DiffusionModel(
+            self.config("fixed_graph"), features, adjacency, capacities
+        )
+        config = self.config("fixed_graph")
+        config.update(
+            {
+                "use_state_encoder": True,
+                "state_feature_dim": 4,
+                "state_channels": [2, 4, 8],
+                "state_global_gate_init": -1.0,
+                "state_film_gate_init": -1.0,
+            }
+        )
+        model = Station24DiffusionModel(config, features, adjacency, capacities)
+        outputs = model.denoiser.state_encoder(self.batch()["node_state"])
+        self.assertEqual(
+            [tuple(value.shape) for value in outputs],
+            [(2, 24, 2, 16), (2, 24, 4, 8), (2, 24, 8, 4)],
+        )
+        for block in [
+            *model.denoiser.encoder_blocks,
+            model.denoiser.bottleneck,
+            *model.denoiser.decoder_blocks,
+        ]:
+            self.assertTrue(torch.equal(block.state_affine.weight, torch.zeros_like(block.state_affine.weight)))
+            self.assertTrue(torch.equal(block.state_affine.bias, torch.zeros_like(block.state_affine.bias)))
+        loss = model(self.batch())
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        generated = model.generate(self.batch(batch_size=1), n_samples=2)
+        self.assertEqual(tuple(generated.shape), (1, 2, 24, 16))
+        self.assertLess(
+            sum(parameter.numel() for parameter in model.parameters())
+            - sum(parameter.numel() for parameter in base.parameters()),
+            5000,
+        )
+        self.assertTrue(model.state_gate_values)
+
 
 class Station24DatasetTests(unittest.TestCase):
     def make_data(self, root: Path):
@@ -167,6 +211,7 @@ class Station24DatasetTests(unittest.TestCase):
             StationForecastDataset,
             build_station_daylight_mask,
             fit_station_residual_scale,
+            fit_station_state_thresholds,
         )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -203,6 +248,40 @@ class Station24DatasetTests(unittest.TestCase):
             self.assertTrue(daylight[:, :, :13].all())
             self.assertFalse(audit["uses_power_or_actual"])
 
+            thresholds = fit_station_state_thresholds(root, ramp_lags=(3, 6))
+            state_config = {
+                "use_state_encoder": True,
+                "state_ramp_lags": [3, 6],
+                "state_clip": 3.0,
+            }
+            state_dataset = StationForecastDataset(
+                root,
+                "val",
+                scale,
+                condition_config=state_config,
+                state_thresholds=thresholds,
+            )
+            state_before = state_dataset[0]["node_state"].clone()
+            self.assertEqual(tuple(state_before.shape), (24, 4, 168))
+            self.assertTrue(torch.isfinite(state_before).all())
+            self.assertEqual(thresholds["fit_split"], "train")
+            self.assertEqual(
+                thresholds["future_state_source"], "current_issued_forecast_only"
+            )
+            val_actual = np.load(root / "val_actual.npy")
+            changed_actual = val_actual + 0.2
+            np.save(root / "val_actual.npy", changed_actual)
+            val_forecast = np.load(root / "val_forecast.npy")
+            np.save(root / "val_residual.npy", changed_actual - val_forecast)
+            state_after = StationForecastDataset(
+                root,
+                "val",
+                scale,
+                condition_config=state_config,
+                state_thresholds=thresholds,
+            )[0]["node_state"]
+            self.assertTrue(torch.equal(state_before, state_after))
+
     def test_generation_cli_smoke_uses_ema_and_writes_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -225,6 +304,18 @@ class Station24DatasetTests(unittest.TestCase):
                 "num_steps": 2,
                 "beta_start": 1e-4,
                 "beta_end": 0.02,
+                "use_forecast_ramps": False,
+                "forecast_ramp_lags": [3, 6],
+                "use_recent_error": True,
+                "recent_error_hours": 24,
+                "use_state_encoder": True,
+                "state_feature_dim": 4,
+                "state_channels": [2, 4, 8],
+                "state_ramp_lags": [3, 6],
+                "state_low_quantile": 0.20,
+                "state_high_quantile": 0.90,
+                "state_ramp_quantile": 0.90,
+                "state_clip": 3.0,
             }
             config = {
                 "experiment": {"name": "smoke", "family": "test"},
@@ -284,6 +375,7 @@ class Station24DatasetTests(unittest.TestCase):
             self.assertEqual(len(runs), 1)
             run_dir = runs[0]
             self.assertTrue((run_dir / "checkpoints" / "model_best.pt").is_file())
+            self.assertTrue((run_dir / "state_thresholds.json").is_file())
             subprocess.run(
                 [
                     sys.executable,
@@ -385,6 +477,48 @@ class Station24DatasetTests(unittest.TestCase):
                     condition_comparison
                     / "figures"
                     / "ramp_and_extreme_metrics.png"
+                ).is_file()
+            )
+
+            state_inputs = []
+            for variant in ["ramp36_control", "state_v1_fixed_graph"]:
+                copied = root / f"state_v1_{variant}"
+                shutil.copytree(output_dir, copied)
+                copied_metrics = json.loads(
+                    (copied / "metrics.json").read_text(encoding="utf-8")
+                )
+                copied_metrics["run"]["spatial_mode"] = "fixed_graph"
+                copied_metrics["run"]["condition_variant"] = variant
+                copied_metrics["run"]["condition_gate_values"] = {}
+                copied_metrics["run"]["state_gate_values"] = {}
+                (copied / "metrics.json").write_text(
+                    json.dumps(copied_metrics), encoding="utf-8"
+                )
+                state_inputs.append(str(copied))
+            state_comparison = root / "state_v1_comparison"
+            subprocess.run(
+                [
+                    sys.executable,
+                    "tools/compare_station24_state_v1.py",
+                    *state_inputs,
+                    "--data-path",
+                    str(data_dir),
+                    "--output-dir",
+                    str(state_comparison),
+                ],
+                check=True,
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+            )
+            self.assertTrue(
+                (state_comparison / "comparison_summary.csv").is_file()
+            )
+            self.assertTrue(
+                (
+                    state_comparison
+                    / "figures"
+                    / "typical_scenario_envelopes.png"
                 ).is_file()
             )
 

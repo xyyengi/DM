@@ -21,9 +21,11 @@ import matplotlib.pyplot as plt
 from src.models.station_conditioned_diffusion import Station24DiffusionModel
 from station_dataset import (
     fit_station_residual_scale,
+    fit_station_state_thresholds,
     get_station_dataloader,
     load_station_static_data,
     write_residual_scale,
+    write_station_state_thresholds,
 )
 
 
@@ -131,6 +133,7 @@ def save_checkpoint(
     train_loss: float,
     val_loss: float,
     parameter_count: int,
+    state_thresholds: Mapping[str, object] | None,
 ) -> None:
     payload = {
         "architecture": model.architecture,
@@ -147,6 +150,12 @@ def save_checkpoint(
         "spatial_gate_values": model.denoiser.spatial_block.gate_values(),
         "condition_variant": str(config.get("experiment", {}).get("variant", "baseline")),
         "condition_gate_values": model.condition_gate_values,
+        "state_gate_values": model.state_gate_values,
+        "state_thresholds": (
+            copy.deepcopy(dict(state_thresholds))
+            if state_thresholds is not None
+            else None
+        ),
     }
     torch.save(payload, path)
 
@@ -211,6 +220,21 @@ def main() -> None:
         data_path, epsilon=float(scale_config.get("epsilon", 1e-4))
     )
     write_residual_scale(run_dir / "residual_scale.json", residual_scale)
+    state_thresholds = None
+    if bool(config["model"].get("use_state_encoder", False)):
+        state_thresholds = fit_station_state_thresholds(
+            data_path,
+            low_quantile=float(config["model"].get("state_low_quantile", 0.20)),
+            high_quantile=float(config["model"].get("state_high_quantile", 0.90)),
+            ramp_quantile=float(config["model"].get("state_ramp_quantile", 0.90)),
+            ramp_lags=tuple(
+                int(value)
+                for value in config["model"].get("state_ramp_lags", [3, 6])
+            ),
+        )
+        write_station_state_thresholds(
+            run_dir / "state_thresholds.json", state_thresholds
+        )
     (run_dir / "config_used.yaml").write_text(
         yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8"
     )
@@ -223,6 +247,7 @@ def main() -> None:
         seed=seed,
         num_workers=int(train_config.get("num_workers", 0)),
         condition_config=config["model"],
+        state_thresholds=state_thresholds,
     )
     val_loader, val_dataset = get_station_dataloader(
         data_path,
@@ -232,6 +257,7 @@ def main() -> None:
         seed=int(train_config.get("validation_seed", 314159)),
         num_workers=int(train_config.get("num_workers", 0)),
         condition_config=config["model"],
+        state_thresholds=state_thresholds,
     )
     (run_dir / "condition_feature_audit.json").write_text(
         json.dumps(
@@ -246,7 +272,10 @@ def main() -> None:
     )
     static = load_station_static_data(data_path)
     model = Station24DiffusionModel(
-        config["model"], static["station_features"], static["station_adjacency"]
+        config["model"],
+        static["station_features"],
+        static["station_adjacency"],
+        static["station_capacities"],
     ).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     trainable_count = sum(
@@ -274,6 +303,7 @@ def main() -> None:
         f"MODEL architecture={model.architecture} spatial_mode={model.spatial_mode} "
         f"condition_variant={config.get('experiment', {}).get('variant', 'baseline')} "
         f"condition_gates={model.condition_gate_values} parameters={parameter_count} "
+        f"state_gates={model.state_gate_values} "
         f"trainable={trainable_count} device={device}"
     )
     print(
@@ -330,11 +360,13 @@ def main() -> None:
                     train_loss,
                     val_loss,
                     parameter_count,
+                    state_thresholds,
                 )
             print(
                 f"epoch={epoch:04d} train={train_loss:.7f} val={val_loss:.7f} "
                 f"best_epoch={best_epoch} spatial_gates={model.denoiser.spatial_block.gate_values()} "
                 f"condition_gates={model.condition_gate_values}"
+                f" state_gates={model.state_gate_values}"
             )
             if best_epoch and epoch - best_epoch >= patience:
                 history.append(row)
@@ -357,6 +389,7 @@ def main() -> None:
                 train_loss,
                 periodic_val,
                 parameter_count,
+                state_thresholds,
             )
 
     if not (checkpoint_dir / "model_best.pt").is_file():
@@ -372,6 +405,7 @@ def main() -> None:
             config.get("experiment", {}).get("variant", "baseline")
         ),
         "condition_gate_values": model.condition_gate_values,
+        "state_gate_values": model.state_gate_values,
         "parameter_count": parameter_count,
         "best_epoch": best_epoch,
         "best_fixed_noise_validation_mse": best_val,

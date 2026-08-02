@@ -1,0 +1,72 @@
+experiment:
+  name: "station24_state_v1_ramp36_control_168h"
+  family: "station24_state_v1"
+  variant: "ramp36_control"
+  description: "Fixed graph control with recent errors and raw 3h/6h forecast ramps"
+
+data:
+  data_path: "./diffusion_input_station"
+  station_count: 24
+  sequence_length: 168
+  residual_definition: "actual_minus_current_forecast"
+
+target:
+  type: "residual"
+  residual_scaling:
+    method: "per_station_std"
+    fit_split: "train"
+    center: false
+    epsilon: 1.0e-4
+
+model:
+  architecture: "station24_resunet"
+  spatial_mode: "fixed_graph"
+  spatial_gate_init: -1.0
+  station_count: 24
+  sequence_length: 168
+  base_channels: 32
+  num_layers: 3
+  channel_multipliers: [1, 2, 4]
+  group_norm_groups: 8
+  dropout: 0.10
+  timestep_embedding_dim: 128
+  num_steps: 500
+  beta_start: 0.0001
+  beta_end: 0.04
+  schedule: "linear"
+  reverse_variance_type: "posterior"
+  use_forecast_ramps: true
+  forecast_ramp_lags: [3, 6]
+  use_forecast_revision: false
+  use_recent_error: true
+  recent_error_hours: 24
+  use_state_encoder: false
+  condition_gate_init: -1.0
+
+train:
+  batch_size: 8
+  gradient_accumulation_steps: 2
+  effective_batch_size: 16
+  lr: 1.0e-4
+  epochs: 300
+  weight_decay: 1.0e-4
+  patience: 40
+  validation_every: 5
+  min_delta: 1.0e-5
+  gradient_clip_norm: 1.0
+  ema_decay: 0.999
+  mixed_precision: true
+  save_every: 50
+  seed: 2027
+  validation_seed: 314159
+  num_workers: 4
+
+evaluation:
+  split: "val"
+  n_samples: 80
+  generation_seed: 424242
+  issue_batch_size: 1
+  member_chunk_size: 10
+  quantiles: [0.80, 0.90, 0.95]
+  physical_projection: "clip_0_1_and_station_astronomical_solar_night"
+  test_locked: true
