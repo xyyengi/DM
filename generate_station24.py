@@ -194,8 +194,9 @@ def main() -> None:
         "checkpoint_validation_mse": float(checkpoint["val_loss"]),
         "architecture": model.architecture,
         "spatial_mode": model.spatial_mode,
+        "spatial_mix_levels": list(model.spatial_mix_levels),
         "parameter_count": int(checkpoint["parameter_count"]),
-        "spatial_gate_values": model.denoiser.spatial_block.gate_values(),
+        "spatial_gate_values": model.spatial_gate_values,
         "condition_variant": str(
             config.get("experiment", {}).get("variant", "baseline")
         ),

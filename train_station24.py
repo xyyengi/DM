@@ -138,6 +138,7 @@ def save_checkpoint(
     payload = {
         "architecture": model.architecture,
         "spatial_mode": model.spatial_mode,
+        "spatial_mix_levels": list(model.spatial_mix_levels),
         "epoch": int(epoch),
         "train_loss": float(train_loss),
         "val_loss": float(val_loss),
@@ -147,7 +148,7 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "residual_scale": dict(residual_scale),
         "config": copy.deepcopy(dict(config)),
-        "spatial_gate_values": model.denoiser.spatial_block.gate_values(),
+        "spatial_gate_values": model.spatial_gate_values,
         "condition_variant": str(config.get("experiment", {}).get("variant", "baseline")),
         "condition_gate_values": model.condition_gate_values,
         "state_gate_values": model.state_gate_values,
@@ -401,10 +402,12 @@ def main() -> None:
     final_record = {
         "architecture": model.architecture,
         "spatial_mode": model.spatial_mode,
+        "spatial_mix_levels": list(model.spatial_mix_levels),
         "condition_variant": str(
             config.get("experiment", {}).get("variant", "baseline")
         ),
         "condition_gate_values": model.condition_gate_values,
+        "spatial_gate_values": model.spatial_gate_values,
         "state_gate_values": model.state_gate_values,
         "parameter_count": parameter_count,
         "best_epoch": best_epoch,

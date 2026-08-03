@@ -87,6 +87,59 @@ class Station24ModelTests(unittest.TestCase):
             {"wind_wind", "solar_solar", "wind_solar"},
         )
 
+    def test_multiscale_graph_mixing_is_lightweight_and_trainable(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        baseline = Station24DiffusionModel(
+            self.config("fixed_graph"), features, adjacency
+        )
+        config = self.config("fixed_graph")
+        config["spatial_mix_levels"] = [
+            "encoder_0",
+            "encoder_1",
+            "bottleneck",
+        ]
+        candidate = Station24DiffusionModel(config, features, adjacency)
+        self.assertEqual(baseline.spatial_mix_levels, ("bottleneck",))
+        self.assertEqual(
+            candidate.spatial_mix_levels,
+            ("encoder_0", "encoder_1", "bottleneck"),
+        )
+        # Each block adds GroupNorm affine, 1x1 projection, and one graph gate:
+        # (4x4 + 3x4 + 1) + (8x8 + 3x8 + 1) = 118.
+        baseline_count = sum(parameter.numel() for parameter in baseline.parameters())
+        candidate_count = sum(parameter.numel() for parameter in candidate.parameters())
+        self.assertEqual(candidate_count - baseline_count, 118)
+        self.assertEqual(set(baseline.spatial_gate_values), {"all"})
+        self.assertEqual(
+            set(candidate.spatial_gate_values),
+            {"encoder_0/all", "encoder_1/all", "bottleneck/all"},
+        )
+
+        loss = candidate(self.batch())
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        for block in candidate.denoiser.encoder_spatial_blocks.values():
+            self.assertIsNotNone(block.graph_gate.grad)
+            self.assertIsNotNone(block.projection.weight.grad)
+        generated = candidate.generate(self.batch(batch_size=1), n_samples=2)
+        self.assertEqual(tuple(generated.shape), (1, 2, 24, 16))
+
+        restored = Station24DiffusionModel(
+            self.config("fixed_graph"), features, adjacency
+        )
+        restored.load_state_dict(baseline.state_dict(), strict=True)
+
+    def test_multiscale_graph_mixing_rejects_unknown_level(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        config = self.config("fixed_graph")
+        config["spatial_mix_levels"] = ["encoder_0", "decoder_0"]
+        with self.assertRaisesRegex(ValueError, "unsupported spatial_mix_levels"):
+            Station24DiffusionModel(config, features, adjacency)
+
     def test_condition_variants_forward_backward_and_sample(self):
         from src.models.station_conditioned_diffusion import Station24DiffusionModel
 
@@ -401,6 +454,7 @@ class Station24DatasetTests(unittest.TestCase):
             )
             metrics = (output_dir / "metrics.json").read_text(encoding="utf-8")
             self.assertIn('"spatial_mode": "fixed_graph"', metrics)
+            self.assertIn('"spatial_mix_levels": [', metrics)
             self.assertTrue((output_dir / "station_daylight_mask.npy").is_file())
 
             comparison_inputs = []
@@ -517,6 +571,54 @@ class Station24DatasetTests(unittest.TestCase):
             self.assertTrue(
                 (
                     state_comparison
+                    / "figures"
+                    / "typical_scenario_envelopes.png"
+                ).is_file()
+            )
+
+            multiscale_inputs = []
+            for variant, levels in [
+                ("state_v1_fixed_graph", ["bottleneck"]),
+                (
+                    "state_v1_multiscale_graph",
+                    ["encoder_0", "encoder_1", "bottleneck"],
+                ),
+            ]:
+                copied = root / f"multiscale_{variant}"
+                shutil.copytree(output_dir, copied)
+                copied_metrics = json.loads(
+                    (copied / "metrics.json").read_text(encoding="utf-8")
+                )
+                copied_metrics["run"]["condition_variant"] = variant
+                copied_metrics["run"]["spatial_mode"] = "fixed_graph"
+                copied_metrics["run"]["spatial_mix_levels"] = levels
+                copied_metrics["run"]["spatial_gate_values"] = {"all": 0.25}
+                (copied / "metrics.json").write_text(
+                    json.dumps(copied_metrics), encoding="utf-8"
+                )
+                multiscale_inputs.append(str(copied))
+            multiscale_comparison = root / "multiscale_comparison"
+            subprocess.run(
+                [
+                    sys.executable,
+                    "tools/compare_station24_multiscale_2a.py",
+                    *multiscale_inputs,
+                    "--data-path",
+                    str(data_dir),
+                    "--output-dir",
+                    str(multiscale_comparison),
+                ],
+                check=True,
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+            )
+            self.assertTrue(
+                (multiscale_comparison / "comparison_summary.csv").is_file()
+            )
+            self.assertTrue(
+                (
+                    multiscale_comparison
                     / "figures"
                     / "typical_scenario_envelopes.png"
                 ).is_file()

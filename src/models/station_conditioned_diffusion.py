@@ -551,6 +551,27 @@ class StationConditionalResUNet1D(nn.Module):
         groups = int(config.get("group_norm_groups", 8))
         dropout = float(config.get("dropout", 0.10))
         timestep_dim = int(config.get("timestep_embedding_dim", 128))
+        configured_spatial_levels = config.get(
+            "spatial_mix_levels", ["bottleneck"]
+        )
+        if not isinstance(configured_spatial_levels, (list, tuple)):
+            raise ValueError("spatial_mix_levels must be a list of level names")
+        allowed_spatial_levels = {
+            f"encoder_{level}" for level in range(num_layers - 1)
+        }
+        allowed_spatial_levels.add("bottleneck")
+        spatial_mix_levels = tuple(str(value) for value in configured_spatial_levels)
+        if not spatial_mix_levels:
+            raise ValueError("spatial_mix_levels must not be empty")
+        if len(set(spatial_mix_levels)) != len(spatial_mix_levels):
+            raise ValueError("spatial_mix_levels must not contain duplicates")
+        unknown_spatial_levels = set(spatial_mix_levels) - allowed_spatial_levels
+        if unknown_spatial_levels:
+            raise ValueError(
+                f"unsupported spatial_mix_levels={sorted(unknown_spatial_levels)}; "
+                f"allowed={sorted(allowed_spatial_levels)}"
+            )
+        self.spatial_mix_levels = spatial_mix_levels
 
         self.register_buffer("station_features", station_features.float())
         self.timestep_embedding = DiffusionTimestepEmbedding(
@@ -611,6 +632,21 @@ class StationConditionalResUNet1D(nn.Module):
                 )
                 for level in range(num_layers - 1)
             ]
+        )
+        self.encoder_spatial_blocks = nn.ModuleDict(
+            {
+                f"encoder_{level}": StationSpatialBlock(
+                    self.channels[level],
+                    adjacency,
+                    station_features,
+                    self.spatial_mode,
+                    groups,
+                    dropout,
+                    gate_init=float(config.get("spatial_gate_init", -1.0)),
+                )
+                for level in range(num_layers - 1)
+                if f"encoder_{level}" in self.spatial_mix_levels
+            }
         )
         self.bottleneck = StationResBlock(
             self.channels[-1],
@@ -711,6 +747,9 @@ class StationConditionalResUNet1D(nn.Module):
                 conditions[level],
                 None if state_conditions is None else state_conditions[level],
             )
+            spatial_level = f"encoder_{level}"
+            if spatial_level in self.encoder_spatial_blocks:
+                hidden = self.encoder_spatial_blocks[spatial_level](hidden)
             skips.append(hidden)
             if level < len(self.downsamples):
                 flattened, _, _ = _flatten_stations(hidden)
@@ -723,7 +762,8 @@ class StationConditionalResUNet1D(nn.Module):
             conditions[-1],
             None if state_conditions is None else state_conditions[-1],
         )
-        hidden = self.spatial_block(hidden)
+        if "bottleneck" in self.spatial_mix_levels:
+            hidden = self.spatial_block(hidden)
 
         for level, upsample, block in zip(
             self.decoder_levels, self.upsamples, self.decoder_blocks
@@ -945,6 +985,24 @@ class Station24DiffusionModel(nn.Module):
     @property
     def spatial_mode(self) -> str:
         return self.denoiser.spatial_mode
+
+    @property
+    def spatial_mix_levels(self) -> tuple[str, ...]:
+        return self.denoiser.spatial_mix_levels
+
+    @property
+    def spatial_gate_values(self) -> dict[str, float]:
+        if self.denoiser.spatial_mix_levels == ("bottleneck",):
+            # Preserve the legacy metadata shape for old single-scale runs.
+            return self.denoiser.spatial_block.gate_values()
+        values: dict[str, float] = {}
+        for level, block in self.denoiser.encoder_spatial_blocks.items():
+            for relation, value in block.gate_values().items():
+                values[f"{level}/{relation}"] = value
+        if "bottleneck" in self.denoiser.spatial_mix_levels:
+            for relation, value in self.denoiser.spatial_block.gate_values().items():
+                values[f"bottleneck/{relation}"] = value
+        return values
 
     @property
     def condition_gate_values(self) -> dict[str, float]:
