@@ -20,11 +20,13 @@ import matplotlib.pyplot as plt
 
 from src.models.station_conditioned_diffusion import Station24DiffusionModel
 from station_dataset import (
+    fit_station_event_weighting,
     fit_station_residual_scale,
     fit_station_state_thresholds,
     get_station_dataloader,
     load_station_static_data,
     write_residual_scale,
+    write_station_event_weighting,
     write_station_state_thresholds,
 )
 
@@ -139,6 +141,7 @@ def save_checkpoint(
     val_loss: float,
     parameter_count: int,
     state_thresholds: Mapping[str, object] | None,
+    event_weighting: Mapping[str, object] | None,
 ) -> None:
     payload = {
         "architecture": model.architecture,
@@ -166,11 +169,23 @@ def save_checkpoint(
         "condition_variant": str(config.get("experiment", {}).get("variant", "baseline")),
         "condition_gate_values": model.condition_gate_values,
         "state_gate_values": model.state_gate_values,
+        "wind_common_gate_value": model.wind_common_gate_value,
+        "event_weighting_file": (
+            str(run_dir / "event_weighting.json")
+            if event_weighting is not None
+            else None
+        ),
         "state_thresholds": (
             copy.deepcopy(dict(state_thresholds))
             if state_thresholds is not None
             else None
         ),
+        "event_weighting": (
+            copy.deepcopy(dict(event_weighting))
+            if event_weighting is not None
+            else None
+        ),
+        "wind_common_gate_value": model.wind_common_gate_value,
     }
     torch.save(payload, path)
 
@@ -253,6 +268,14 @@ def main() -> None:
         write_station_state_thresholds(
             run_dir / "state_thresholds.json", state_thresholds
         )
+    event_weighting = None
+    if bool(config["model"].get("use_extreme_event_weighting", False)):
+        event_weighting = fit_station_event_weighting(
+            data_path, config["model"]
+        )
+        write_station_event_weighting(
+            run_dir / "event_weighting.json", event_weighting
+        )
     (run_dir / "config_used.yaml").write_text(
         yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8"
     )
@@ -266,6 +289,7 @@ def main() -> None:
         num_workers=int(train_config.get("num_workers", 0)),
         condition_config=config["model"],
         state_thresholds=state_thresholds,
+        event_weighting=event_weighting,
     )
     val_loader, val_dataset = get_station_dataloader(
         data_path,
@@ -276,6 +300,7 @@ def main() -> None:
         num_workers=int(train_config.get("num_workers", 0)),
         condition_config=config["model"],
         state_thresholds=state_thresholds,
+        event_weighting=event_weighting,
     )
     (run_dir / "condition_feature_audit.json").write_text(
         json.dumps(
@@ -325,6 +350,8 @@ def main() -> None:
         f"condition_variant={config.get('experiment', {}).get('variant', 'baseline')} "
         f"residual_scaling={residual_scale.get('method', 'per_station_std')} "
         f"ramp_aux_weight={model.diffusion.ramp_auxiliary_loss_weight} "
+        f"common_event_weight={model.diffusion.wind_common_event_loss_weight} "
+        f"common_gate={model.wind_common_gate_value} "
         f"condition_gates={model.condition_gate_values} parameters={parameter_count} "
         f"state_gates={model.state_gate_values} "
         f"trainable={trainable_count} device={device}"
@@ -384,6 +411,7 @@ def main() -> None:
                     val_loss,
                     parameter_count,
                     state_thresholds,
+                    event_weighting,
                 )
             print(
                 f"epoch={epoch:04d} train={train_loss:.7f} val={val_loss:.7f} "
@@ -413,6 +441,7 @@ def main() -> None:
                 periodic_val,
                 parameter_count,
                 state_thresholds,
+                event_weighting,
             )
 
     if not (checkpoint_dir / "model_best.pt").is_file():
@@ -449,6 +478,9 @@ def main() -> None:
         "ramp_auxiliary_lags": list(model.diffusion.ramp_auxiliary_lags),
         "ramp_auxiliary_lag_weights": list(
             model.diffusion.ramp_auxiliary_lag_weights
+        ),
+        "wind_common_event_loss_weight": float(
+            model.diffusion.wind_common_event_loss_weight
         ),
         "parameter_count": parameter_count,
         "best_epoch": best_epoch,

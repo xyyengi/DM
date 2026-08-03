@@ -1099,6 +1099,58 @@ class StationConditionalResUNet1D(nn.Module):
             _group_count(self.channels[0], groups), self.channels[0]
         )
         self.output = nn.Conv1d(self.channels[0], 1, kernel_size=1)
+        self.use_wind_common_residual_head = bool(
+            config.get("use_wind_common_residual_head", False)
+        )
+        capacities = (
+            station_capacities.float()
+            if station_capacities is not None
+            else torch.ones(self.station_count, dtype=torch.float32)
+        )
+        wind_mask = station_features[:, 0].float()
+        wind_capacity = capacities * wind_mask
+        if wind_capacity.sum() <= 0:
+            raise ValueError("at least one wind station is required")
+        self.register_buffer("wind_station_mask", wind_mask, persistent=False)
+        self.register_buffer(
+            "wind_capacity_weight",
+            wind_capacity / wind_capacity.sum(),
+            persistent=False,
+        )
+        self.wind_common_head = None
+        self.wind_common_gate = None
+        if self.use_wind_common_residual_head:
+            common_channels = int(config.get("wind_common_channels", 16))
+            if common_channels <= 0:
+                raise ValueError("wind_common_channels must be positive")
+            self.wind_common_head = nn.Sequential(
+                nn.Conv1d(
+                    self.channels[0], common_channels, kernel_size=3, padding=1
+                ),
+                nn.GroupNorm(
+                    _group_count(common_channels, groups), common_channels
+                ),
+                nn.SiLU(),
+                nn.Conv1d(
+                    common_channels,
+                    common_channels,
+                    kernel_size=3,
+                    padding=2,
+                    dilation=2,
+                ),
+                nn.GroupNorm(
+                    _group_count(common_channels, groups), common_channels
+                ),
+                nn.SiLU(),
+                nn.Conv1d(common_channels, 1, kernel_size=3, padding=1),
+            )
+            self.wind_common_gate = nn.Parameter(
+                torch.tensor(float(config.get("wind_common_gate_init", -1.0)))
+            )
+            # Start exactly from the existing 2D denoiser.  The common path is
+            # learned gradually instead of perturbing every wind node at epoch 1.
+            nn.init.zeros_(self.wind_common_head[-1].weight)
+            nn.init.zeros_(self.wind_common_head[-1].bias)
 
     def forward(
         self,
@@ -1202,8 +1254,20 @@ class StationConditionalResUNet1D(nn.Module):
                 None if state_conditions is None else state_conditions[level],
             )
         flattened, _, _ = _flatten_stations(hidden)
-        output = self.output(F.silu(self.output_norm(flattened)))
-        return output.reshape(batch, stations, length)
+        output = self.output(F.silu(self.output_norm(flattened))).reshape(
+            batch, stations, length
+        )
+        if self.wind_common_head is not None:
+            pooled = torch.einsum(
+                "s,bsct->bct", self.wind_capacity_weight, hidden
+            )
+            common = self.wind_common_head(pooled)
+            output = output + (
+                torch.sigmoid(self.wind_common_gate)
+                * common
+                * self.wind_station_mask[None, :, None]
+            )
+        return output
 
 
 class StationGaussianDiffusion(nn.Module):
@@ -1216,6 +1280,8 @@ class StationGaussianDiffusion(nn.Module):
         ramp_auxiliary_loss_weight: float = 0.0,
         ramp_auxiliary_lags: tuple[int, ...] = (1, 3, 6),
         ramp_auxiliary_lag_weights: tuple[float, ...] = (0.5, 0.3, 0.2),
+        wind_common_event_loss_weight: float = 0.0,
+        wind_common_event_level_fraction: float = 0.5,
     ) -> None:
         super().__init__()
         self.denoiser = denoiser
@@ -1231,8 +1297,18 @@ class StationGaussianDiffusion(nn.Module):
         self.ramp_auxiliary_lag_weights = tuple(
             float(value) for value in ramp_auxiliary_lag_weights
         )
+        self.wind_common_event_loss_weight = float(
+            wind_common_event_loss_weight
+        )
+        self.wind_common_event_level_fraction = float(
+            wind_common_event_level_fraction
+        )
         if self.ramp_auxiliary_loss_weight < 0:
             raise ValueError("ramp auxiliary loss weight must be non-negative")
+        if self.wind_common_event_loss_weight < 0:
+            raise ValueError("wind common event loss weight must be non-negative")
+        if not 0.0 <= self.wind_common_event_level_fraction <= 1.0:
+            raise ValueError("wind common event level fraction must be in [0,1]")
         if (
             not self.ramp_auxiliary_lags
             or len(self.ramp_auxiliary_lags) != len(self.ramp_auxiliary_lag_weights)
@@ -1268,6 +1344,8 @@ class StationGaussianDiffusion(nn.Module):
         recent_error_mask: torch.Tensor | None = None,
         node_state: torch.Tensor | None = None,
         residual_scale: torch.Tensor | None = None,
+        loss_weight: torch.Tensor | None = None,
+        event_time_weight: torch.Tensor | None = None,
         timestep: torch.Tensor | None = None,
         noise: torch.Tensor | None = None,
         include_auxiliary: bool = True,
@@ -1292,12 +1370,21 @@ class StationGaussianDiffusion(nn.Module):
         )
         squared_error = (prediction - noise) ** 2
         valid_mask = valid_mask.to(squared_error.dtype)
-        epsilon_loss = (squared_error * valid_mask).sum() / valid_mask.sum().clamp(min=1.0)
-        if self.ramp_auxiliary_loss_weight <= 0 or not include_auxiliary:
+        effective_mask = valid_mask
+        if include_auxiliary and loss_weight is not None:
+            if loss_weight.shape != clean.shape:
+                raise ValueError("loss_weight must match residual target [B,S,L]")
+            effective_mask = effective_mask * loss_weight.to(squared_error.dtype)
+        epsilon_loss = (squared_error * effective_mask).sum() / effective_mask.sum().clamp(min=1.0)
+        needs_x0 = include_auxiliary and (
+            self.ramp_auxiliary_loss_weight > 0
+            or self.wind_common_event_loss_weight > 0
+        )
+        if not needs_x0:
             return epsilon_loss
         if residual_scale is None or residual_scale.shape != clean.shape:
             raise ValueError(
-                "residual_scale [B,S,L] is required for ramp auxiliary loss"
+                "residual_scale [B,S,L] is required for auxiliary losses"
             )
 
         alpha_hat = self.alpha_hat[timestep.long()].view(-1, 1, 1)
@@ -1313,23 +1400,70 @@ class StationGaussianDiffusion(nn.Module):
         ).clamp(max=1.0)
         lag_weight_sum = sum(self.ramp_auxiliary_lag_weights)
         ramp_loss = torch.zeros((), device=clean.device, dtype=clean.dtype)
-        for lag, lag_weight in zip(
-            self.ramp_auxiliary_lags, self.ramp_auxiliary_lag_weights
-        ):
-            if lag >= clean.shape[-1]:
-                raise ValueError(f"ramp auxiliary lag={lag} exceeds sequence length")
-            predicted_ramp = predicted_actual[:, :, lag:] - predicted_actual[:, :, :-lag]
-            target_ramp = target_actual[:, :, lag:] - target_actual[:, :, :-lag]
-            pair_mask = valid_mask[:, :, lag:] * valid_mask[:, :, :-lag]
-            weighted_error = (
-                torch.abs(predicted_ramp - target_ramp)
-                * pair_mask
-                * snr_weight
+        if self.ramp_auxiliary_loss_weight > 0:
+            for lag, lag_weight in zip(
+                self.ramp_auxiliary_lags, self.ramp_auxiliary_lag_weights
+            ):
+                if lag >= clean.shape[-1]:
+                    raise ValueError(f"ramp auxiliary lag={lag} exceeds sequence length")
+                predicted_ramp = predicted_actual[:, :, lag:] - predicted_actual[:, :, :-lag]
+                target_ramp = target_actual[:, :, lag:] - target_actual[:, :, :-lag]
+                pair_mask = valid_mask[:, :, lag:] * valid_mask[:, :, :-lag]
+                weighted_error = (
+                    torch.abs(predicted_ramp - target_ramp)
+                    * pair_mask
+                    * snr_weight
+                )
+                current = weighted_error.sum() / pair_mask.sum().clamp(min=1.0)
+                ramp_loss = ramp_loss + float(lag_weight) * current
+            ramp_loss = ramp_loss / float(lag_weight_sum)
+
+        common_event_loss = torch.zeros((), device=clean.device, dtype=clean.dtype)
+        if self.wind_common_event_loss_weight > 0:
+            wind_weight = self.denoiser.wind_capacity_weight.to(clean.dtype)
+            predicted_wind = torch.einsum("s,bst->bt", wind_weight, predicted_actual)
+            target_wind = torch.einsum("s,bst->bt", wind_weight, target_actual)
+            wind_valid = (
+                valid_mask
+                * self.denoiser.wind_station_mask[None, :, None]
+            ).sum(dim=1) / self.denoiser.wind_station_mask.sum().clamp(min=1.0)
+            time_weight = torch.ones_like(wind_valid)
+            if event_time_weight is not None:
+                if event_time_weight.shape != wind_valid.shape:
+                    raise ValueError("event_time_weight must be [B,L]")
+                time_weight = event_time_weight.to(clean.dtype)
+            level_mask = wind_valid * time_weight * snr_weight[:, 0]
+            level_error = F.smooth_l1_loss(
+                predicted_wind, target_wind, reduction="none"
             )
-            current = weighted_error.sum() / pair_mask.sum().clamp(min=1.0)
-            ramp_loss = ramp_loss + float(lag_weight) * current
-        ramp_loss = ramp_loss / float(lag_weight_sum)
-        return epsilon_loss + self.ramp_auxiliary_loss_weight * ramp_loss
+            level_loss = (level_error * level_mask).sum() / level_mask.sum().clamp(min=1.0)
+            common_ramp = torch.zeros_like(level_loss)
+            for lag, lag_weight in zip(
+                self.ramp_auxiliary_lags, self.ramp_auxiliary_lag_weights
+            ):
+                predicted_delta = predicted_wind[:, lag:] - predicted_wind[:, :-lag]
+                target_delta = target_wind[:, lag:] - target_wind[:, :-lag]
+                pair_mask = (
+                    wind_valid[:, lag:]
+                    * wind_valid[:, :-lag]
+                    * torch.maximum(time_weight[:, lag:], time_weight[:, :-lag])
+                    * snr_weight[:, 0]
+                )
+                error = F.smooth_l1_loss(
+                    predicted_delta, target_delta, reduction="none"
+                )
+                common_ramp = common_ramp + float(lag_weight) * (
+                    (error * pair_mask).sum() / pair_mask.sum().clamp(min=1.0)
+                )
+            common_ramp = common_ramp / float(lag_weight_sum)
+            fraction = self.wind_common_event_level_fraction
+            common_event_loss = fraction * level_loss + (1.0 - fraction) * common_ramp
+
+        return (
+            epsilon_loss
+            + self.ramp_auxiliary_loss_weight * ramp_loss
+            + self.wind_common_event_loss_weight * common_event_loss
+        )
 
     def reverse_variance(self, timestep: torch.Tensor) -> torch.Tensor:
         beta = self.beta[timestep]
@@ -1468,6 +1602,12 @@ class Station24DiffusionModel(nn.Module):
                     "ramp_auxiliary_lag_weights", [0.5, 0.3, 0.2]
                 )
             ),
+            wind_common_event_loss_weight=float(
+                self.config.get("wind_common_event_loss_weight", 0.0)
+            ),
+            wind_common_event_level_fraction=float(
+                self.config.get("wind_common_event_level_fraction", 0.5)
+            ),
         )
 
     @property
@@ -1540,6 +1680,13 @@ class Station24DiffusionModel(nn.Module):
             )
         return values
 
+    @property
+    def wind_common_gate_value(self) -> float | None:
+        gate = self.denoiser.wind_common_gate
+        if gate is None:
+            return None
+        return float(torch.sigmoid(gate.detach()).cpu())
+
     def forward(
         self,
         batch: Mapping[str, torch.Tensor],
@@ -1560,6 +1707,8 @@ class Station24DiffusionModel(nn.Module):
             recent_error_mask=batch.get("recent_error_mask"),
             node_state=batch.get("node_state"),
             residual_scale=batch.get("residual_scale"),
+            loss_weight=batch.get("loss_weight"),
+            event_time_weight=batch.get("event_time_weight"),
             timestep=timestep,
             noise=noise,
             include_auxiliary=include_auxiliary,

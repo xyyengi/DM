@@ -124,6 +124,7 @@ def main() -> None:
         num_workers=0,
         condition_config=config["model"],
         state_thresholds=checkpoint.get("state_thresholds"),
+        event_weighting=checkpoint.get("event_weighting"),
     )
     daylight_mask, daylight_audit = build_station_daylight_mask(data_path, args.split)
     generated_standardized = []
@@ -234,6 +235,13 @@ def main() -> None:
         ),
         "condition_gate_values": model.condition_gate_values,
         "state_gate_values": model.state_gate_values,
+        "wind_common_gate_value": model.wind_common_gate_value,
+        "event_weighting_file": (
+            str(run_dir / "event_weighting.json")
+            if (run_dir / "event_weighting.json").is_file()
+            else None
+        ),
+        "event_weighting_applied_during_generation": False,
         "state_thresholds_file": (
             str(run_dir / "state_thresholds.json")
             if (run_dir / "state_thresholds.json").is_file()
@@ -249,6 +257,9 @@ def main() -> None:
         "ramp_auxiliary_lags": list(model.diffusion.ramp_auxiliary_lags),
         "ramp_auxiliary_lag_weights": list(
             model.diffusion.ramp_auxiliary_lag_weights
+        ),
+        "wind_common_event_loss_weight": float(
+            model.diffusion.wind_common_event_loss_weight
         ),
         "split": args.split,
         "n_samples": n_samples,

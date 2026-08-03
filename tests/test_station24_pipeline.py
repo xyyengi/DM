@@ -120,6 +120,49 @@ class Station24ModelTests(unittest.TestCase):
             )
         )
 
+    def test_common_wind_head_and_event_loss_are_lightweight_and_trainable(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        capacities = torch.linspace(10.0, 100.0, 24)
+        baseline = Station24DiffusionModel(
+            self.config("fixed_graph"), features, adjacency, capacities
+        )
+        config = self.config("fixed_graph")
+        config.update(
+            {
+                "use_forecast_revision": True,
+                "use_wind_common_residual_head": True,
+                "wind_common_channels": 4,
+                "wind_common_gate_init": -1.0,
+                "wind_common_event_loss_weight": 0.10,
+                "wind_common_event_level_fraction": 0.50,
+                "ramp_auxiliary_lags": [1, 3, 6],
+                "ramp_auxiliary_lag_weights": [0.5, 0.3, 0.2],
+            }
+        )
+        candidate = Station24DiffusionModel(
+            config, features, adjacency, capacities
+        )
+        increment = sum(p.numel() for p in candidate.parameters()) - sum(
+            p.numel() for p in baseline.parameters()
+        )
+        self.assertGreater(increment, 0)
+        self.assertLess(increment, 1000)
+        batch = self.batch()
+        batch["residual_scale"] = torch.full_like(
+            batch["residual_target"], 0.2
+        )
+        batch["loss_weight"] = torch.ones_like(batch["residual_target"])
+        batch["event_time_weight"] = torch.ones(2, 16)
+        batch["event_time_weight"][:, 8:] = 3.0
+        loss = candidate(batch)
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        self.assertIsNotNone(candidate.denoiser.wind_common_head[-1].weight.grad)
+        self.assertIsNotNone(candidate.denoiser.wind_common_gate.grad)
+        self.assertAlmostEqual(candidate.wind_common_gate_value, 0.2689414, places=5)
+
     def test_type_gated_graph_has_exact_relation_gates(self):
         from src.models.station_conditioned_diffusion import Station24DiffusionModel
 
@@ -546,6 +589,38 @@ class Station24DatasetTests(unittest.TestCase):
                 float(torch.max(item["residual_scale"][:13]) - torch.min(item["residual_scale"][:13])),
                 0.0,
             )
+
+    def test_event_weighting_is_train_only_and_bounded(self):
+        from station_dataset import (
+            StationForecastDataset,
+            fit_station_event_weighting,
+            fit_station_residual_scale,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_data(root)
+            scale = fit_station_residual_scale(root)
+            config = {
+                "event_max_weight": 3.0,
+                "event_negative_quantiles": [0.90, 0.99],
+                "event_ramp_quantiles": [0.90, 0.99],
+                "event_ramp_lags": [1, 3, 6],
+            }
+            specification = fit_station_event_weighting(root, config)
+            train_item = StationForecastDataset(
+                root, "train", scale, event_weighting=specification
+            )[0]
+            val_item = StationForecastDataset(
+                root, "val", scale, event_weighting=specification
+            )[0]
+            self.assertEqual(specification["fit_split"], "train")
+            self.assertFalse(specification["future_actual_used_as_condition"])
+            self.assertGreaterEqual(float(train_item["event_time_weight"].min()), 1.0)
+            self.assertLessEqual(float(train_item["event_time_weight"].max()), 3.0)
+            self.assertAlmostEqual(float(train_item["loss_weight"].mean()), 1.0, places=5)
+            self.assertTrue(torch.equal(val_item["loss_weight"], torch.ones_like(val_item["loss_weight"])))
+            self.assertTrue(torch.equal(val_item["event_time_weight"], torch.ones_like(val_item["event_time_weight"])))
 
     def test_generation_cli_smoke_uses_ema_and_writes_metrics(self):
         with tempfile.TemporaryDirectory() as directory:

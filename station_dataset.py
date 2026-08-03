@@ -481,6 +481,185 @@ def validate_station_state_thresholds(
     return dict(thresholds)
 
 
+def fit_station_event_weighting(
+    data_dir: str | Path,
+    condition_config: Mapping[str, object],
+) -> dict[str, object]:
+    """Fit train-only thresholds used to upweight rare wind events in the loss."""
+    data_dir = validate_station_data_dir(data_dir)
+    config = dict(condition_config)
+    residual = np.asarray(
+        np.load(data_dir / "train_residual.npy", mmap_mode="r"),
+        dtype=np.float64,
+    )
+    actual = np.asarray(
+        np.load(data_dir / "train_actual.npy", mmap_mode="r"),
+        dtype=np.float64,
+    )
+    valid = np.asarray(
+        np.load(data_dir / "train_fill_mask.npy", mmap_mode="r")
+    ) == 0
+    stations = pd.read_csv(data_dir / "station_order.csv").sort_values(
+        "channel_index"
+    ).reset_index(drop=True)
+    wind_indices = stations.index[stations.data_type.eq("wind")].to_numpy(int)
+    capacities = stations.capacity_mw.to_numpy(dtype=np.float64)
+    wind_capacity = capacities[wind_indices]
+    wind_weight = wind_capacity / wind_capacity.sum()
+    wind_valid = valid[:, :, wind_indices]
+    complete = wind_valid.all(axis=-1)
+    aggregate_residual = np.einsum(
+        "nts,s->nt", residual[:, :, wind_indices], wind_weight
+    )
+    aggregate_actual = np.einsum(
+        "nts,s->nt", actual[:, :, wind_indices], wind_weight
+    )
+
+    negative = np.maximum(-aggregate_residual[complete], 0.0)
+    negative_quantiles = tuple(
+        float(value)
+        for value in config.get("event_negative_quantiles", [0.90, 0.99])
+    )
+    if len(negative_quantiles) != 2 or not (
+        0 <= negative_quantiles[0] < negative_quantiles[1] <= 1
+    ):
+        raise ValueError("event_negative_quantiles must contain two increasing values")
+    negative_thresholds = np.quantile(negative, negative_quantiles)
+
+    ramp_lags = tuple(
+        int(value) for value in config.get("event_ramp_lags", [1, 3, 6])
+    )
+    ramp_quantiles = tuple(
+        float(value)
+        for value in config.get("event_ramp_quantiles", [0.90, 0.99])
+    )
+    if len(ramp_quantiles) != 2 or not (
+        0 <= ramp_quantiles[0] < ramp_quantiles[1] <= 1
+    ):
+        raise ValueError("event_ramp_quantiles must contain two increasing values")
+    ramp_thresholds: dict[str, list[float]] = {}
+    for lag in ramp_lags:
+        if not 1 <= lag < EXPECTED_HOURS:
+            raise ValueError(f"invalid event ramp lag={lag}")
+        pair_valid = complete[:, lag:] & complete[:, :-lag]
+        magnitude = np.abs(
+            aggregate_actual[:, lag:] - aggregate_actual[:, :-lag]
+        )[pair_valid]
+        ramp_thresholds[str(lag)] = [
+            float(value) for value in np.quantile(magnitude, ramp_quantiles)
+        ]
+
+    return {
+        "method": "train_target_aggregate_wind_event_quantiles",
+        "fit_split": "train",
+        "used_for": "training_loss_weight_only",
+        "future_actual_used_as_condition": False,
+        "applied_to_validation_or_generation": False,
+        "max_weight": float(config.get("event_max_weight", 3.0)),
+        "negative_quantiles": list(negative_quantiles),
+        "negative_thresholds": [float(value) for value in negative_thresholds],
+        "ramp_quantiles": list(ramp_quantiles),
+        "ramp_lags": list(ramp_lags),
+        "ramp_thresholds": ramp_thresholds,
+        "synchronous_residual_threshold": float(
+            config.get("event_synchronous_residual_threshold", 0.25)
+        ),
+        "synchronous_fraction_start": float(
+            config.get("event_synchronous_fraction_start", 0.30)
+        ),
+        "synchronous_fraction_full": float(
+            config.get("event_synchronous_fraction_full", 0.80)
+        ),
+        "wind_station_indices": [int(value) for value in wind_indices],
+        "wind_capacity_weights": [float(value) for value in wind_weight],
+    }
+
+
+def validate_station_event_weighting(
+    specification: Mapping[str, object],
+) -> dict[str, object]:
+    specification = dict(specification)
+    if specification.get("fit_split") != "train":
+        raise ValueError("event weighting must be fitted on train")
+    if bool(specification.get("future_actual_used_as_condition", True)):
+        raise ValueError("event targets cannot be exposed as generation conditions")
+    if bool(specification.get("applied_to_validation_or_generation", True)):
+        raise ValueError("event weighting must be disabled outside training")
+    maximum = float(specification.get("max_weight", 0.0))
+    if not 1.0 <= maximum <= 5.0:
+        raise ValueError("event max_weight must be in [1,5]")
+    indices = np.asarray(specification.get("wind_station_indices"), dtype=int)
+    weights = np.asarray(specification.get("wind_capacity_weights"), dtype=float)
+    if indices.ndim != 1 or weights.shape != indices.shape or weights.sum() <= 0:
+        raise ValueError("invalid wind station weights")
+    return specification
+
+
+def build_station_event_loss_weights(
+    actual: np.ndarray,
+    residual: np.ndarray,
+    valid_mask: np.ndarray,
+    specification: Mapping[str, object] | None,
+    split: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return [S,L] epsilon weights and [L] aggregate-event weights."""
+    station_count, length = residual.shape
+    loss_weight = np.ones((station_count, length), dtype=np.float32)
+    time_weight = np.ones(length, dtype=np.float32)
+    if specification is None or split != "train":
+        return loss_weight, time_weight
+    spec = validate_station_event_weighting(specification)
+    indices = np.asarray(spec["wind_station_indices"], dtype=int)
+    capacity_weight = np.asarray(spec["wind_capacity_weights"], dtype=np.float64)
+    aggregate_residual = np.einsum(
+        "st,s->t", residual[indices], capacity_weight
+    )
+    aggregate_actual = np.einsum("st,s->t", actual[indices], capacity_weight)
+    complete = valid_mask[indices].min(axis=0) > 0.5
+
+    def severity(value: np.ndarray, thresholds: list[float]) -> np.ndarray:
+        start, full = (float(thresholds[0]), float(thresholds[1]))
+        denominator = max(full - start, 1e-6)
+        return np.clip((value - start) / denominator, 0.0, 1.0)
+
+    event = severity(
+        np.maximum(-aggregate_residual, 0.0), spec["negative_thresholds"]
+    )
+    for lag in (int(value) for value in spec["ramp_lags"]):
+        ramp = np.zeros(length, dtype=np.float64)
+        ramp[lag:] = np.abs(aggregate_actual[lag:] - aggregate_actual[:-lag])
+        event = np.maximum(
+            event, severity(ramp, spec["ramp_thresholds"][str(lag)])
+        )
+    synchronous = np.mean(
+        residual[indices]
+        <= -float(spec["synchronous_residual_threshold"]),
+        axis=0,
+    )
+    sync_start = float(spec["synchronous_fraction_start"])
+    sync_full = float(spec["synchronous_fraction_full"])
+    event = np.maximum(
+        event,
+        np.clip(
+            (synchronous - sync_start) / max(sync_full - sync_start, 1e-6),
+            0.0,
+            1.0,
+        ),
+    )
+    event *= complete
+    time_weight = (
+        1.0 + (float(spec["max_weight"]) - 1.0) * event
+    ).astype(np.float32)
+    loss_weight[indices] = time_weight[None]
+    # Keep the average valid epsilon contribution at one, changing emphasis
+    # rather than the optimizer's effective learning rate.
+    denominator = float((loss_weight * valid_mask).sum())
+    numerator = float(valid_mask.sum())
+    if denominator > 0:
+        loss_weight *= numerator / denominator
+    return loss_weight, time_weight
+
+
 class StationForecastDataset(Dataset):
     """One item is one forecast issuance with 24 stations and 168 lead hours."""
 
@@ -491,6 +670,7 @@ class StationForecastDataset(Dataset):
         residual_scale: Mapping[str, object],
         condition_config: Mapping[str, object] | None = None,
         state_thresholds: Mapping[str, object] | None = None,
+        event_weighting: Mapping[str, object] | None = None,
     ) -> None:
         if split not in {"train", "val", "test"}:
             raise ValueError(f"unsupported split={split!r}")
@@ -505,6 +685,11 @@ class StationForecastDataset(Dataset):
         self.residual_scale = dict(residual_scale)
         self.scale = validate_residual_scale(self.residual_scale)
         self.condition_config = dict(condition_config or {})
+        self.event_weighting = (
+            validate_station_event_weighting(event_weighting)
+            if event_weighting is not None
+            else None
+        )
         self.use_state_encoder = bool(
             self.condition_config.get("use_state_encoder", False)
         )
@@ -566,6 +751,11 @@ class StationForecastDataset(Dataset):
                 self.residual_scale.get("method", "per_station_std")
             ),
             "future_actual_used_as_condition": False,
+            "event_weighting_enabled": self.event_weighting is not None,
+            "event_weighting_applied": bool(
+                self.event_weighting is not None and split == "train"
+            ),
+            "event_weighting_uses_target_as_condition": False,
         }
         self._validate_shapes()
 
@@ -668,6 +858,13 @@ class StationForecastDataset(Dataset):
             revision_mask=revision_mask,
         )
         target = residual / scale_tensor
+        loss_weight, event_time_weight = build_station_event_loss_weights(
+            actual,
+            residual,
+            valid_mask,
+            self.event_weighting,
+            self.split,
+        )
         return {
             "sample_index": torch.tensor(index, dtype=torch.long),
             "forecast": torch.from_numpy(forecast),
@@ -688,6 +885,8 @@ class StationForecastDataset(Dataset):
             "recent_error": torch.from_numpy(recent_error),
             "recent_error_mask": torch.from_numpy(recent_error_mask),
             "node_state": torch.from_numpy(node_state),
+            "loss_weight": torch.from_numpy(loss_weight),
+            "event_time_weight": torch.from_numpy(event_time_weight),
         }
 
 
@@ -772,6 +971,7 @@ def get_station_dataloader(
     num_workers: int = 0,
     condition_config: Mapping[str, object] | None = None,
     state_thresholds: Mapping[str, object] | None = None,
+    event_weighting: Mapping[str, object] | None = None,
 ) -> tuple[DataLoader, StationForecastDataset]:
     dataset = StationForecastDataset(
         data_dir,
@@ -779,6 +979,7 @@ def get_station_dataloader(
         residual_scale,
         condition_config=condition_config,
         state_thresholds=state_thresholds,
+        event_weighting=event_weighting,
     )
     generator = torch.Generator()
     split_offset = {"train": 0, "val": 10_000, "test": 20_000}[split]
@@ -807,5 +1008,14 @@ def write_station_state_thresholds(
 ) -> None:
     Path(path).write_text(
         json.dumps(dict(thresholds), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def write_station_event_weighting(
+    path: str | Path, specification: Mapping[str, object]
+) -> None:
+    Path(path).write_text(
+        json.dumps(dict(specification), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
