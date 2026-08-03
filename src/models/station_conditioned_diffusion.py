@@ -1,7 +1,8 @@
 """Lead-aware conditional ResUNet diffusion for 24 wind/solar stations.
 
 Stations remain an explicit spatial axis.  Temporal convolutions share weights
-across stations; optional graph propagation is applied once at the bottleneck.
+across stations; optional graph propagation can be sequential or fused through
+a lightweight station-and-time-dependent parallel branch.
 """
 
 from __future__ import annotations
@@ -69,6 +70,16 @@ def _normalize_adjacency(adjacency: torch.Tensor) -> torch.Tensor:
     degree = adjacency.sum(dim=1).clamp(min=1e-8)
     inverse_sqrt = degree.rsqrt()
     return inverse_sqrt[:, None] * adjacency * inverse_sqrt[None, :]
+
+
+def _normalize_batched_adjacency(adjacency: torch.Tensor) -> torch.Tensor:
+    if adjacency.ndim != 3 or adjacency.shape[-1] != adjacency.shape[-2]:
+        raise ValueError(
+            f"batched adjacency must be [B,S,S], got {tuple(adjacency.shape)}"
+        )
+    degree = adjacency.sum(dim=-1).clamp(min=1e-8)
+    inverse_sqrt = degree.rsqrt()
+    return inverse_sqrt[:, :, None] * adjacency * inverse_sqrt[:, None, :]
 
 
 def _flatten_stations(value: torch.Tensor) -> tuple[torch.Tensor, int, int]:
@@ -520,6 +531,309 @@ class StationSpatialBlock(nn.Module):
         return value + _restore_stations(transformed, batch, stations)
 
 
+class StationParallelGraphFusion(nn.Module):
+    """Fuse temporal and graph branches with a local dynamic gate.
+
+    The temporal branch is produced by the existing FiLM-conditioned ResBlock.
+    The spatial branch starts from the same pre-ResBlock hidden state plus the
+    already-available forecast condition.  The graph can remain geographic or
+    use a small condition/state-dependent residual on top of that physical
+    prior.  A zero-initialized local gate learns when each station and lead hour
+    should use the graph message.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        adjacency: torch.Tensor,
+        station_features: torch.Tensor,
+        groups: int,
+        dropout: float,
+        gate_init: float = -1.0,
+        adjacency_mode: str = "fixed",
+        state_channels: int | None = None,
+        dynamic_embedding_dim: int = 16,
+        dynamic_top_k: int = 6,
+        dynamic_temperature: float = 1.0,
+        dynamic_mix_gate_init: float = -3.0,
+    ) -> None:
+        super().__init__()
+        self.channels = int(channels)
+        self.adjacency_mode = str(adjacency_mode)
+        if self.adjacency_mode not in {"fixed", "hybrid_dynamic"}:
+            raise ValueError(
+                "parallel adjacency mode must be fixed or hybrid_dynamic, got "
+                f"{self.adjacency_mode!r}"
+            )
+        normalized_adjacency = _normalize_adjacency(adjacency)
+        self.register_buffer("normalized_adjacency", normalized_adjacency)
+        self.register_buffer(
+            "off_geographic_mask",
+            (adjacency <= 0).float(),
+        )
+        self.spatial_norm = nn.GroupNorm(
+            _group_count(self.channels, groups), self.channels
+        )
+        self.spatial_projection = nn.Conv1d(
+            self.channels, self.channels, kernel_size=1
+        )
+        self.dropout = nn.Dropout(float(dropout))
+        self.gate_prior = nn.Parameter(torch.tensor(float(gate_init)))
+        self.gate_projection = nn.Conv1d(self.channels * 3, 1, kernel_size=1)
+        nn.init.zeros_(self.gate_projection.weight)
+        nn.init.zeros_(self.gate_projection.bias)
+
+        self.dynamic_embedding_dim = int(dynamic_embedding_dim)
+        self.dynamic_top_k = int(dynamic_top_k)
+        self.dynamic_temperature = float(dynamic_temperature)
+        self.dynamic_state_channels = int(state_channels or 0)
+        self.dynamic_node_encoder = None
+        self.static_node_projection = None
+        self.dynamic_node_norm = None
+        self.dynamic_mix_gate = None
+        if self.adjacency_mode == "hybrid_dynamic":
+            station_count = int(adjacency.shape[0])
+            if not 1 <= self.dynamic_top_k < station_count:
+                raise ValueError(
+                    f"dynamic_top_k must be in [1,{station_count - 1}]"
+                )
+            if self.dynamic_embedding_dim <= 0:
+                raise ValueError("dynamic_embedding_dim must be positive")
+            if self.dynamic_temperature <= 0:
+                raise ValueError("dynamic_temperature must be positive")
+            dynamic_input_channels = self.channels + self.dynamic_state_channels
+            self.dynamic_node_encoder = nn.Sequential(
+                nn.Linear(dynamic_input_channels * 2, self.dynamic_embedding_dim),
+                nn.SiLU(),
+                nn.Linear(self.dynamic_embedding_dim, self.dynamic_embedding_dim),
+            )
+            self.static_node_projection = nn.Linear(
+                int(station_features.shape[1]),
+                self.dynamic_embedding_dim,
+                bias=False,
+            )
+            self.dynamic_node_norm = nn.LayerNorm(self.dynamic_embedding_dim)
+            self.dynamic_mix_gate = nn.Parameter(
+                torch.tensor(float(dynamic_mix_gate_init))
+            )
+            self.register_buffer(
+                "static_station_features", station_features.float()
+            )
+
+        self.register_buffer(
+            "gate_observed_sum", torch.tensor(0.0, dtype=torch.float64), persistent=False
+        )
+        self.register_buffer(
+            "gate_observed_square_sum",
+            torch.tensor(0.0, dtype=torch.float64),
+            persistent=False,
+        )
+        self.register_buffer(
+            "gate_observed_count", torch.tensor(0, dtype=torch.long), persistent=False
+        )
+        self.register_buffer(
+            "gate_observed_min", torch.tensor(float("inf")), persistent=False
+        )
+        self.register_buffer(
+            "gate_observed_max", torch.tensor(float("-inf")), persistent=False
+        )
+        station_count = int(adjacency.shape[0])
+        self.register_buffer(
+            "adjacency_observed_sum",
+            torch.zeros(station_count, station_count, dtype=torch.float64),
+            persistent=False,
+        )
+        self.register_buffer(
+            "adjacency_observed_square_sum",
+            torch.zeros(station_count, station_count, dtype=torch.float64),
+            persistent=False,
+        )
+        self.register_buffer(
+            "adjacency_observed_count",
+            torch.tensor(0, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "off_geographic_mass_sum",
+            torch.tensor(0.0, dtype=torch.float64),
+            persistent=False,
+        )
+
+    def reset_gate_statistics(self) -> None:
+        self.gate_observed_sum.zero_()
+        self.gate_observed_square_sum.zero_()
+        self.gate_observed_count.zero_()
+        self.gate_observed_min.fill_(float("inf"))
+        self.gate_observed_max.fill_(float("-inf"))
+        self.adjacency_observed_sum.zero_()
+        self.adjacency_observed_square_sum.zero_()
+        self.adjacency_observed_count.zero_()
+        self.off_geographic_mass_sum.zero_()
+
+    def gate_statistics(self) -> dict[str, float]:
+        values = {
+            "prior": float(torch.sigmoid(self.gate_prior.detach()).cpu()),
+        }
+        if self.dynamic_mix_gate is not None:
+            values["dynamic_mix"] = float(
+                torch.sigmoid(self.dynamic_mix_gate.detach()).cpu()
+            )
+        if int(self.gate_observed_count.detach().cpu()) > 0:
+            mean = self.gate_observed_sum / self.gate_observed_count
+            variance = (
+                self.gate_observed_square_sum / self.gate_observed_count - mean.square()
+            ).clamp(min=0.0)
+            values.update(
+                {
+                    "observed_mean": float(mean.cpu()),
+                    "observed_std": float(variance.sqrt().cpu()),
+                    "observed_min": float(self.gate_observed_min.cpu()),
+                    "observed_max": float(self.gate_observed_max.cpu()),
+                }
+            )
+        if int(self.adjacency_observed_count.detach().cpu()) > 0:
+            count = self.adjacency_observed_count.double()
+            adjacency_mean = self.adjacency_observed_sum / count
+            adjacency_variance = (
+                self.adjacency_observed_square_sum / count
+                - adjacency_mean.square()
+            ).clamp(min=0.0)
+            values.update(
+                {
+                    "adjacency_mean": float(adjacency_mean.mean().cpu()),
+                    "adjacency_std": float(adjacency_variance.mean().sqrt().cpu()),
+                    "off_geographic_mass": float(
+                        (self.off_geographic_mass_sum / count).cpu()
+                    ),
+                }
+            )
+        return values
+
+    def adjacency_moments(self) -> dict[str, torch.Tensor]:
+        if int(self.adjacency_observed_count.detach().cpu()) == 0:
+            return {}
+        count = self.adjacency_observed_count.double()
+        mean = self.adjacency_observed_sum / count
+        variance = (
+            self.adjacency_observed_square_sum / count - mean.square()
+        ).clamp(min=0.0)
+        return {
+            "mean": mean.detach().float().cpu(),
+            "std": variance.sqrt().detach().float().cpu(),
+        }
+
+    def _hybrid_adjacency(
+        self,
+        condition: torch.Tensor,
+        state_condition: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.adjacency_mode == "fixed":
+            return self.normalized_adjacency[None].expand(
+                condition.shape[0], -1, -1
+            )
+        if self.dynamic_node_encoder is None or self.dynamic_mix_gate is None:
+            raise RuntimeError("hybrid dynamic graph modules were not initialized")
+        dynamic_inputs = [condition]
+        if self.dynamic_state_channels:
+            if state_condition is None:
+                raise ValueError(
+                    "state_condition is required by the hybrid dynamic graph"
+                )
+            if state_condition.shape[:2] != condition.shape[:2] or (
+                state_condition.shape[-1] != condition.shape[-1]
+            ):
+                raise ValueError("dynamic graph condition/state axes do not match")
+            if state_condition.shape[2] != self.dynamic_state_channels:
+                raise ValueError(
+                    "unexpected dynamic graph state channels: "
+                    f"{state_condition.shape[2]} != {self.dynamic_state_channels}"
+                )
+            dynamic_inputs.append(state_condition)
+        context = torch.cat(dynamic_inputs, dim=2)
+        pooled = torch.cat(
+            [context.mean(dim=-1), context.var(dim=-1, unbiased=False).add(1e-6).sqrt()],
+            dim=-1,
+        )
+        dynamic_nodes = self.dynamic_node_encoder(pooled)
+        static_nodes = self.static_node_projection(self.static_station_features)
+        nodes = self.dynamic_node_norm(dynamic_nodes + static_nodes[None])
+        similarity = torch.einsum("bid,bjd->bij", nodes, nodes)
+        similarity = similarity / math.sqrt(self.dynamic_embedding_dim)
+        similarity = 0.5 * (similarity + similarity.transpose(1, 2))
+
+        station_count = similarity.shape[-1]
+        identity = torch.eye(
+            station_count, dtype=torch.bool, device=similarity.device
+        )[None]
+        ranking = similarity.masked_fill(identity, float("-inf"))
+        neighbors = ranking.topk(self.dynamic_top_k, dim=-1).indices
+        sparse_mask = torch.zeros_like(similarity, dtype=torch.bool)
+        sparse_mask.scatter_(-1, neighbors, True)
+        sparse_mask = sparse_mask | sparse_mask.transpose(1, 2) | identity
+        dynamic = F.softplus(similarity / self.dynamic_temperature)
+        dynamic = dynamic * sparse_mask.to(dynamic.dtype)
+        dynamic = dynamic + identity.to(dynamic.dtype)
+        dynamic = _normalize_batched_adjacency(dynamic)
+        mix = torch.sigmoid(self.dynamic_mix_gate)
+        return (1.0 - mix) * self.normalized_adjacency[None] + mix * dynamic
+
+    def _observe_adjacency(self, adjacency: torch.Tensor) -> None:
+        detached = adjacency.detach().double()
+        self.adjacency_observed_sum.add_(detached.sum(dim=0))
+        self.adjacency_observed_square_sum.add_(detached.square().sum(dim=0))
+        self.adjacency_observed_count.add_(detached.shape[0])
+        off_mass = (
+            detached * self.off_geographic_mask[None].double()
+        ).sum(dim=(1, 2)) / detached.sum(dim=(1, 2)).clamp(min=1e-12)
+        self.off_geographic_mass_sum.add_(off_mass.sum())
+
+    def forward(
+        self,
+        source: torch.Tensor,
+        temporal: torch.Tensor,
+        condition: torch.Tensor,
+        state_condition: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if source.shape != temporal.shape or source.shape != condition.shape:
+            raise ValueError(
+                "parallel fusion inputs must share [B,S,C,L], got "
+                f"source={tuple(source.shape)} temporal={tuple(temporal.shape)} "
+                f"condition={tuple(condition.shape)}"
+            )
+        graph_source = source + condition
+        adjacency = self._hybrid_adjacency(condition, state_condition)
+        message = torch.einsum("bij,bjct->bict", adjacency, graph_source)
+        message_flat, batch, stations = _flatten_stations(message)
+        spatial_flat = self.spatial_projection(
+            F.silu(self.spatial_norm(message_flat))
+        )
+        spatial_flat = self.dropout(spatial_flat)
+        temporal_flat, _, _ = _flatten_stations(temporal)
+        condition_flat, _, _ = _flatten_stations(condition)
+        gate = torch.sigmoid(
+            self.gate_prior
+            + self.gate_projection(
+                torch.cat([temporal_flat, spatial_flat, condition_flat], dim=1)
+            )
+        )
+        if not self.training:
+            with torch.no_grad():
+                if self.adjacency_mode == "hybrid_dynamic":
+                    self._observe_adjacency(adjacency)
+                detached = gate.detach()
+                self.gate_observed_sum.add_(detached.double().sum())
+                self.gate_observed_square_sum.add_(detached.double().square().sum())
+                self.gate_observed_count.add_(detached.numel())
+                self.gate_observed_min.copy_(
+                    torch.minimum(self.gate_observed_min, detached.min().float())
+                )
+                self.gate_observed_max.copy_(
+                    torch.maximum(self.gate_observed_max, detached.max().float())
+                )
+        fused_flat = temporal_flat + gate * spatial_flat
+        return _restore_stations(fused_flat, batch, stations)
+
+
 class StationConditionalResUNet1D(nn.Module):
     """Conditional temporal ResUNet with an explicit station axis."""
 
@@ -572,6 +886,50 @@ class StationConditionalResUNet1D(nn.Module):
                 f"allowed={sorted(allowed_spatial_levels)}"
             )
         self.spatial_mix_levels = spatial_mix_levels
+        configured_parallel_levels = config.get(
+            "parallel_spatial_fusion_levels", []
+        )
+        if not isinstance(configured_parallel_levels, (list, tuple)):
+            raise ValueError(
+                "parallel_spatial_fusion_levels must be a list of level names"
+            )
+        parallel_levels = tuple(str(value) for value in configured_parallel_levels)
+        if len(set(parallel_levels)) != len(parallel_levels):
+            raise ValueError(
+                "parallel_spatial_fusion_levels must not contain duplicates"
+            )
+        unknown_parallel_levels = set(parallel_levels) - allowed_spatial_levels
+        if unknown_parallel_levels:
+            raise ValueError(
+                "unsupported parallel_spatial_fusion_levels="
+                f"{sorted(unknown_parallel_levels)}; "
+                f"allowed={sorted(allowed_spatial_levels)}"
+            )
+        overlap = set(parallel_levels) & set(spatial_mix_levels)
+        if overlap:
+            raise ValueError(
+                "sequential and parallel graph fusion cannot share levels: "
+                f"{sorted(overlap)}"
+            )
+        if parallel_levels and self.spatial_mode != "fixed_graph":
+            raise ValueError(
+                "parallel graph fusion currently requires spatial_mode=fixed_graph"
+            )
+        self.parallel_spatial_fusion_levels = parallel_levels
+        self.parallel_spatial_adjacency_mode = str(
+            config.get("parallel_spatial_adjacency_mode", "fixed")
+        )
+        if self.parallel_spatial_adjacency_mode not in {
+            "fixed",
+            "hybrid_dynamic",
+        }:
+            raise ValueError(
+                "parallel_spatial_adjacency_mode must be fixed or hybrid_dynamic"
+            )
+        if not parallel_levels and self.parallel_spatial_adjacency_mode != "fixed":
+            raise ValueError(
+                "hybrid dynamic adjacency requires a parallel spatial fusion level"
+            )
 
         self.register_buffer("station_features", station_features.float())
         self.timestep_embedding = DiffusionTimestepEmbedding(
@@ -646,6 +1004,48 @@ class StationConditionalResUNet1D(nn.Module):
                 )
                 for level in range(num_layers - 1)
                 if f"encoder_{level}" in self.spatial_mix_levels
+            }
+        )
+        spatial_level_channels = {
+            **{
+                f"encoder_{level}": self.channels[level]
+                for level in range(num_layers - 1)
+            },
+            "bottleneck": self.channels[-1],
+        }
+        self.parallel_spatial_blocks = nn.ModuleDict(
+            {
+                level: StationParallelGraphFusion(
+                    spatial_level_channels[level],
+                    adjacency,
+                    station_features,
+                    groups,
+                    dropout,
+                    gate_init=float(
+                        config.get("parallel_spatial_gate_init", -1.0)
+                    ),
+                    adjacency_mode=self.parallel_spatial_adjacency_mode,
+                    state_channels=(
+                        state_widths[int(level.split("_")[-1])]
+                        if self.use_state_encoder and level.startswith("encoder_")
+                        else (
+                            state_widths[-1]
+                            if self.use_state_encoder and level == "bottleneck"
+                            else None
+                        )
+                    ),
+                    dynamic_embedding_dim=int(
+                        config.get("dynamic_graph_embedding_dim", 16)
+                    ),
+                    dynamic_top_k=int(config.get("dynamic_graph_top_k", 6)),
+                    dynamic_temperature=float(
+                        config.get("dynamic_graph_temperature", 1.0)
+                    ),
+                    dynamic_mix_gate_init=float(
+                        config.get("dynamic_graph_mix_gate_init", -3.0)
+                    ),
+                )
+                for level in self.parallel_spatial_fusion_levels
             }
         )
         self.bottleneck = StationResBlock(
@@ -741,13 +1141,22 @@ class StationConditionalResUNet1D(nn.Module):
         hidden = _restore_stations(hidden, batch, stations)
         skips = []
         for level, block in enumerate(self.encoder_blocks):
-            hidden = block(
-                hidden,
+            branch_input = hidden
+            temporal = block(
+                branch_input,
                 time_embedding,
                 conditions[level],
                 None if state_conditions is None else state_conditions[level],
             )
             spatial_level = f"encoder_{level}"
+            hidden = temporal
+            if spatial_level in self.parallel_spatial_blocks:
+                hidden = self.parallel_spatial_blocks[spatial_level](
+                    branch_input,
+                    temporal,
+                    conditions[level],
+                    None if state_conditions is None else state_conditions[level],
+                )
             if spatial_level in self.encoder_spatial_blocks:
                 hidden = self.encoder_spatial_blocks[spatial_level](hidden)
             skips.append(hidden)
@@ -756,12 +1165,21 @@ class StationConditionalResUNet1D(nn.Module):
                 hidden = _restore_stations(
                     self.downsamples[level](flattened), batch, stations
                 )
-        hidden = self.bottleneck(
-            hidden,
+        bottleneck_input = hidden
+        temporal = self.bottleneck(
+            bottleneck_input,
             time_embedding,
             conditions[-1],
             None if state_conditions is None else state_conditions[-1],
         )
+        hidden = temporal
+        if "bottleneck" in self.parallel_spatial_blocks:
+            hidden = self.parallel_spatial_blocks["bottleneck"](
+                bottleneck_input,
+                temporal,
+                conditions[-1],
+                None if state_conditions is None else state_conditions[-1],
+            )
         if "bottleneck" in self.spatial_mix_levels:
             hidden = self.spatial_block(hidden)
 
@@ -991,6 +1409,14 @@ class Station24DiffusionModel(nn.Module):
         return self.denoiser.spatial_mix_levels
 
     @property
+    def parallel_spatial_fusion_levels(self) -> tuple[str, ...]:
+        return self.denoiser.parallel_spatial_fusion_levels
+
+    @property
+    def parallel_spatial_adjacency_mode(self) -> str:
+        return self.denoiser.parallel_spatial_adjacency_mode
+
+    @property
     def spatial_gate_values(self) -> dict[str, float]:
         if self.denoiser.spatial_mix_levels == ("bottleneck",):
             # Preserve the legacy metadata shape for old single-scale runs.
@@ -1003,6 +1429,28 @@ class Station24DiffusionModel(nn.Module):
             for relation, value in self.denoiser.spatial_block.gate_values().items():
                 values[f"bottleneck/{relation}"] = value
         return values
+
+    @property
+    def parallel_spatial_gate_statistics(self) -> dict[str, float]:
+        values: dict[str, float] = {}
+        for level, block in self.denoiser.parallel_spatial_blocks.items():
+            for name, value in block.gate_statistics().items():
+                values[f"{level}/{name}"] = value
+        return values
+
+    def reset_parallel_spatial_gate_statistics(self) -> None:
+        for block in self.denoiser.parallel_spatial_blocks.values():
+            block.reset_gate_statistics()
+
+    @property
+    def parallel_spatial_adjacency_moments(
+        self,
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        return {
+            level: moments
+            for level, block in self.denoiser.parallel_spatial_blocks.items()
+            if (moments := block.adjacency_moments())
+        }
 
     @property
     def condition_gate_values(self) -> dict[str, float]:

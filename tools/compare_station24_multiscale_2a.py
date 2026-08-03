@@ -19,6 +19,7 @@ LABELS = {
     "state_v1_fixed_graph": "State V1 / bottleneck graph",
     "state_v1_multiscale_graph": "Experiment 2A / multiscale graph",
 }
+TITLE = "Station24 Experiment 2A paired validation comparison"
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,7 +27,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("result_dirs", nargs=2)
     parser.add_argument("--data-path", default="diffusion_input_station")
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--baseline-variant", default=ORDER[0])
+    parser.add_argument("--candidate-variant", default=ORDER[1])
+    parser.add_argument("--baseline-label", default=LABELS[ORDER[0]])
+    parser.add_argument("--candidate-label", default=LABELS[ORDER[1]])
+    parser.add_argument("--baseline-spatial-levels", nargs="+", default=["bottleneck"])
+    parser.add_argument(
+        "--candidate-spatial-levels",
+        nargs="+",
+        default=["encoder_0", "encoder_1", "bottleneck"],
+    )
+    parser.add_argument("--baseline-parallel-levels", nargs="*", default=[])
+    parser.add_argument("--candidate-parallel-levels", nargs="*", default=[])
+    parser.add_argument("--baseline-parallel-adjacency", default="fixed")
+    parser.add_argument("--candidate-parallel-adjacency", default="fixed")
+    parser.add_argument("--title", default=TITLE)
+    parser.add_argument("--figure-prefix", default="multiscale_2a")
     return parser.parse_args()
+
+
+def configure_comparison(args: argparse.Namespace) -> None:
+    global ORDER, LABELS, TITLE
+    if args.baseline_variant == args.candidate_variant:
+        raise ValueError("baseline and candidate variants must differ")
+    ORDER = [args.baseline_variant, args.candidate_variant]
+    LABELS = {
+        ORDER[0]: args.baseline_label,
+        ORDER[1]: args.candidate_label,
+    }
+    TITLE = args.title
 
 
 def nested(metrics: dict, *keys: str) -> float:
@@ -36,7 +65,15 @@ def nested(metrics: dict, *keys: str) -> float:
     return float(value)
 
 
-def load_results(paths: list[str] | tuple[str, ...]) -> dict[str, dict]:
+def load_results(
+    paths: list[str] | tuple[str, ...],
+    expected_baseline_levels: list[str],
+    expected_candidate_levels: list[str],
+    expected_baseline_parallel_levels: list[str],
+    expected_candidate_parallel_levels: list[str],
+    expected_baseline_parallel_adjacency: str,
+    expected_candidate_parallel_adjacency: str,
+) -> dict[str, dict]:
     results = {}
     signatures = set()
     for raw in paths:
@@ -45,11 +82,11 @@ def load_results(paths: list[str] | tuple[str, ...]) -> dict[str, dict]:
         run = metrics["run"]
         variant = run.get("condition_variant")
         if variant not in ORDER or variant in results:
-            raise ValueError(f"unexpected or duplicate Experiment 2A variant {variant}")
+            raise ValueError(f"unexpected or duplicate comparison variant {variant}")
         if run["spatial_mode"] != "fixed_graph":
-            raise ValueError("Experiment 2A comparison requires fixed_graph")
+            raise ValueError("paired comparison requires fixed_graph")
         if bool(run.get("test_used")) or run["split"] != "val":
-            raise ValueError("Experiment 2A comparison is validation-only")
+            raise ValueError("paired comparison is validation-only")
         signatures.add(
             (
                 run["split"],
@@ -60,17 +97,50 @@ def load_results(paths: list[str] | tuple[str, ...]) -> dict[str, dict]:
         )
         results[variant] = {"path": path, "metrics": metrics}
     if set(results) != set(ORDER) or len(signatures) != 1:
-        raise ValueError("Experiment 2A variants or generation protocols do not match")
-    baseline_levels = results[ORDER[0]]["metrics"]["run"].get(
+        raise ValueError("variants or generation protocols do not match")
+    observed_baseline_levels = results[ORDER[0]]["metrics"]["run"].get(
         "spatial_mix_levels", ["bottleneck"]
     )
-    candidate_levels = results[ORDER[1]]["metrics"]["run"].get(
+    observed_candidate_levels = results[ORDER[1]]["metrics"]["run"].get(
         "spatial_mix_levels"
     )
-    if baseline_levels != ["bottleneck"]:
-        raise ValueError(f"unexpected State V1 graph levels: {baseline_levels}")
-    if candidate_levels != ["encoder_0", "encoder_1", "bottleneck"]:
-        raise ValueError(f"unexpected Experiment 2A graph levels: {candidate_levels}")
+    if observed_baseline_levels != list(expected_baseline_levels):
+        raise ValueError(
+            f"unexpected baseline graph levels: {observed_baseline_levels}; "
+            f"expected={list(expected_baseline_levels)}"
+        )
+    if observed_candidate_levels != list(expected_candidate_levels):
+        raise ValueError(
+            f"unexpected candidate graph levels: {observed_candidate_levels}; "
+            f"expected={list(expected_candidate_levels)}"
+        )
+    for variant, expected_levels, expected_adjacency, role in [
+        (
+            ORDER[0],
+            expected_baseline_parallel_levels,
+            expected_baseline_parallel_adjacency,
+            "baseline",
+        ),
+        (
+            ORDER[1],
+            expected_candidate_parallel_levels,
+            expected_candidate_parallel_adjacency,
+            "candidate",
+        ),
+    ]:
+        run = results[variant]["metrics"]["run"]
+        observed_parallel = run.get("parallel_spatial_fusion_levels", [])
+        if observed_parallel != list(expected_levels):
+            raise ValueError(
+                f"unexpected {role} parallel levels: {observed_parallel}; "
+                f"expected={list(expected_levels)}"
+            )
+        observed_adjacency = run.get("parallel_spatial_adjacency_mode", "fixed")
+        if observed_adjacency != expected_adjacency:
+            raise ValueError(
+                f"unexpected {role} parallel adjacency: {observed_adjacency}; "
+                f"expected={expected_adjacency}"
+            )
     return results
 
 
@@ -145,13 +215,24 @@ def build_gate_table(results: dict[str, dict]) -> pd.DataFrame:
                     "sigmoid_gate_value": float(value),
                 }
             )
+        for gate, value in run.get(
+            "parallel_spatial_gate_statistics", {}
+        ).items():
+            rows.append(
+                {
+                    "variant": variant,
+                    "label": LABELS[variant],
+                    "gate": f"parallel/{gate}",
+                    "sigmoid_gate_value": float(value),
+                }
+            )
     return pd.DataFrame(rows)
 
 
 def plot_summary(summary: pd.DataFrame, output: Path) -> None:
     fig, axes = plt.subplots(2, 4, figsize=(18, 8.5))
     x = np.arange(len(summary))
-    labels = ["Bottleneck", "Multiscale"]
+    labels = [LABELS[variant] for variant in ORDER]
     plots = [
         ("wind_station_coverage_90", "Wind station 90% coverage", 0.90),
         ("wind_aggregate_mw_coverage_90", "Wind aggregate 90% coverage", 0.90),
@@ -167,10 +248,10 @@ def plot_summary(summary: pd.DataFrame, output: Path) -> None:
         if nominal is not None:
             axis.axhline(nominal, color="#dc2626", linestyle="--", linewidth=1)
             axis.set_ylim(0, 1)
-        axis.set_xticks(x, labels)
+        axis.set_xticks(x, labels, rotation=12, ha="right")
         axis.set_title(title)
         axis.grid(axis="y", alpha=0.25)
-    fig.suptitle("Station24 Experiment 2A paired validation comparison")
+    fig.suptitle(TITLE)
     fig.tight_layout()
     fig.savefig(output, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -240,17 +321,26 @@ def markdown_table(frame: pd.DataFrame) -> str:
 
 def main() -> None:
     args = parse_args()
+    configure_comparison(args)
     output = Path(args.output_dir)
     if output.exists():
         raise FileExistsError(f"refusing to overwrite {output}")
     figures = output / "figures"
     figures.mkdir(parents=True)
-    results = load_results(args.result_dirs)
+    results = load_results(
+        args.result_dirs,
+        list(args.baseline_spatial_levels),
+        list(args.candidate_spatial_levels),
+        list(args.baseline_parallel_levels),
+        list(args.candidate_parallel_levels),
+        str(args.baseline_parallel_adjacency),
+        str(args.candidate_parallel_adjacency),
+    )
     summary = build_summary(results)
     gates = build_gate_table(results)
     summary.to_csv(output / "comparison_summary.csv", index=False)
     gates.to_csv(output / "spatial_gate_values.csv", index=False)
-    plot_summary(summary, figures / "multiscale_2a_key_metrics.png")
+    plot_summary(summary, figures / f"{args.figure_prefix}_key_metrics.png")
     stations = pd.read_csv(Path(args.data_path) / "station_order.csv").sort_values(
         "channel_index"
     )
@@ -272,12 +362,14 @@ def main() -> None:
         "variogram_score",
         "spatial_corr_rmse",
     ]
-    report = "# Station24 Experiment 2A comparison\n\n"
+    report = f"# {TITLE}\n\n"
     report += (
-        "Only the graph-mixing locations differ: the baseline mixes at the 42-hour "
-        "bottleneck, while Experiment 2A mixes at 168/84/42-hour U-Net scales. "
+        f"Paired comparison: {LABELS[ORDER[0]]} versus {LABELS[ORDER[1]]}. "
         "State V1 features, residual target, FiLM, optimizer, validation members, "
-        "generation seed, reverse steps, and physical projection are unchanged.\n\n"
+        "generation seed, reverse steps, and physical projection are unchanged. "
+        f"Candidate sequential graph levels={list(args.candidate_spatial_levels)}; "
+        f"parallel fusion levels={list(args.candidate_parallel_levels)}; "
+        f"parallel adjacency={args.candidate_parallel_adjacency}.\n\n"
     )
     report += markdown_table(summary[columns]) + "\n\n"
     report += f"Representative validation issue index: `{typical}`.\n"

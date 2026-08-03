@@ -140,6 +140,124 @@ class Station24ModelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported spatial_mix_levels"):
             Station24DiffusionModel(config, features, adjacency)
 
+    def test_cdsg_lite_parallel_fusion_is_local_and_lightweight(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        baseline = Station24DiffusionModel(
+            self.config("fixed_graph"), features, adjacency
+        )
+        config = self.config("fixed_graph")
+        config["parallel_spatial_fusion_levels"] = ["encoder_0"]
+        candidate = Station24DiffusionModel(config, features, adjacency)
+        self.assertEqual(baseline.parallel_spatial_fusion_levels, ())
+        self.assertEqual(candidate.parallel_spatial_fusion_levels, ("encoder_0",))
+        # C=4: norm 8 + projection 20 + prior 1 + local gate (12+1) = 42.
+        baseline_count = sum(parameter.numel() for parameter in baseline.parameters())
+        candidate_count = sum(parameter.numel() for parameter in candidate.parameters())
+        self.assertEqual(candidate_count - baseline_count, 42)
+
+        candidate.reset_parallel_spatial_gate_statistics()
+        candidate.eval()
+        loss = candidate(self.batch())
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        fusion = candidate.denoiser.parallel_spatial_blocks["encoder_0"]
+        self.assertIsNotNone(fusion.spatial_projection.weight.grad)
+        self.assertIsNotNone(fusion.gate_projection.weight.grad)
+        self.assertIsNotNone(fusion.gate_prior.grad)
+        statistics = candidate.parallel_spatial_gate_statistics
+        self.assertEqual(
+            set(statistics),
+            {
+                "encoder_0/prior",
+                "encoder_0/observed_mean",
+                "encoder_0/observed_std",
+                "encoder_0/observed_min",
+                "encoder_0/observed_max",
+            },
+        )
+        generated = candidate.generate(self.batch(batch_size=1), n_samples=2)
+        self.assertEqual(tuple(generated.shape), (1, 2, 24, 16))
+
+    def test_cdsg_lite_parallel_fusion_rejects_double_graph_at_same_level(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        config = self.config("fixed_graph")
+        config["spatial_mix_levels"] = ["encoder_0", "bottleneck"]
+        config["parallel_spatial_fusion_levels"] = ["encoder_0"]
+        with self.assertRaisesRegex(ValueError, "cannot share levels"):
+            Station24DiffusionModel(config, features, adjacency)
+
+    def test_cdsg_lite_hybrid_dynamic_graph_is_sparse_light_and_trainable(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        fixed_config = self.config("fixed_graph")
+        fixed_config["parallel_spatial_fusion_levels"] = ["encoder_0"]
+        fixed = Station24DiffusionModel(fixed_config, features, adjacency)
+
+        dynamic_config = self.config("fixed_graph")
+        dynamic_config.update(
+            {
+                "parallel_spatial_fusion_levels": ["encoder_0"],
+                "parallel_spatial_adjacency_mode": "hybrid_dynamic",
+                "dynamic_graph_embedding_dim": 16,
+                "dynamic_graph_top_k": 3,
+                "dynamic_graph_temperature": 1.0,
+                "dynamic_graph_mix_gate_init": -3.0,
+            }
+        )
+        dynamic = Station24DiffusionModel(dynamic_config, features, adjacency)
+        fixed_count = sum(parameter.numel() for parameter in fixed.parameters())
+        dynamic_count = sum(parameter.numel() for parameter in dynamic.parameters())
+        # C=4 and d=16: dynamic MLP 416, static projection 80,
+        # LayerNorm 32, and one residual-mix gate.
+        self.assertEqual(dynamic_count - fixed_count, 529)
+        self.assertEqual(
+            dynamic.parallel_spatial_adjacency_mode, "hybrid_dynamic"
+        )
+
+        dynamic.reset_parallel_spatial_gate_statistics()
+        dynamic.eval()
+        loss = dynamic(self.batch())
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        fusion = dynamic.denoiser.parallel_spatial_blocks["encoder_0"]
+        self.assertIsNotNone(fusion.dynamic_mix_gate.grad)
+        self.assertIsNotNone(fusion.dynamic_node_encoder[0].weight.grad)
+        self.assertIsNotNone(fusion.static_node_projection.weight.grad)
+        statistics = dynamic.parallel_spatial_gate_statistics
+        self.assertIn("encoder_0/dynamic_mix", statistics)
+        self.assertIn("encoder_0/off_geographic_mass", statistics)
+        moments = dynamic.parallel_spatial_adjacency_moments["encoder_0"]
+        self.assertEqual(tuple(moments["mean"].shape), (24, 24))
+        self.assertEqual(tuple(moments["std"].shape), (24, 24))
+
+    def test_cdsg_lite_hybrid_dynamic_graph_accepts_state_v1_context(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        config = self.config("fixed_graph")
+        config.update(
+            {
+                "parallel_spatial_fusion_levels": ["encoder_0"],
+                "parallel_spatial_adjacency_mode": "hybrid_dynamic",
+                "dynamic_graph_embedding_dim": 8,
+                "dynamic_graph_top_k": 3,
+                "use_state_encoder": True,
+                "state_feature_dim": 4,
+                "state_channels": [2, 4, 8],
+            }
+        )
+        model = Station24DiffusionModel(config, features, adjacency)
+        loss = model(self.batch())
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        generated = model.generate(self.batch(batch_size=1), n_samples=2)
+        self.assertEqual(tuple(generated.shape), (1, 2, 24, 16))
+
     def test_condition_variants_forward_backward_and_sample(self):
         from src.models.station_conditioned_diffusion import Station24DiffusionModel
 
@@ -455,6 +573,7 @@ class Station24DatasetTests(unittest.TestCase):
             metrics = (output_dir / "metrics.json").read_text(encoding="utf-8")
             self.assertIn('"spatial_mode": "fixed_graph"', metrics)
             self.assertIn('"spatial_mix_levels": [', metrics)
+            self.assertIn('"parallel_spatial_fusion_levels": []', metrics)
             self.assertTrue((output_dir / "station_daylight_mask.npy").is_file())
 
             comparison_inputs = []
@@ -621,6 +740,124 @@ class Station24DatasetTests(unittest.TestCase):
                     multiscale_comparison
                     / "figures"
                     / "typical_scenario_envelopes.png"
+                ).is_file()
+            )
+
+            cdsg_inputs = []
+            for variant, parallel_levels in [
+                ("state_v1_fixed_graph", []),
+                ("state_v1_cdsg_lite_parallel", ["encoder_0"]),
+            ]:
+                copied = root / f"cdsg_lite_{variant}"
+                shutil.copytree(output_dir, copied)
+                copied_metrics = json.loads(
+                    (copied / "metrics.json").read_text(encoding="utf-8")
+                )
+                copied_metrics["run"]["condition_variant"] = variant
+                copied_metrics["run"]["spatial_mix_levels"] = ["bottleneck"]
+                copied_metrics["run"][
+                    "parallel_spatial_fusion_levels"
+                ] = parallel_levels
+                copied_metrics["run"]["parallel_spatial_gate_statistics"] = (
+                    {"encoder_0/observed_mean": 0.25} if parallel_levels else {}
+                )
+                (copied / "metrics.json").write_text(
+                    json.dumps(copied_metrics), encoding="utf-8"
+                )
+                cdsg_inputs.append(str(copied))
+            cdsg_comparison = root / "cdsg_lite_comparison"
+            subprocess.run(
+                [
+                    sys.executable,
+                    "tools/compare_station24_multiscale_2a.py",
+                    *cdsg_inputs,
+                    "--data-path",
+                    str(data_dir),
+                    "--output-dir",
+                    str(cdsg_comparison),
+                    "--candidate-variant",
+                    "state_v1_cdsg_lite_parallel",
+                    "--candidate-label",
+                    "CDSG-lite parallel fusion",
+                    "--candidate-spatial-levels",
+                    "bottleneck",
+                    "--candidate-parallel-levels",
+                    "encoder_0",
+                    "--figure-prefix",
+                    "cdsg_lite_2b",
+                ],
+                check=True,
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+            )
+            self.assertTrue(
+                (cdsg_comparison / "comparison_summary.csv").is_file()
+            )
+            self.assertTrue(
+                (cdsg_comparison / "figures" / "cdsg_lite_2b_key_metrics.png").is_file()
+            )
+
+            dynamic_result = root / "cdsg_lite_state_v1_cdsg_lite_hybrid_dynamic"
+            shutil.copytree(output_dir, dynamic_result)
+            dynamic_metrics = json.loads(
+                (dynamic_result / "metrics.json").read_text(encoding="utf-8")
+            )
+            dynamic_metrics["run"].update(
+                {
+                    "condition_variant": "state_v1_cdsg_lite_hybrid_dynamic",
+                    "spatial_mix_levels": ["bottleneck"],
+                    "parallel_spatial_fusion_levels": ["encoder_0"],
+                    "parallel_spatial_adjacency_mode": "hybrid_dynamic",
+                    "parallel_spatial_gate_statistics": {
+                        "encoder_0/observed_mean": 0.25,
+                        "encoder_0/dynamic_mix": 0.05,
+                    },
+                }
+            )
+            (dynamic_result / "metrics.json").write_text(
+                json.dumps(dynamic_metrics), encoding="utf-8"
+            )
+            comparison_2b_2c = root / "cdsg_lite_2b_2c_comparison"
+            subprocess.run(
+                [
+                    sys.executable,
+                    "tools/compare_station24_multiscale_2a.py",
+                    cdsg_inputs[1],
+                    str(dynamic_result),
+                    "--data-path",
+                    str(data_dir),
+                    "--output-dir",
+                    str(comparison_2b_2c),
+                    "--baseline-variant",
+                    "state_v1_cdsg_lite_parallel",
+                    "--candidate-variant",
+                    "state_v1_cdsg_lite_hybrid_dynamic",
+                    "--baseline-parallel-levels",
+                    "encoder_0",
+                    "--candidate-parallel-levels",
+                    "encoder_0",
+                    "--baseline-parallel-adjacency",
+                    "fixed",
+                    "--candidate-parallel-adjacency",
+                    "hybrid_dynamic",
+                    "--baseline-spatial-levels",
+                    "bottleneck",
+                    "--candidate-spatial-levels",
+                    "bottleneck",
+                    "--figure-prefix",
+                    "cdsg_lite_2b_2c",
+                ],
+                check=True,
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+            )
+            self.assertTrue(
+                (
+                    comparison_2b_2c
+                    / "figures"
+                    / "cdsg_lite_2b_2c_key_metrics.png"
                 ).is_file()
             )
 

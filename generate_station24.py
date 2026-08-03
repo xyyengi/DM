@@ -100,6 +100,18 @@ def main() -> None:
         raise ValueError("checkpoint architecture does not match config")
     if checkpoint.get("spatial_mode") != model.spatial_mode:
         raise ValueError("checkpoint spatial mode does not match config")
+    if checkpoint.get("spatial_mix_levels", ["bottleneck"]) != list(
+        model.spatial_mix_levels
+    ):
+        raise ValueError("checkpoint spatial levels do not match config")
+    if checkpoint.get("parallel_spatial_fusion_levels", []) != list(
+        model.parallel_spatial_fusion_levels
+    ):
+        raise ValueError("checkpoint parallel fusion levels do not match config")
+    if checkpoint.get("parallel_spatial_adjacency_mode", "fixed") != (
+        model.parallel_spatial_adjacency_mode
+    ):
+        raise ValueError("checkpoint parallel adjacency mode does not match config")
     state = checkpoint.get("ema_model_state_dict", checkpoint["model_state_dict"])
     model.load_state_dict(state, strict=True)
     model.eval()
@@ -121,6 +133,7 @@ def main() -> None:
     projected_actual_scenarios = []
     actual_values = []
     forecast_values = []
+    model.reset_parallel_spatial_gate_statistics()
 
     print(
         f"GENERATION split={args.split} issues={len(loader.dataset)} "
@@ -169,6 +182,16 @@ def main() -> None:
     np.save(output_dir / "actual_data_normalized.npy", actual_array)
     np.save(output_dir / "forecast_data_normalized.npy", forecast_array)
     np.save(output_dir / "station_daylight_mask.npy", daylight_mask)
+    for level, moments in model.parallel_spatial_adjacency_moments.items():
+        safe_level = level.replace("/", "_")
+        np.save(
+            output_dir / f"parallel_adjacency_{safe_level}_mean.npy",
+            moments["mean"].numpy(),
+        )
+        np.save(
+            output_dir / f"parallel_adjacency_{safe_level}_std.npy",
+            moments["std"].numpy(),
+        )
 
     stations = pd.read_csv(data_path / "station_order.csv").sort_values(
         "channel_index"
@@ -195,8 +218,17 @@ def main() -> None:
         "architecture": model.architecture,
         "spatial_mode": model.spatial_mode,
         "spatial_mix_levels": list(model.spatial_mix_levels),
+        "parallel_spatial_fusion_levels": list(
+            model.parallel_spatial_fusion_levels
+        ),
+        "parallel_spatial_adjacency_mode": (
+            model.parallel_spatial_adjacency_mode
+        ),
         "parameter_count": int(checkpoint["parameter_count"]),
         "spatial_gate_values": model.spatial_gate_values,
+        "parallel_spatial_gate_statistics": (
+            model.parallel_spatial_gate_statistics
+        ),
         "condition_variant": str(
             config.get("experiment", {}).get("variant", "baseline")
         ),

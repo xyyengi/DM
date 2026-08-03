@@ -139,6 +139,12 @@ def save_checkpoint(
         "architecture": model.architecture,
         "spatial_mode": model.spatial_mode,
         "spatial_mix_levels": list(model.spatial_mix_levels),
+        "parallel_spatial_fusion_levels": list(
+            model.parallel_spatial_fusion_levels
+        ),
+        "parallel_spatial_adjacency_mode": (
+            model.parallel_spatial_adjacency_mode
+        ),
         "epoch": int(epoch),
         "train_loss": float(train_loss),
         "val_loss": float(val_loss),
@@ -149,6 +155,9 @@ def save_checkpoint(
         "residual_scale": dict(residual_scale),
         "config": copy.deepcopy(dict(config)),
         "spatial_gate_values": model.spatial_gate_values,
+        "parallel_spatial_gate_statistics": (
+            model.parallel_spatial_gate_statistics
+        ),
         "condition_variant": str(config.get("experiment", {}).get("variant", "baseline")),
         "condition_gate_values": model.condition_gate_values,
         "state_gate_values": model.state_gate_values,
@@ -302,6 +311,9 @@ def main() -> None:
 
     print(
         f"MODEL architecture={model.architecture} spatial_mode={model.spatial_mode} "
+        f"spatial_levels={list(model.spatial_mix_levels)} "
+        f"parallel_levels={list(model.parallel_spatial_fusion_levels)} "
+        f"parallel_adjacency={model.parallel_spatial_adjacency_mode} "
         f"condition_variant={config.get('experiment', {}).get('variant', 'baseline')} "
         f"condition_gates={model.condition_gate_values} parameters={parameter_count} "
         f"state_gates={model.state_gate_values} "
@@ -403,11 +415,20 @@ def main() -> None:
         "architecture": model.architecture,
         "spatial_mode": model.spatial_mode,
         "spatial_mix_levels": list(model.spatial_mix_levels),
+        "parallel_spatial_fusion_levels": list(
+            model.parallel_spatial_fusion_levels
+        ),
+        "parallel_spatial_adjacency_mode": (
+            model.parallel_spatial_adjacency_mode
+        ),
         "condition_variant": str(
             config.get("experiment", {}).get("variant", "baseline")
         ),
         "condition_gate_values": model.condition_gate_values,
         "spatial_gate_values": model.spatial_gate_values,
+        "parallel_spatial_gate_statistics": (
+            model.parallel_spatial_gate_statistics
+        ),
         "state_gate_values": model.state_gate_values,
         "parameter_count": parameter_count,
         "best_epoch": best_epoch,
