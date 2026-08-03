@@ -75,6 +75,51 @@ class Station24ModelTests(unittest.TestCase):
         self.assertLess(counts["fixed_graph"] - counts["none"], 1000)
         self.assertLess(counts["type_gated_graph"] - counts["none"], 1000)
 
+    def test_ramp_auxiliary_loss_is_finite_and_parameter_free(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        base_config = self.config("fixed_graph")
+        auxiliary_config = dict(base_config)
+        auxiliary_config.update(
+            {
+                "ramp_auxiliary_loss_weight": 0.05,
+                "ramp_auxiliary_lags": [1, 3, 6],
+                "ramp_auxiliary_lag_weights": [0.5, 0.3, 0.2],
+            }
+        )
+        baseline = Station24DiffusionModel(base_config, features, adjacency)
+        auxiliary = Station24DiffusionModel(auxiliary_config, features, adjacency)
+        auxiliary.load_state_dict(baseline.state_dict())
+        self.assertEqual(
+            sum(parameter.numel() for parameter in baseline.parameters()),
+            sum(parameter.numel() for parameter in auxiliary.parameters()),
+        )
+        batch = self.batch()
+        batch["residual_scale"] = torch.full_like(batch["residual_target"], 0.2)
+        timestep = torch.tensor([0, 1])
+        noise = torch.randn_like(batch["residual_target"])
+        baseline_loss = baseline(batch, timestep=timestep, noise=noise)
+        auxiliary_loss = auxiliary(batch, timestep=timestep, noise=noise)
+        auxiliary_epsilon_only = auxiliary(
+            batch,
+            timestep=timestep,
+            noise=noise,
+            include_auxiliary=False,
+        )
+        self.assertTrue(torch.isfinite(auxiliary_loss))
+        self.assertTrue(
+            torch.allclose(auxiliary_epsilon_only, baseline_loss, atol=1e-7)
+        )
+        self.assertGreater(float(auxiliary_loss.detach()), float(baseline_loss.detach()))
+        auxiliary_loss.backward()
+        self.assertTrue(
+            all(
+                parameter.grad is None or torch.isfinite(parameter.grad).all()
+                for parameter in auxiliary.parameters()
+            )
+        )
+
     def test_type_gated_graph_has_exact_relation_gates(self):
         from src.models.station_conditioned_diffusion import Station24DiffusionModel
 
@@ -399,6 +444,7 @@ class Station24DatasetTests(unittest.TestCase):
             self.assertEqual(tuple(item["forecast_ramps"].shape), (24, 3, 168))
             self.assertEqual(tuple(item["forecast_revision"].shape), (24, 168))
             self.assertEqual(tuple(item["recent_error"].shape), (24, 24))
+            self.assertEqual(tuple(item["residual_scale"].shape), (24, 168))
             train_dataset = StationForecastDataset(root, "train", scale)
             conditioned = train_dataset[1]
             self.assertEqual(float(conditioned["revision_mask"][:, :144].min()), 1.0)
@@ -453,6 +499,54 @@ class Station24DatasetTests(unittest.TestCase):
             )[0]["node_state"]
             self.assertTrue(torch.equal(state_before, state_after))
 
+    def test_wind_conditional_scale_is_train_fitted_and_invertible(self):
+        from station_dataset import StationForecastDataset, fit_station_residual_scale
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_data(root)
+            train_forecast = np.broadcast_to(
+                np.linspace(0.05, 0.95, 168, dtype=np.float32)[None, :, None],
+                (2, 168, 24),
+            ).copy()
+            hourly_wave = (
+                0.05
+                + 0.10
+                * np.sin(np.arange(168, dtype=np.float32) * 2.0 * np.pi / 24.0)
+            )[None, :, None]
+            train_residual = train_forecast * hourly_wave
+            np.save(root / "train_forecast.npy", train_forecast)
+            np.save(root / "train_residual.npy", train_residual)
+            np.save(root / "train_actual.npy", train_forecast + train_residual)
+            scale = fit_station_residual_scale(
+                root,
+                method="wind_factorized_condition_std",
+                condition_config={
+                    "ramp_lag": 3,
+                    "factor_iterations": 3,
+                    "factor_clip": [0.5, 2.0],
+                },
+            )
+            self.assertEqual(scale["fit_split"], "train")
+            self.assertEqual(scale["method"], "wind_factorized_condition_std")
+            self.assertFalse(scale["future_actual_used_as_condition"])
+            self.assertNotIn("Infinity", json.dumps(scale))
+            dataset = StationForecastDataset(root, "train", scale)
+            item = dataset[1]
+            reconstructed = item["residual_target"] * item["residual_scale"]
+            self.assertTrue(torch.allclose(reconstructed, item["residual"], atol=1e-6))
+            base = torch.tensor(scale["scale"], dtype=torch.float32)
+            self.assertTrue(
+                torch.allclose(
+                    item["residual_scale"][13:],
+                    base[13:, None].expand(-1, 168),
+                )
+            )
+            self.assertGreater(
+                float(torch.max(item["residual_scale"][:13]) - torch.min(item["residual_scale"][:13])),
+                0.0,
+            )
+
     def test_generation_cli_smoke_uses_ema_and_writes_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -487,13 +581,22 @@ class Station24DatasetTests(unittest.TestCase):
                 "state_high_quantile": 0.90,
                 "state_ramp_quantile": 0.90,
                 "state_clip": 3.0,
+                "ramp_auxiliary_loss_weight": 0.05,
+                "ramp_auxiliary_lags": [1, 3, 6],
+                "ramp_auxiliary_lag_weights": [0.5, 0.3, 0.2],
             }
             config = {
                 "experiment": {"name": "smoke", "family": "test"},
                 "data": {"data_path": str(data_dir)},
                 "target": {
                     "type": "residual",
-                    "residual_scaling": {"epsilon": 1e-4},
+                    "residual_scaling": {
+                        "method": "wind_factorized_condition_std",
+                        "epsilon": 1e-4,
+                        "ramp_lag": 3,
+                        "factor_iterations": 2,
+                        "factor_clip": [0.5, 2.0],
+                    },
                 },
                 "model": model_config,
                 "train": {
@@ -574,6 +677,11 @@ class Station24DatasetTests(unittest.TestCase):
             self.assertIn('"spatial_mode": "fixed_graph"', metrics)
             self.assertIn('"spatial_mix_levels": [', metrics)
             self.assertIn('"parallel_spatial_fusion_levels": []', metrics)
+            self.assertIn(
+                '"residual_scaling_method": "wind_factorized_condition_std"',
+                metrics,
+            )
+            self.assertIn('"ramp_auxiliary_loss_weight": 0.05', metrics)
             self.assertTrue((output_dir / "station_daylight_mask.npy").is_file())
 
             comparison_inputs = []

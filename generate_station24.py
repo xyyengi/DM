@@ -88,7 +88,6 @@ def main() -> None:
     set_seed(seed)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     residual_scale = checkpoint["residual_scale"]
-    scale = np.asarray(residual_scale["scale"], dtype=np.float32)
     static = load_station_static_data(data_path)
     model = Station24DiffusionModel(
         config["model"],
@@ -149,7 +148,8 @@ def main() -> None:
                 chunks.append(model.generate(batch, n_samples=current).cpu())
             remaining -= current
         standardized = torch.cat(chunks, dim=1).numpy()  # [B,K,S,T]
-        residual = standardized * scale[None, None, :, None]
+        scale_tensor = raw_batch["residual_scale"].numpy()  # [B,S,T]
+        residual = standardized * scale_tensor[:, None, :, :]
         forecast = raw_batch["forecast"].numpy()  # [B,S,T]
         actual = raw_batch["actual"].numpy()
         raw_scenarios = forecast[:, None, :, :] + residual
@@ -240,6 +240,16 @@ def main() -> None:
             else None
         ),
         "condition_feature_audit": dataset.condition_audit,
+        "residual_scaling_method": str(
+            residual_scale.get("method", "per_station_std")
+        ),
+        "ramp_auxiliary_loss_weight": float(
+            model.diffusion.ramp_auxiliary_loss_weight
+        ),
+        "ramp_auxiliary_lags": list(model.diffusion.ramp_auxiliary_lags),
+        "ramp_auxiliary_lag_weights": list(
+            model.diffusion.ramp_auxiliary_lag_weights
+        ),
         "split": args.split,
         "n_samples": n_samples,
         "generation_seed": seed,

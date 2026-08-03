@@ -116,7 +116,12 @@ def validate(
             device=device,
             dtype=batch["residual_target"].dtype,
         )
-        loss = model(batch, timestep=timestep, noise=noise)
+        loss = model(
+            batch,
+            timestep=timestep,
+            noise=noise,
+            include_auxiliary=False,
+        )
         total_loss += float(loss) * batch_size
         total_samples += batch_size
     return total_loss / max(total_samples, 1)
@@ -227,7 +232,10 @@ def main() -> None:
 
     scale_config = config["target"]["residual_scaling"]
     residual_scale = fit_station_residual_scale(
-        data_path, epsilon=float(scale_config.get("epsilon", 1e-4))
+        data_path,
+        epsilon=float(scale_config.get("epsilon", 1e-4)),
+        method=str(scale_config.get("method", "per_station_std")),
+        condition_config=scale_config,
     )
     write_residual_scale(run_dir / "residual_scale.json", residual_scale)
     state_thresholds = None
@@ -315,6 +323,8 @@ def main() -> None:
         f"parallel_levels={list(model.parallel_spatial_fusion_levels)} "
         f"parallel_adjacency={model.parallel_spatial_adjacency_mode} "
         f"condition_variant={config.get('experiment', {}).get('variant', 'baseline')} "
+        f"residual_scaling={residual_scale.get('method', 'per_station_std')} "
+        f"ramp_aux_weight={model.diffusion.ramp_auxiliary_loss_weight} "
         f"condition_gates={model.condition_gate_values} parameters={parameter_count} "
         f"state_gates={model.state_gate_values} "
         f"trainable={trainable_count} device={device}"
@@ -430,6 +440,16 @@ def main() -> None:
             model.parallel_spatial_gate_statistics
         ),
         "state_gate_values": model.state_gate_values,
+        "residual_scaling_method": str(
+            residual_scale.get("method", "per_station_std")
+        ),
+        "ramp_auxiliary_loss_weight": float(
+            model.diffusion.ramp_auxiliary_loss_weight
+        ),
+        "ramp_auxiliary_lags": list(model.diffusion.ramp_auxiliary_lags),
+        "ramp_auxiliary_lag_weights": list(
+            model.diffusion.ramp_auxiliary_lag_weights
+        ),
         "parameter_count": parameter_count,
         "best_epoch": best_epoch,
         "best_fixed_noise_validation_mse": best_val,

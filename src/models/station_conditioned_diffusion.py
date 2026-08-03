@@ -1213,6 +1213,9 @@ class StationGaussianDiffusion(nn.Module):
         num_steps: int,
         beta_start: float,
         beta_end: float,
+        ramp_auxiliary_loss_weight: float = 0.0,
+        ramp_auxiliary_lags: tuple[int, ...] = (1, 3, 6),
+        ramp_auxiliary_lag_weights: tuple[float, ...] = (0.5, 0.3, 0.2),
     ) -> None:
         super().__init__()
         self.denoiser = denoiser
@@ -1223,6 +1226,21 @@ class StationGaussianDiffusion(nn.Module):
         self.register_buffer("beta", beta)
         self.register_buffer("alpha", alpha)
         self.register_buffer("alpha_hat", alpha_hat)
+        self.ramp_auxiliary_loss_weight = float(ramp_auxiliary_loss_weight)
+        self.ramp_auxiliary_lags = tuple(int(value) for value in ramp_auxiliary_lags)
+        self.ramp_auxiliary_lag_weights = tuple(
+            float(value) for value in ramp_auxiliary_lag_weights
+        )
+        if self.ramp_auxiliary_loss_weight < 0:
+            raise ValueError("ramp auxiliary loss weight must be non-negative")
+        if (
+            not self.ramp_auxiliary_lags
+            or len(self.ramp_auxiliary_lags) != len(self.ramp_auxiliary_lag_weights)
+            or any(lag <= 0 for lag in self.ramp_auxiliary_lags)
+            or any(weight < 0 for weight in self.ramp_auxiliary_lag_weights)
+            or sum(self.ramp_auxiliary_lag_weights) <= 0
+        ):
+            raise ValueError("invalid ramp auxiliary lags or lag weights")
 
     def add_noise(
         self,
@@ -1249,8 +1267,10 @@ class StationGaussianDiffusion(nn.Module):
         recent_error: torch.Tensor | None = None,
         recent_error_mask: torch.Tensor | None = None,
         node_state: torch.Tensor | None = None,
+        residual_scale: torch.Tensor | None = None,
         timestep: torch.Tensor | None = None,
         noise: torch.Tensor | None = None,
+        include_auxiliary: bool = True,
     ) -> torch.Tensor:
         if timestep is None:
             timestep = torch.randint(
@@ -1272,7 +1292,44 @@ class StationGaussianDiffusion(nn.Module):
         )
         squared_error = (prediction - noise) ** 2
         valid_mask = valid_mask.to(squared_error.dtype)
-        return (squared_error * valid_mask).sum() / valid_mask.sum().clamp(min=1.0)
+        epsilon_loss = (squared_error * valid_mask).sum() / valid_mask.sum().clamp(min=1.0)
+        if self.ramp_auxiliary_loss_weight <= 0 or not include_auxiliary:
+            return epsilon_loss
+        if residual_scale is None or residual_scale.shape != clean.shape:
+            raise ValueError(
+                "residual_scale [B,S,L] is required for ramp auxiliary loss"
+            )
+
+        alpha_hat = self.alpha_hat[timestep.long()].view(-1, 1, 1)
+        predicted_clean = (
+            noisy - (1.0 - alpha_hat).sqrt() * prediction
+        ) / alpha_hat.sqrt().clamp(min=1e-6)
+        physical_scale = residual_scale.to(predicted_clean.dtype)
+        predicted_actual = forecast + predicted_clean * physical_scale
+        target_actual = forecast + clean * physical_scale
+        # Suppress unstable x0 reconstruction at very noisy diffusion steps.
+        snr_weight = torch.sqrt(
+            alpha_hat / (1.0 - alpha_hat).clamp(min=1e-6)
+        ).clamp(max=1.0)
+        lag_weight_sum = sum(self.ramp_auxiliary_lag_weights)
+        ramp_loss = torch.zeros((), device=clean.device, dtype=clean.dtype)
+        for lag, lag_weight in zip(
+            self.ramp_auxiliary_lags, self.ramp_auxiliary_lag_weights
+        ):
+            if lag >= clean.shape[-1]:
+                raise ValueError(f"ramp auxiliary lag={lag} exceeds sequence length")
+            predicted_ramp = predicted_actual[:, :, lag:] - predicted_actual[:, :, :-lag]
+            target_ramp = target_actual[:, :, lag:] - target_actual[:, :, :-lag]
+            pair_mask = valid_mask[:, :, lag:] * valid_mask[:, :, :-lag]
+            weighted_error = (
+                torch.abs(predicted_ramp - target_ramp)
+                * pair_mask
+                * snr_weight
+            )
+            current = weighted_error.sum() / pair_mask.sum().clamp(min=1.0)
+            ramp_loss = ramp_loss + float(lag_weight) * current
+        ramp_loss = ramp_loss / float(lag_weight_sum)
+        return epsilon_loss + self.ramp_auxiliary_loss_weight * ramp_loss
 
     def reverse_variance(self, timestep: torch.Tensor) -> torch.Tensor:
         beta = self.beta[timestep]
@@ -1398,6 +1455,19 @@ class Station24DiffusionModel(nn.Module):
             num_steps=int(self.config.get("num_steps", 500)),
             beta_start=float(self.config.get("beta_start", 1e-4)),
             beta_end=float(self.config.get("beta_end", 0.04)),
+            ramp_auxiliary_loss_weight=float(
+                self.config.get("ramp_auxiliary_loss_weight", 0.0)
+            ),
+            ramp_auxiliary_lags=tuple(
+                int(value)
+                for value in self.config.get("ramp_auxiliary_lags", [1, 3, 6])
+            ),
+            ramp_auxiliary_lag_weights=tuple(
+                float(value)
+                for value in self.config.get(
+                    "ramp_auxiliary_lag_weights", [0.5, 0.3, 0.2]
+                )
+            ),
         )
 
     @property
@@ -1475,6 +1545,7 @@ class Station24DiffusionModel(nn.Module):
         batch: Mapping[str, torch.Tensor],
         timestep: torch.Tensor | None = None,
         noise: torch.Tensor | None = None,
+        include_auxiliary: bool = True,
     ) -> torch.Tensor:
         return self.diffusion.training_loss(
             batch["residual_target"],
@@ -1488,8 +1559,10 @@ class Station24DiffusionModel(nn.Module):
             recent_error=batch.get("recent_error"),
             recent_error_mask=batch.get("recent_error_mask"),
             node_state=batch.get("node_state"),
+            residual_scale=batch.get("residual_scale"),
             timestep=timestep,
             noise=noise,
+            include_auxiliary=include_auxiliary,
         )
 
     def generate(

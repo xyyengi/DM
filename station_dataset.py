@@ -54,8 +54,10 @@ def validate_station_data_dir(data_dir: str | Path) -> Path:
 def fit_station_residual_scale(
     data_dir: str | Path,
     epsilon: float = 1e-4,
+    method: str = "per_station_std",
+    condition_config: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Fit per-station residual standard deviations on valid train values only."""
+    """Fit residual normalization on valid train values only."""
     data_dir = validate_station_data_dir(data_dir)
     residual = np.load(data_dir / "train_residual.npy", mmap_mode="r")
     fill_mask = np.load(data_dir / "train_fill_mask.npy", mmap_mode="r")
@@ -69,7 +71,7 @@ def fit_station_residual_scale(
         scale = max(float(values.std()), float(epsilon))
         scales.append(scale)
         counts.append(int(values.size))
-    return {
+    result: dict[str, object] = {
         "method": "per_station_std",
         "fit_split": "train",
         "center": False,
@@ -77,6 +79,189 @@ def fit_station_residual_scale(
         "scale": scales,
         "valid_value_count": counts,
     }
+    if method == "per_station_std":
+        return result
+    if method != "wind_factorized_condition_std":
+        raise ValueError(f"unsupported residual scaling method={method!r}")
+
+    config = dict(condition_config or {})
+    forecast = np.asarray(
+        np.load(data_dir / "train_forecast.npy", mmap_mode="r"),
+        dtype=np.float64,
+    )
+    residual_array = np.asarray(residual, dtype=np.float64)
+    valid = np.asarray(fill_mask) == 0
+    stations = pd.read_csv(data_dir / "station_order.csv").sort_values(
+        "channel_index"
+    ).reset_index(drop=True)
+    wind_indices = stations.index[stations.data_type.eq("wind")].to_numpy(int)
+    wind_mask = np.zeros(forecast.shape, dtype=bool)
+    wind_mask[:, :, wind_indices] = True
+    valid &= wind_mask
+
+    issue_frame = pd.read_csv(data_dir / "train_issue_dates.csv")
+    issue_days = pd.to_datetime(issue_frame["issue_date"]).dt.normalize()
+    lookup = {timestamp: index for index, timestamp in enumerate(issue_days)}
+    previous = np.asarray(
+        [lookup.get(timestamp - pd.Timedelta(days=1), -1) for timestamp in issue_days],
+        dtype=np.int64,
+    )
+    revision = np.full_like(forecast, np.nan)
+    for index, previous_index in enumerate(previous):
+        if previous_index >= 0:
+            revision[index, :144] = (
+                forecast[index, :144] - forecast[previous_index, 24:]
+            )
+
+    ramp_lag = int(config.get("ramp_lag", 3))
+    if not 1 <= ramp_lag < EXPECTED_HOURS:
+        raise ValueError("conditional residual ramp_lag must be between 1 and 167")
+    ramp = np.full_like(forecast, np.nan)
+    ramp[:, ramp_lag:] = np.abs(
+        forecast[:, ramp_lag:] - forecast[:, :-ramp_lag]
+    )
+    lead_day = np.broadcast_to(
+        (np.arange(EXPECTED_HOURS) // 24 + 1)[None, :, None],
+        forecast.shape,
+    ).astype(np.float64)
+
+    def quantile_edges(values: np.ndarray, quantiles: list[float]) -> np.ndarray:
+        selected = values[valid & np.isfinite(values)]
+        if not len(selected):
+            raise ValueError("no valid train values for conditional residual scaling")
+        edges = np.quantile(selected, quantiles)
+        edges[0], edges[-1] = -1.0e30, 1.0e30
+        for edge_index in range(1, len(edges)):
+            if edges[edge_index] <= edges[edge_index - 1]:
+                edges[edge_index] = np.nextafter(edges[edge_index - 1], np.inf)
+        return edges
+
+    level_quantiles = [
+        float(value)
+        for value in config.get("forecast_level_quantiles", [0, 0.2, 0.4, 0.6, 0.8, 1])
+    ]
+    ramp_quantiles = [
+        float(value)
+        for value in config.get("forecast_ramp_quantiles", [0, 0.25, 0.5, 0.75, 1])
+    ]
+    revision_quantiles = [
+        float(value)
+        for value in config.get("forecast_revision_quantiles", [0, 0.25, 0.5, 0.75, 1])
+    ]
+    for name, quantiles in [
+        ("forecast_level", level_quantiles),
+        ("forecast_ramp", ramp_quantiles),
+        ("forecast_revision", revision_quantiles),
+    ]:
+        if quantiles[0] != 0.0 or quantiles[-1] != 1.0 or any(
+            right <= left for left, right in zip(quantiles, quantiles[1:])
+        ):
+            raise ValueError(f"invalid {name} quantiles={quantiles}")
+
+    feature_values = {
+        "forecast_level": forecast,
+        "lead_day": lead_day,
+        "forecast_ramp": ramp,
+        "forecast_revision": np.abs(revision),
+    }
+    edges = {
+        "forecast_level": quantile_edges(forecast, level_quantiles),
+        "lead_day": np.arange(0.5, 8.5, 1.0, dtype=np.float64),
+        "forecast_ramp": quantile_edges(ramp, ramp_quantiles),
+        "forecast_revision": quantile_edges(np.abs(revision), revision_quantiles),
+    }
+    bin_index = {
+        name: np.digitize(
+            feature_values[name], condition_edges[1:-1], right=False
+        )
+        for name, condition_edges in edges.items()
+    }
+    factor_values = {
+        name: np.ones(len(condition_edges) - 1, dtype=np.float64)
+        for name, condition_edges in edges.items()
+    }
+    base = np.asarray(scales, dtype=np.float64)[None, None, :]
+    iterations = int(config.get("factor_iterations", 6))
+    factor_clip = config.get("factor_clip", [0.5, 2.0])
+    clip_low, clip_high = float(factor_clip[0]), float(factor_clip[1])
+    if iterations <= 0 or not 0 < clip_low < clip_high:
+        raise ValueError("invalid conditional residual factor fitting settings")
+
+    for _ in range(iterations):
+        for name, condition_edges in edges.items():
+            other_multiplier = np.ones_like(forecast, dtype=np.float64)
+            for other_name, other_factors in factor_values.items():
+                if other_name == name:
+                    continue
+                other_valid = np.isfinite(feature_values[other_name])
+                other_multiplier[other_valid] *= other_factors[
+                    bin_index[other_name][other_valid]
+                ]
+            normalized = residual_array / (base * other_multiplier)
+            values = feature_values[name]
+            counts_by_bin = []
+            updated = []
+            for current_bin in range(len(condition_edges) - 1):
+                selected = (
+                    valid
+                    & np.isfinite(values)
+                    & (bin_index[name] == current_bin)
+                )
+                sample = normalized[selected]
+                counts_by_bin.append(int(sample.size))
+                updated.append(float(np.std(sample)) if sample.size else 1.0)
+            updated_array = np.clip(
+                np.asarray(updated, dtype=np.float64), clip_low, clip_high
+            )
+            counts_array = np.asarray(counts_by_bin, dtype=np.float64)
+            if counts_array.sum() > 0:
+                log_center = np.average(
+                    np.log(np.maximum(updated_array, epsilon)),
+                    weights=counts_array,
+                )
+                updated_array = np.clip(
+                    updated_array / np.exp(log_center), clip_low, clip_high
+                )
+            factor_values[name] = updated_array
+
+    combined_multiplier = np.ones_like(forecast, dtype=np.float64)
+    for name, fitted_factors in factor_values.items():
+        available = np.isfinite(feature_values[name])
+        combined_multiplier[available] *= fitted_factors[
+            bin_index[name][available]
+        ]
+    unconditional_scales = np.asarray(scales, dtype=np.float64)
+    adjusted_scales = unconditional_scales.copy()
+    for station_index in wind_indices:
+        selected = valid[:, :, station_index]
+        standardized = residual_array[:, :, station_index][selected] / (
+            unconditional_scales[station_index]
+            * combined_multiplier[:, :, station_index][selected]
+        )
+        adjusted_scales[station_index] *= max(float(np.std(standardized)), epsilon)
+
+    result.update(
+        {
+            "method": "wind_factorized_condition_std",
+            "future_condition_source": "issued_forecast_and_previous_issue_forecast",
+            "future_actual_used_as_condition": False,
+            "wind_station_indices": wind_indices.tolist(),
+            "ramp_lag": ramp_lag,
+            "factor_iterations": iterations,
+            "factor_clip": [clip_low, clip_high],
+            "unconditional_station_scale": unconditional_scales.tolist(),
+            "scale": adjusted_scales.tolist(),
+            "condition_edges": {
+                name: condition_edges.tolist()
+                for name, condition_edges in edges.items()
+            },
+            "condition_factors": {
+                name: values.tolist() for name, values in factor_values.items()
+            },
+            "missing_revision_factor": 1.0,
+        }
+    )
+    return result
 
 
 def validate_residual_scale(
@@ -92,7 +277,94 @@ def validate_residual_scale(
         raise ValueError(f"invalid residual scale shape/value: {scale.shape}")
     if np.any(scale <= 0):
         raise ValueError("all residual scales must be positive")
+    method = residual_scale.get("method", "per_station_std")
+    if method not in {"per_station_std", "wind_factorized_condition_std"}:
+        raise ValueError(f"unsupported residual scale method={method!r}")
+    if method == "wind_factorized_condition_std":
+        if bool(residual_scale.get("future_actual_used_as_condition", True)):
+            raise ValueError("future actual cannot be used for residual scaling")
+        wind_indices = np.asarray(
+            residual_scale.get("wind_station_indices"), dtype=np.int64
+        )
+        if (
+            wind_indices.ndim != 1
+            or not len(wind_indices)
+            or np.any(wind_indices < 0)
+            or np.any(wind_indices >= station_count)
+        ):
+            raise ValueError("invalid wind station indices in residual scale")
+        edges = residual_scale.get("condition_edges", {})
+        factors = residual_scale.get("condition_factors", {})
+        for name in [
+            "forecast_level",
+            "lead_day",
+            "forecast_ramp",
+            "forecast_revision",
+        ]:
+            condition_edges = np.asarray(edges.get(name), dtype=np.float64)
+            condition_factors = np.asarray(factors.get(name), dtype=np.float64)
+            if (
+                condition_edges.ndim != 1
+                or len(condition_edges) != len(condition_factors) + 1
+                or not np.all(np.diff(condition_edges) > 0)
+                or not np.isfinite(condition_factors).all()
+                or np.any(condition_factors <= 0)
+            ):
+                raise ValueError(f"invalid conditional residual factor {name}")
     return scale
+
+
+def build_station_residual_scale_tensor(
+    residual_scale: Mapping[str, object],
+    forecast: np.ndarray,
+    forecast_revision: np.ndarray | None = None,
+    revision_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Build generation-known [station, lead] residual scales."""
+    base = validate_residual_scale(residual_scale)
+    forecast = np.asarray(forecast, dtype=np.float32)
+    if forecast.shape != (EXPECTED_STATIONS, EXPECTED_HOURS):
+        raise ValueError(f"forecast expected (24,168), got {forecast.shape}")
+    output = np.broadcast_to(base[:, None], forecast.shape).copy()
+    if residual_scale.get("method", "per_station_std") == "per_station_std":
+        return output
+
+    wind_indices = np.asarray(
+        residual_scale["wind_station_indices"], dtype=np.int64
+    )
+    ramp_lag = int(residual_scale["ramp_lag"])
+    ramp = np.full_like(forecast, np.nan)
+    ramp[:, ramp_lag:] = np.abs(
+        forecast[:, ramp_lag:] - forecast[:, :-ramp_lag]
+    )
+    lead_day = np.broadcast_to(
+        (np.arange(EXPECTED_HOURS) // 24 + 1)[None, :], forecast.shape
+    ).astype(np.float32)
+    if forecast_revision is None:
+        forecast_revision = np.zeros_like(forecast)
+    if revision_mask is None:
+        revision_mask = np.zeros_like(forecast)
+    features = {
+        "forecast_level": forecast,
+        "lead_day": lead_day,
+        "forecast_ramp": ramp,
+        "forecast_revision": np.abs(np.asarray(forecast_revision, dtype=np.float32)),
+    }
+    edges = residual_scale["condition_edges"]
+    factors = residual_scale["condition_factors"]
+    multiplier = np.ones_like(forecast, dtype=np.float32)
+    for name, values in features.items():
+        condition_edges = np.asarray(edges[name], dtype=np.float64)
+        condition_factors = np.asarray(factors[name], dtype=np.float32)
+        valid = np.isfinite(values)
+        if name == "forecast_revision":
+            valid &= np.asarray(revision_mask) > 0
+        bins = np.digitize(values[valid], condition_edges[1:-1], right=False)
+        multiplier[valid] *= condition_factors[bins]
+    output[wind_indices] *= multiplier[wind_indices]
+    if not np.isfinite(output).all() or np.any(output <= 0):
+        raise ValueError("conditional residual scale tensor is invalid")
+    return output
 
 
 def fit_station_state_thresholds(
@@ -230,7 +502,8 @@ class StationForecastDataset(Dataset):
         self.time_mark = np.load(self.data_dir / f"{split}_time_mark.npy")
         self.lead_mark = np.load(self.data_dir / f"{split}_lead_mark.npy")
         self.fill_mask = np.load(self.data_dir / f"{split}_fill_mask.npy")
-        self.scale = validate_residual_scale(residual_scale)
+        self.residual_scale = dict(residual_scale)
+        self.scale = validate_residual_scale(self.residual_scale)
         self.condition_config = dict(condition_config or {})
         self.use_state_encoder = bool(
             self.condition_config.get("use_state_encoder", False)
@@ -289,6 +562,9 @@ class StationForecastDataset(Dataset):
             ] if self.use_state_encoder else [],
             "state_ramp_lags": list(self.state_ramp_lags) if self.use_state_encoder else [],
             "state_source": "current_issued_forecast_only" if self.use_state_encoder else None,
+            "residual_scaling_method": str(
+                self.residual_scale.get("method", "per_station_std")
+            ),
             "future_actual_used_as_condition": False,
         }
         self._validate_shapes()
@@ -325,7 +601,6 @@ class StationForecastDataset(Dataset):
         forecast = np.asarray(self.forecast[index], dtype=np.float32).T.copy()
         actual = np.asarray(self.actual[index], dtype=np.float32).T.copy()
         residual = np.asarray(self.residual[index], dtype=np.float32).T.copy()
-        target = residual / self.scale[:, None]
         valid_mask = 1.0 - np.asarray(
             self.fill_mask[index], dtype=np.float32
         ).T.copy()
@@ -386,12 +661,20 @@ class StationForecastDataset(Dataset):
             ).T
             recent_error[:] = previous_residual[:, : self.recent_error_hours]
             recent_error_mask[:] = 1.0
+        scale_tensor = build_station_residual_scale_tensor(
+            self.residual_scale,
+            forecast,
+            forecast_revision=forecast_revision,
+            revision_mask=revision_mask,
+        )
+        target = residual / scale_tensor
         return {
             "sample_index": torch.tensor(index, dtype=torch.long),
             "forecast": torch.from_numpy(forecast),
             "actual": torch.from_numpy(actual),
             "residual": torch.from_numpy(residual),
             "residual_target": torch.from_numpy(target),
+            "residual_scale": torch.from_numpy(scale_tensor),
             "calendar": torch.from_numpy(
                 np.asarray(self.time_mark[index], dtype=np.float32).T.copy()
             ),

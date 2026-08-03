@@ -1,0 +1,99 @@
+experiment:
+  name: "station24_state_v1_cdsg_2e_ramp_aux_168h"
+  family: "station24_cdsg_2e"
+  variant: "state_v1_cdsg_2e_conditional_scale_ramp_aux"
+  description: "Experiment 2E: 2D conditional scaling plus lightweight 1h/3h/6h physical ramp reconstruction loss"
+
+data:
+  data_path: "./diffusion_input_station"
+  station_count: 24
+  sequence_length: 168
+  residual_definition: "actual_minus_current_forecast"
+
+target:
+  type: "residual"
+  residual_scaling:
+    method: "wind_factorized_condition_std"
+    fit_split: "train"
+    center: false
+    epsilon: 1.0e-4
+    forecast_level_quantiles: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    forecast_ramp_quantiles: [0.0, 0.25, 0.5, 0.75, 1.0]
+    forecast_revision_quantiles: [0.0, 0.25, 0.5, 0.75, 1.0]
+    ramp_lag: 3
+    factor_iterations: 6
+    factor_clip: [0.5, 2.0]
+
+model:
+  architecture: "station24_resunet"
+  spatial_mode: "fixed_graph"
+  spatial_mix_levels: ["bottleneck"]
+  spatial_gate_init: -1.0
+  parallel_spatial_fusion_levels: ["encoder_0"]
+  parallel_spatial_gate_init: -1.0
+  parallel_spatial_adjacency_mode: "fixed"
+  station_count: 24
+  sequence_length: 168
+  base_channels: 32
+  num_layers: 3
+  channel_multipliers: [1, 2, 4]
+  group_norm_groups: 8
+  dropout: 0.10
+  timestep_embedding_dim: 128
+  num_steps: 500
+  beta_start: 0.0001
+  beta_end: 0.04
+  schedule: "linear"
+  reverse_variance_type: "posterior"
+  use_forecast_ramps: false
+  forecast_ramp_lags: [3, 6]
+  use_forecast_revision: false
+  use_recent_error: true
+  recent_error_hours: 24
+  condition_gate_init: -1.0
+  use_state_encoder: true
+  state_feature_dim: 4
+  state_feature_names:
+    - "low_output_severity"
+    - "high_output_severity"
+    - "ramp_up_severity"
+    - "ramp_down_severity"
+  state_channels: [8, 16, 32]
+  state_ramp_lags: [3, 6]
+  state_low_quantile: 0.20
+  state_high_quantile: 0.90
+  state_ramp_quantile: 0.90
+  state_clip: 3.0
+  state_global_gate_init: -1.0
+  state_film_gate_init: -1.0
+  ramp_auxiliary_loss_weight: 0.05
+  ramp_auxiliary_lags: [1, 3, 6]
+  ramp_auxiliary_lag_weights: [0.5, 0.3, 0.2]
+
+train:
+  batch_size: 8
+  gradient_accumulation_steps: 2
+  effective_batch_size: 16
+  lr: 1.0e-4
+  epochs: 300
+  weight_decay: 1.0e-4
+  patience: 40
+  validation_every: 5
+  min_delta: 1.0e-5
+  gradient_clip_norm: 1.0
+  ema_decay: 0.999
+  mixed_precision: true
+  save_every: 50
+  seed: 2027
+  validation_seed: 314159
+  num_workers: 4
+
+evaluation:
+  split: "val"
+  n_samples: 80
+  generation_seed: 424242
+  issue_batch_size: 1
+  member_chunk_size: 10
+  quantiles: [0.80, 0.90, 0.95]
+  physical_projection: "clip_0_1_and_station_astronomical_solar_night"
+  test_locked: true
