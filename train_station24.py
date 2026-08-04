@@ -170,11 +170,6 @@ def save_checkpoint(
         "condition_gate_values": model.condition_gate_values,
         "state_gate_values": model.state_gate_values,
         "wind_common_gate_value": model.wind_common_gate_value,
-        "event_weighting_file": (
-            str(run_dir / "event_weighting.json")
-            if event_weighting is not None
-            else None
-        ),
         "state_thresholds": (
             copy.deepcopy(dict(state_thresholds))
             if state_thresholds is not None
@@ -185,7 +180,6 @@ def save_checkpoint(
             if event_weighting is not None
             else None
         ),
-        "wind_common_gate_value": model.wind_common_gate_value,
     }
     torch.save(payload, path)
 

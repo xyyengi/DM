@@ -163,6 +163,43 @@ class Station24ModelTests(unittest.TestCase):
         self.assertIsNotNone(candidate.denoiser.wind_common_gate.grad)
         self.assertAlmostEqual(candidate.wind_common_gate_value, 0.2689414, places=5)
 
+    def test_checkpoint_saves_event_weighting_without_run_scope(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+        from train_station24 import create_ema, save_checkpoint
+
+        features, adjacency = synthetic_static()
+        config = self.config("fixed_graph")
+        config["use_wind_common_residual_head"] = True
+        config["wind_common_channels"] = 4
+        model = Station24DiffusionModel(config, features, adjacency)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        event_weighting = {
+            "fit_split": "train",
+            "future_actual_used_as_condition": False,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint_path = Path(directory) / "model.pt"
+            save_checkpoint(
+                checkpoint_path,
+                model,
+                create_ema(model),
+                optimizer,
+                {"experiment": {"variant": "checkpoint_smoke"}},
+                {"method": "per_station_std", "scale": [1.0] * 24},
+                1,
+                0.5,
+                0.4,
+                sum(parameter.numel() for parameter in model.parameters()),
+                None,
+                event_weighting,
+            )
+            saved = torch.load(
+                checkpoint_path, map_location="cpu", weights_only=False
+            )
+        self.assertEqual(saved["event_weighting"], event_weighting)
+        self.assertEqual(saved["condition_variant"], "checkpoint_smoke")
+        self.assertIsNotNone(saved["wind_common_gate_value"])
+
     def test_type_gated_graph_has_exact_relation_gates(self):
         from src.models.station_conditioned_diffusion import Station24DiffusionModel
 
