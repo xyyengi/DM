@@ -31,6 +31,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--issue-batch-size", type=int, default=None)
     parser.add_argument("--member-chunk-size", type=int, default=None)
+    parser.add_argument(
+        "--energy-score-member-limit",
+        type=int,
+        default=None,
+        help=(
+            "Evaluate the high-cost multivariate energy score on a deterministic "
+            "subset of at most this many members; all other metrics use every member"
+        ),
+    )
     parser.add_argument("--allow-test", action="store_true")
     parser.add_argument("--allow-cpu", action="store_true")
     return parser.parse_args()
@@ -210,6 +219,7 @@ def main() -> None:
             float(value)
             for value in evaluation_config.get("quantiles", [0.80, 0.90, 0.95])
         ),
+        energy_score_member_limit=args.energy_score_member_limit,
     )
     metrics["run"] = {
         "run_dir": str(run_dir),
@@ -264,6 +274,10 @@ def main() -> None:
         "split": args.split,
         "n_samples": n_samples,
         "generation_seed": seed,
+        "evaluation_member_count": n_samples,
+        "energy_score_member_count": int(
+            metrics["joint"]["energy_score_member_count"]
+        ),
         "physical_projection": "clip_0_1_and_station_astronomical_solar_night",
         "daylight_audit": daylight_audit,
         "test_used": args.split == "test",

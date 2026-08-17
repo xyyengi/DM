@@ -1125,6 +1125,7 @@ class Station24EvaluationTests(unittest.TestCase):
             )
         self.assertIn("coverage_90_daylight", station_frame.columns)
         self.assertTrue(np.isfinite(metrics["joint"]["energy_score_pu"]))
+        self.assertEqual(metrics["joint"]["energy_score_member_count"], 5)
 
 
 if __name__ == "__main__":

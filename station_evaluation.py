@@ -290,6 +290,7 @@ def evaluate_station_scenarios(
     adjacency: np.ndarray,
     daylight_mask: np.ndarray | None = None,
     interval_levels: tuple[float, ...] = DEFAULT_INTERVAL_LEVELS,
+    energy_score_member_limit: int | None = None,
 ) -> tuple[dict[str, object], pd.DataFrame, pd.DataFrame]:
     """Evaluate arrays shaped samples=[N,K,T,S], actual/forecast=[N,T,S]."""
     if samples.ndim != 4 or actual.ndim != 3:
@@ -298,6 +299,8 @@ def evaluate_station_scenarios(
         raise ValueError("scenario and actual shapes do not align")
     if raw_samples.shape != samples.shape or forecast.shape != actual.shape:
         raise ValueError("raw/projected/forecast shapes do not align")
+    if energy_score_member_limit is not None and energy_score_member_limit <= 1:
+        raise ValueError("energy_score_member_limit must be greater than one")
     station_types = stations.data_type.to_numpy()
     capacities = stations.capacity_mw.to_numpy(dtype=np.float64)
     if daylight_mask is not None:
@@ -531,8 +534,21 @@ def evaluate_station_scenarios(
                 valid_mask=aggregate_daylight,
             )
 
+    energy_samples = samples
+    if (
+        energy_score_member_limit is not None
+        and samples.shape[1] > energy_score_member_limit
+    ):
+        energy_indices = np.linspace(
+            0,
+            samples.shape[1] - 1,
+            num=energy_score_member_limit,
+            dtype=np.int64,
+        )
+        energy_samples = samples[:, energy_indices, ...]
     summary["joint"] = {
-        "energy_score_pu": energy_score(samples, actual),
+        "energy_score_pu": energy_score(energy_samples, actual),
+        "energy_score_member_count": int(energy_samples.shape[1]),
         "adjacency_variogram_score": adjacency_variogram_score(
             samples, actual, adjacency
         ),
