@@ -85,7 +85,7 @@ for required in \
   train_lead_mark.npy train_fill_mask.npy train_issue_dates.csv \
   val_forecast.npy val_actual.npy val_residual.npy val_time_mark.npy \
   val_lead_mark.npy val_fill_mask.npy val_issue_dates.csv \
-  station_features.npy station_adjacency.npy station_distance_km.npy \
+  station_features.npy station_adjacency.npy \
   station_order.csv export_metadata.json; do
   [[ -f "${DATA}/${required}" ]] || die "missing data artifact ${DATA}/${required}"
 done

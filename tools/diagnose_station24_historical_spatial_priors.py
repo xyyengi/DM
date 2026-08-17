@@ -53,6 +53,31 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def station_distance_km(stations: pd.DataFrame) -> np.ndarray:
+    """Deterministically derive the great-circle distance matrix from metadata."""
+
+    required = {"latitude", "longitude"}
+    missing = required - set(stations.columns)
+    if missing:
+        raise ValueError(
+            "station distance file is absent and station_order.csv lacks "
+            f"coordinates: {sorted(missing)}"
+        )
+    latitude = np.deg2rad(stations.latitude.to_numpy(dtype=np.float64))
+    longitude = np.deg2rad(stations.longitude.to_numpy(dtype=np.float64))
+    if not np.isfinite(latitude).all() or not np.isfinite(longitude).all():
+        raise ValueError("station coordinates contain non-finite values")
+    delta_latitude = latitude[:, None] - latitude[None, :]
+    delta_longitude = longitude[:, None] - longitude[None, :]
+    haversine = (
+        np.sin(delta_latitude / 2.0) ** 2
+        + np.cos(latitude[:, None])
+        * np.cos(latitude[None, :])
+        * np.sin(delta_longitude / 2.0) ** 2
+    )
+    return 6371.0088 * 2.0 * np.arcsin(np.sqrt(np.clip(haversine, 0.0, 1.0)))
+
+
 def pair_type(types: np.ndarray, i: int, j: int) -> str:
     if types[i] == types[j]:
         return f"{types[i]}-{types[j]}"
@@ -622,7 +647,7 @@ def main() -> None:
     required = [
         "train_forecast.npy", "train_actual.npy", "train_residual.npy",
         "train_fill_mask.npy", "train_issue_dates.csv", "station_order.csv",
-        "station_distance.npy", "station_adjacency.npy", "export_metadata.json",
+        "station_adjacency.npy", "export_metadata.json",
     ]
     missing = [name for name in required if not (data_path / name).is_file()]
     if missing:
@@ -639,7 +664,23 @@ def main() -> None:
     valid = fill_mask == 0
     stations = pd.read_csv(data_path / "station_order.csv").sort_values("channel_index").reset_index(drop=True)
     station_types = stations.data_type.to_numpy()
-    distance = np.load(data_path / "station_distance.npy")
+    distance_path = data_path / "station_distance.npy"
+    if distance_path.is_file():
+        distance = np.load(distance_path)
+        loaded_files[distance_path.name] = sha256_file(distance_path)
+        distance_audit = {
+            "source": str(distance_path),
+            "method": "precomputed",
+        }
+    else:
+        distance = station_distance_km(stations)
+        distance_audit = {
+            "source": str(data_path / "station_order.csv"),
+            "method": "haversine_from_station_coordinates",
+            "earth_radius_km": 6371.0088,
+        }
+    if distance.shape != (24, 24) or not np.isfinite(distance).all():
+        raise ValueError(f"invalid station distance matrix shape={distance.shape}")
     geo = np.load(data_path / "station_adjacency.npy")
     issue_frame = pd.read_csv(data_path / "train_issue_dates.csv")
     timestamps = issue_target_timestamps(issue_frame, forecast.shape[1])
@@ -871,6 +912,7 @@ def main() -> None:
             "residual": list(residual.shape),
         },
         "actual_deduplication": dedup_audit,
+        "station_distance": distance_audit,
         "residual_scale": {
             **scale_audit,
             "source": str(scale_path),
