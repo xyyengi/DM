@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import copy
 from pathlib import Path
 import json
 import shutil
@@ -74,6 +75,54 @@ class Station24ModelTests(unittest.TestCase):
             counts[mode] = sum(parameter.numel() for parameter in model.parameters())
         self.assertLess(counts["fixed_graph"] - counts["none"], 1000)
         self.assertLess(counts["type_gated_graph"] - counts["none"], 1000)
+
+    def test_dual_fixed_graph_adds_only_four_shared_projection_logits(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        baseline_config = self.config("fixed_graph")
+        baseline_config.update(
+            {
+                "spatial_mix_levels": ["bottleneck"],
+                "parallel_spatial_fusion_levels": ["encoder_0"],
+                "parallel_spatial_adjacency_mode": "fixed",
+            }
+        )
+        dual_config = copy.deepcopy(baseline_config)
+        dual_config.update(
+            {
+                "use_dual_fixed_graph": True,
+                "dual_graph_primary_logit_init": 2.0,
+                "dual_graph_secondary_logit_init": 0.0,
+            }
+        )
+        baseline = Station24DiffusionModel(baseline_config, features, adjacency)
+        candidate = Station24DiffusionModel(
+            dual_config,
+            features,
+            adjacency,
+            secondary_adjacency=adjacency.clone(),
+        )
+        baseline_count = sum(parameter.numel() for parameter in baseline.parameters())
+        candidate_count = sum(parameter.numel() for parameter in candidate.parameters())
+        self.assertEqual(candidate_count - baseline_count, 4)
+
+        dual_parameters = {
+            name: parameter
+            for name, parameter in candidate.named_parameters()
+            if "dual_graph_logits" in name
+        }
+        self.assertEqual(len(dual_parameters), 2)
+        self.assertEqual(sum(value.numel() for value in dual_parameters.values()), 4)
+        for parameter in dual_parameters.values():
+            weights = torch.softmax(parameter.detach(), dim=0)
+            self.assertAlmostEqual(float(weights.sum()), 1.0, places=6)
+            self.assertGreater(float(weights[0]), float(weights[1]))
+
+        loss = candidate(self.batch())
+        loss.backward()
+        for parameter in dual_parameters.values():
+            self.assertIsNotNone(parameter.grad)
 
     def test_ramp_auxiliary_loss_is_finite_and_parameter_free(self):
         from src.models.station_conditioned_diffusion import Station24DiffusionModel

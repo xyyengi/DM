@@ -13,6 +13,7 @@ import torch
 import yaml
 
 from src.models.station_conditioned_diffusion import Station24DiffusionModel
+from station_graph_prior import load_generation_graphs
 from station_dataset import (
     build_station_daylight_mask,
     get_station_dataloader,
@@ -98,11 +99,18 @@ def main() -> None:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     residual_scale = checkpoint["residual_scale"]
     static = load_station_static_data(data_path)
+    primary_adjacency, secondary_adjacency, graph_manifest = load_generation_graphs(
+        data_path,
+        run_dir,
+        config["model"],
+        checkpoint,
+    )
     model = Station24DiffusionModel(
         config["model"],
         static["station_features"],
-        static["station_adjacency"],
+        primary_adjacency,
         static["station_capacities"],
+        secondary_adjacency,
     ).to(device)
     if checkpoint.get("architecture") != model.architecture:
         raise ValueError("checkpoint architecture does not match config")
@@ -281,6 +289,7 @@ def main() -> None:
         "physical_projection": "clip_0_1_and_station_astronomical_solar_night",
         "daylight_audit": daylight_audit,
         "test_used": args.split == "test",
+        "graph_manifest": graph_manifest,
     }
     solar_indices = stations.index[stations.data_type.eq("solar")].to_numpy()
     solar_night = ~daylight_mask[:, :, solar_indices]

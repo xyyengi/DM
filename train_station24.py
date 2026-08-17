@@ -19,6 +19,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from src.models.station_conditioned_diffusion import Station24DiffusionModel
+from station_graph_prior import prepare_training_graphs
 from station_dataset import (
     fit_station_event_weighting,
     fit_station_residual_scale,
@@ -41,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--secondary-adjacency", default=None)
     parser.add_argument("--allow-cpu", action="store_true")
     return parser.parse_args()
 
@@ -142,6 +144,7 @@ def save_checkpoint(
     parameter_count: int,
     state_thresholds: Mapping[str, object] | None,
     event_weighting: Mapping[str, object] | None,
+    graph_manifest: Mapping[str, object],
 ) -> None:
     payload = {
         "architecture": model.architecture,
@@ -180,6 +183,7 @@ def save_checkpoint(
             if event_weighting is not None
             else None
         ),
+        "graph_manifest": copy.deepcopy(dict(graph_manifest)),
     }
     torch.save(payload, path)
 
@@ -238,6 +242,16 @@ def main() -> None:
     log_dir = run_dir / "logs"
     checkpoint_dir.mkdir(parents=True)
     log_dir.mkdir(parents=True)
+
+    static = load_station_static_data(data_path)
+    primary_adjacency, secondary_adjacency, graph_manifest = (
+        prepare_training_graphs(
+            data_path,
+            run_dir,
+            config["model"],
+            args.secondary_adjacency,
+        )
+    )
 
     scale_config = config["target"]["residual_scaling"]
     residual_scale = fit_station_residual_scale(
@@ -307,12 +321,12 @@ def main() -> None:
         ),
         encoding="utf-8",
     )
-    static = load_station_static_data(data_path)
     model = Station24DiffusionModel(
         config["model"],
         static["station_features"],
-        static["station_adjacency"],
+        primary_adjacency,
         static["station_capacities"],
+        secondary_adjacency,
     ).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     trainable_count = sum(
@@ -341,6 +355,7 @@ def main() -> None:
         f"spatial_levels={list(model.spatial_mix_levels)} "
         f"parallel_levels={list(model.parallel_spatial_fusion_levels)} "
         f"parallel_adjacency={model.parallel_spatial_adjacency_mode} "
+        f"graph_mode={graph_manifest['mode']} "
         f"condition_variant={config.get('experiment', {}).get('variant', 'baseline')} "
         f"residual_scaling={residual_scale.get('method', 'per_station_std')} "
         f"ramp_aux_weight={model.diffusion.ramp_auxiliary_loss_weight} "
@@ -406,6 +421,7 @@ def main() -> None:
                     parameter_count,
                     state_thresholds,
                     event_weighting,
+                    graph_manifest,
                 )
             print(
                 f"epoch={epoch:04d} train={train_loss:.7f} val={val_loss:.7f} "
@@ -436,6 +452,7 @@ def main() -> None:
                 parameter_count,
                 state_thresholds,
                 event_weighting,
+                graph_manifest,
             )
 
     if not (checkpoint_dir / "model_best.pt").is_file():
@@ -482,6 +499,7 @@ def main() -> None:
         "training_seed": seed,
         "validation_seed": validation_seed,
         "test_used": False,
+        "graph_manifest": graph_manifest,
     }
     (run_dir / "training_summary.json").write_text(
         json.dumps(final_record, ensure_ascii=False, indent=2), encoding="utf-8"

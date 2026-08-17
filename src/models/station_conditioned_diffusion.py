@@ -463,6 +463,9 @@ class StationSpatialBlock(nn.Module):
         groups: int,
         dropout: float,
         gate_init: float = -1.0,
+        secondary_adjacency: torch.Tensor | None = None,
+        dual_graph_primary_logit_init: float = 2.0,
+        dual_graph_secondary_logit_init: float = 0.0,
     ) -> None:
         super().__init__()
         if mode not in SPATIAL_MODES:
@@ -470,6 +473,22 @@ class StationSpatialBlock(nn.Module):
         self.mode = mode
         normalized = _normalize_adjacency(adjacency)
         self.register_buffer("normalized_adjacency", normalized)
+        self.dual_graph_logits = None
+        if secondary_adjacency is not None:
+            if mode != "fixed_graph":
+                raise ValueError("dual fixed graph requires spatial_mode=fixed_graph")
+            self.register_buffer(
+                "normalized_secondary_adjacency",
+                _normalize_adjacency(secondary_adjacency),
+            )
+            self.dual_graph_logits = nn.Parameter(
+                torch.tensor(
+                    [
+                        float(dual_graph_primary_logit_init),
+                        float(dual_graph_secondary_logit_init),
+                    ]
+                )
+            )
         wind = station_features[:, 0].float()
         solar = station_features[:, 1].float()
         masks = {
@@ -504,7 +523,16 @@ class StationSpatialBlock(nn.Module):
         if self.mode == "none":
             return {}
         if self.mode == "fixed_graph":
-            return {"all": float(torch.sigmoid(self.graph_gate.detach()).cpu())}
+            values = {"all": float(torch.sigmoid(self.graph_gate.detach()).cpu())}
+            if self.dual_graph_logits is not None:
+                weights = torch.softmax(self.dual_graph_logits.detach(), dim=0).cpu()
+                values.update(
+                    {
+                        "dual_primary": float(weights[0]),
+                        "dual_secondary": float(weights[1]),
+                    }
+                )
+            return values
         return {
             name: float(torch.sigmoid(value.detach()).cpu())
             for name, value in self.relation_gates.items()
@@ -514,9 +542,14 @@ class StationSpatialBlock(nn.Module):
         if self.mode == "none":
             return value
         if self.mode == "fixed_graph":
-            message = torch.einsum(
-                "ij,bjct->bict", self.normalized_adjacency, value
-            )
+            adjacency = self.normalized_adjacency
+            if self.dual_graph_logits is not None:
+                weights = torch.softmax(self.dual_graph_logits, dim=0)
+                adjacency = (
+                    weights[0] * self.normalized_adjacency
+                    + weights[1] * self.normalized_secondary_adjacency
+                )
+            message = torch.einsum("ij,bjct->bict", adjacency, value)
             message = torch.sigmoid(self.graph_gate) * message
         else:
             message = torch.zeros_like(value)
@@ -556,6 +589,9 @@ class StationParallelGraphFusion(nn.Module):
         dynamic_top_k: int = 6,
         dynamic_temperature: float = 1.0,
         dynamic_mix_gate_init: float = -3.0,
+        secondary_adjacency: torch.Tensor | None = None,
+        dual_graph_primary_logit_init: float = 2.0,
+        dual_graph_secondary_logit_init: float = 0.0,
     ) -> None:
         super().__init__()
         self.channels = int(channels)
@@ -567,6 +603,22 @@ class StationParallelGraphFusion(nn.Module):
             )
         normalized_adjacency = _normalize_adjacency(adjacency)
         self.register_buffer("normalized_adjacency", normalized_adjacency)
+        self.dual_graph_logits = None
+        if secondary_adjacency is not None:
+            if self.adjacency_mode != "fixed":
+                raise ValueError("dual fixed graph cannot be combined with dynamic adjacency")
+            self.register_buffer(
+                "normalized_secondary_adjacency",
+                _normalize_adjacency(secondary_adjacency),
+            )
+            self.dual_graph_logits = nn.Parameter(
+                torch.tensor(
+                    [
+                        float(dual_graph_primary_logit_init),
+                        float(dual_graph_secondary_logit_init),
+                    ]
+                )
+            )
         self.register_buffer(
             "off_geographic_mask",
             (adjacency <= 0).float(),
@@ -674,6 +726,10 @@ class StationParallelGraphFusion(nn.Module):
         values = {
             "prior": float(torch.sigmoid(self.gate_prior.detach()).cpu()),
         }
+        if self.dual_graph_logits is not None:
+            weights = torch.softmax(self.dual_graph_logits.detach(), dim=0).cpu()
+            values["dual_primary"] = float(weights[0])
+            values["dual_secondary"] = float(weights[1])
         if self.dynamic_mix_gate is not None:
             values["dynamic_mix"] = float(
                 torch.sigmoid(self.dynamic_mix_gate.detach()).cpu()
@@ -728,7 +784,14 @@ class StationParallelGraphFusion(nn.Module):
         state_condition: torch.Tensor | None,
     ) -> torch.Tensor:
         if self.adjacency_mode == "fixed":
-            return self.normalized_adjacency[None].expand(
+            adjacency = self.normalized_adjacency
+            if self.dual_graph_logits is not None:
+                weights = torch.softmax(self.dual_graph_logits, dim=0)
+                adjacency = (
+                    weights[0] * self.normalized_adjacency
+                    + weights[1] * self.normalized_secondary_adjacency
+                )
+            return adjacency[None].expand(
                 condition.shape[0], -1, -1
             )
         if self.dynamic_node_encoder is None or self.dynamic_mix_gate is None:
@@ -843,12 +906,20 @@ class StationConditionalResUNet1D(nn.Module):
         station_features: torch.Tensor,
         adjacency: torch.Tensor,
         station_capacities: torch.Tensor | None = None,
+        secondary_adjacency: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.sequence_length = int(config.get("sequence_length", 168))
         self.station_count = int(config.get("station_count", 24))
         self.spatial_mode = str(config.get("spatial_mode", "none"))
         self.use_state_encoder = bool(config.get("use_state_encoder", False))
+        self.use_dual_fixed_graph = bool(config.get("use_dual_fixed_graph", False))
+        if self.use_dual_fixed_graph != (secondary_adjacency is not None):
+            raise ValueError(
+                "use_dual_fixed_graph must match the supplied secondary adjacency"
+            )
+        if self.use_dual_fixed_graph and self.spatial_mode != "fixed_graph":
+            raise ValueError("dual fixed graph requires spatial_mode=fixed_graph")
         if self.spatial_mode not in SPATIAL_MODES:
             raise ValueError(f"unsupported spatial_mode={self.spatial_mode!r}")
         if station_features.shape[0] != self.station_count:
@@ -1001,6 +1072,13 @@ class StationConditionalResUNet1D(nn.Module):
                     groups,
                     dropout,
                     gate_init=float(config.get("spatial_gate_init", -1.0)),
+                    secondary_adjacency=secondary_adjacency,
+                    dual_graph_primary_logit_init=float(
+                        config.get("dual_graph_primary_logit_init", 2.0)
+                    ),
+                    dual_graph_secondary_logit_init=float(
+                        config.get("dual_graph_secondary_logit_init", 0.0)
+                    ),
                 )
                 for level in range(num_layers - 1)
                 if f"encoder_{level}" in self.spatial_mix_levels
@@ -1044,6 +1122,13 @@ class StationConditionalResUNet1D(nn.Module):
                     dynamic_mix_gate_init=float(
                         config.get("dynamic_graph_mix_gate_init", -3.0)
                     ),
+                    secondary_adjacency=secondary_adjacency,
+                    dual_graph_primary_logit_init=float(
+                        config.get("dual_graph_primary_logit_init", 2.0)
+                    ),
+                    dual_graph_secondary_logit_init=float(
+                        config.get("dual_graph_secondary_logit_init", 0.0)
+                    ),
                 )
                 for level in self.parallel_spatial_fusion_levels
             }
@@ -1066,6 +1151,13 @@ class StationConditionalResUNet1D(nn.Module):
             groups,
             dropout,
             gate_init=float(config.get("spatial_gate_init", -1.0)),
+            secondary_adjacency=secondary_adjacency,
+            dual_graph_primary_logit_init=float(
+                config.get("dual_graph_primary_logit_init", 2.0)
+            ),
+            dual_graph_secondary_logit_init=float(
+                config.get("dual_graph_secondary_logit_init", 0.0)
+            ),
         )
 
         self.decoder_levels = tuple(reversed(range(num_layers - 1)))
@@ -1578,11 +1670,16 @@ class Station24DiffusionModel(nn.Module):
         station_features: torch.Tensor,
         adjacency: torch.Tensor,
         station_capacities: torch.Tensor | None = None,
+        secondary_adjacency: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.config = dict(config)
         self.denoiser = StationConditionalResUNet1D(
-            self.config, station_features, adjacency, station_capacities
+            self.config,
+            station_features,
+            adjacency,
+            station_capacities,
+            secondary_adjacency,
         )
         self.diffusion = StationGaussianDiffusion(
             self.denoiser,

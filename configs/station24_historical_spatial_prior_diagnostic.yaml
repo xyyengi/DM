@@ -1,0 +1,84 @@
+experiment:
+  name: "station24_historical_spatial_prior_diagnostic"
+  stage: "train_only_spatial_prior_diagnostic"
+  variant: "historical_spatial_prior_diagnostic"
+  description: "Independent train-only audit of geographic, historical-power, residual, tail, lead-day, and lagged station relations"
+
+data:
+  data_path: "./diffusion_input_station"
+  split: "train"
+  station_count: 24
+  sequence_length: 168
+  allow_validation_actual: false
+  allow_test_actual: false
+  actual_time_handling: "deduplicate_overlapping_target_hours"
+  forecast_residual_handling: "retain_issue_and_lead_vintage"
+  residual_scale_path: "./outputs_shandong/cdsg_2d_2e_20260803_223947/training/20260803_223954_station24_cdsg_2d_conditional_scale_20260803_223947_seed2027/residual_scale.json"
+
+correlation:
+  methods: ["pearson", "spearman"]
+  minimum_pair_observations: 500
+  solar_mask: "station_astronomical_daylight"
+  solar_elevation_threshold_deg: -0.833
+  timestamp_offset_minutes: 30.0
+  preserve_negative_correlations: true
+
+tail:
+  low_quantile: 0.10
+  high_quantile: 0.90
+  station_type: "wind"
+  minimum_lift: 1.0
+
+lead_day:
+  days: [1, 2, 3, 4, 5, 6, 7]
+
+lag:
+  minimum_hours: -6
+  maximum_hours: 6
+  selection: "maximum_signed_correlation"
+
+bootstrap:
+  repetitions: 200
+  seed: 20260817
+  issue_block_size: 7
+  calendar_day_block_size: 7
+  confidence_level: 0.95
+  stable_positive_probability: 0.90
+  stable_ci_lower_bound: 0.0
+
+graph:
+  topology_policy: "within_type"
+  positive_only: true
+  top_k: 5
+  minimum_weight: 0.0
+  symmetrization: "maximum"
+  self_loop_weight: 1.0
+  # The model applies symmetric-degree normalization at load time.  Export raw
+  # stable weights here so both geographic and historical graphs are normalized once.
+  normalization: "none"
+  overwrite_source_geographic_graph: false
+
+reference_audit:
+  legacy_solar_active_threshold_pu: 0.02
+  fail_on_large_mismatch: true
+  correlation_tolerance: 0.08
+  geo_edge_correlation_tolerance: 0.08
+  tail_lift_tolerance: 1.0
+  lead_day_correlation_tolerance: 0.10
+  expected:
+    wind_wind_raw_residual_mean: 0.298
+    solar_solar_raw_residual_mean: 0.561
+    wind_solar_raw_residual_mean: 0.126
+    geo_edge_absolute_raw_residual_mean: 0.378
+    non_geo_edge_absolute_raw_residual_mean: 0.213
+    wind_low_tail_lift_mean: 3.21
+    wind_day1_absolute_residual_mean: 0.233
+    wind_day7_absolute_residual_mean: 0.338
+    lead_day_edge_pattern_mean_correlation: 0.968
+
+output:
+  root: "./outputs_shandong/station24/historical_spatial_priors"
+  run_name: "historical_spatial_prior_diagnostic"
+  save_raw_matrices: true
+  save_candidate_adjacencies: true
+  save_figures: true

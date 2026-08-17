@@ -51,6 +51,16 @@ bash run_station24_spatial_ablation_pipeline.sh
 
 详细命令、监控方式和结果目录见 `docs/station24_spatial_ablation.md`。
 
+## 历史空间先验双图实验
+
+当前分支的下一阶段使用两个完全独立的固定双图候选：`geo_history_actual_dual` 与 `geo_history_residual_dual`。两者保留同一地理图，仅第二张训练集历史图不同，并自动执行训练、500成员验证生成、比较和打包：
+
+```bash
+bash run_station24_historical_dual_graph_pipeline.sh
+```
+
+设计边界、诊断依据、监控和停止命令见 `docs/station24_historical_dual_graph.md`。
+
 ## 数据口径
 
 - 每个发布批次包含未来168小时、24个场站的预测与实测；
