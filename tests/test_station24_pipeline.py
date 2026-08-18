@@ -241,6 +241,7 @@ class Station24ModelTests(unittest.TestCase):
                 sum(parameter.numel() for parameter in model.parameters()),
                 None,
                 event_weighting,
+                {},
             )
             saved = torch.load(
                 checkpoint_path, map_location="cpu", weights_only=False
@@ -708,6 +709,47 @@ class Station24DatasetTests(unittest.TestCase):
             self.assertTrue(torch.equal(val_item["loss_weight"], torch.ones_like(val_item["loss_weight"])))
             self.assertTrue(torch.equal(val_item["event_time_weight"], torch.ones_like(val_item["event_time_weight"])))
 
+    def test_forecast_mismatch_weighting_targets_event_and_context(self):
+        from station_dataset import build_station_event_loss_weights
+
+        actual = np.zeros((24, 168), dtype=np.float32)
+        residual = np.zeros_like(actual)
+        valid = np.ones_like(actual)
+        residual[0, 10] = -1.0
+        specification = {
+            "method": "train_forecast_mismatch_event_weighting_v1",
+            "fit_split": "train",
+            "future_actual_used_as_condition": False,
+            "applied_to_validation_or_generation": False,
+            "max_weight": 3.0,
+            "aggregate_level_thresholds": [0.2, 0.8],
+            "node_level_thresholds": [[0.2, 0.8] for _ in range(13)],
+            "ramp_lags": [1, 3, 6],
+            "aggregate_ramp_mismatch_thresholds": {
+                str(lag): [0.2, 0.8] for lag in [1, 3, 6]
+            },
+            "node_ramp_mismatch_thresholds": {
+                str(lag): [[0.2, 0.8] for _ in range(13)]
+                for lag in [1, 3, 6]
+            },
+            "context_hours": 2,
+            "use_aggregate_events": False,
+            "use_node_events": True,
+            "wind_station_indices": list(range(13)),
+            "wind_capacity_weights": [1.0 / 13.0] * 13,
+        }
+        train_weight, _ = build_station_event_loss_weights(
+            actual, residual, valid, specification, "train"
+        )
+        val_weight, _ = build_station_event_loss_weights(
+            actual, residual, valid, specification, "val"
+        )
+        self.assertGreater(float(train_weight[0, 10]), float(train_weight[0, 0]))
+        self.assertGreater(float(train_weight[0, 8]), float(train_weight[0, 0]))
+        self.assertGreater(float(train_weight[0, 12]), float(train_weight[0, 0]))
+        self.assertAlmostEqual(float((train_weight * valid).mean()), 1.0, places=5)
+        np.testing.assert_array_equal(val_weight, np.ones_like(val_weight))
+
     def test_generation_cli_smoke_uses_ema_and_writes_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -742,6 +784,15 @@ class Station24DatasetTests(unittest.TestCase):
                 "state_high_quantile": 0.90,
                 "state_ramp_quantile": 0.90,
                 "state_clip": 3.0,
+                "use_extreme_event_weighting": True,
+                "event_weighting_method": "forecast_mismatch_v1",
+                "event_max_weight": 3.0,
+                "event_level_quantiles": [0.90, 0.99],
+                "event_ramp_mismatch_quantiles": [0.90, 0.99],
+                "event_ramp_lags": [1, 3, 6],
+                "event_context_hours": 2,
+                "event_use_aggregate_events": True,
+                "event_use_node_events": True,
                 "ramp_auxiliary_loss_weight": 0.05,
                 "ramp_auxiliary_lags": [1, 3, 6],
                 "ramp_auxiliary_lag_weights": [0.5, 0.3, 0.2],
@@ -811,6 +862,7 @@ class Station24DatasetTests(unittest.TestCase):
             run_dir = runs[0]
             self.assertTrue((run_dir / "checkpoints" / "model_best.pt").is_file())
             self.assertTrue((run_dir / "state_thresholds.json").is_file())
+            self.assertTrue((run_dir / "event_weighting.json").is_file())
             subprocess.run(
                 [
                     sys.executable,
@@ -843,6 +895,11 @@ class Station24DatasetTests(unittest.TestCase):
                 metrics,
             )
             self.assertIn('"ramp_auxiliary_loss_weight": 0.05', metrics)
+            self.assertIn(
+                '"event_weighting_method": '
+                '"train_forecast_mismatch_event_weighting_v1"',
+                metrics,
+            )
             self.assertTrue((output_dir / "station_daylight_mask.npy").is_file())
 
             comparison_inputs = []

@@ -511,9 +511,108 @@ def fit_station_event_weighting(
     aggregate_residual = np.einsum(
         "nts,s->nt", residual[:, :, wind_indices], wind_weight
     )
-    aggregate_actual = np.einsum(
-        "nts,s->nt", actual[:, :, wind_indices], wind_weight
-    )
+    aggregate_actual = np.einsum("nts,s->nt", actual[:, :, wind_indices], wind_weight)
+
+    method = str(config.get("event_weighting_method", "target_extremes_v0"))
+    if method == "forecast_mismatch_v1":
+        level_quantiles = tuple(
+            float(value)
+            for value in config.get("event_level_quantiles", [0.90, 0.99])
+        )
+        ramp_quantiles = tuple(
+            float(value)
+            for value in config.get(
+                "event_ramp_mismatch_quantiles", [0.90, 0.99]
+            )
+        )
+        for name, quantiles in (
+            ("event_level_quantiles", level_quantiles),
+            ("event_ramp_mismatch_quantiles", ramp_quantiles),
+        ):
+            if len(quantiles) != 2 or not (
+                0 <= quantiles[0] < quantiles[1] <= 1
+            ):
+                raise ValueError(f"{name} must contain two increasing values")
+        ramp_lags = tuple(
+            int(value) for value in config.get("event_ramp_lags", [1, 3, 6])
+        )
+        if not ramp_lags or any(
+            lag < 1 or lag >= EXPECTED_HOURS for lag in ramp_lags
+        ):
+            raise ValueError(f"invalid event_ramp_lags={ramp_lags}")
+        aggregate_negative = np.maximum(-aggregate_residual[complete], 0.0)
+        aggregate_level_thresholds = np.quantile(
+            aggregate_negative, level_quantiles
+        )
+        aggregate_ramp_thresholds: dict[str, list[float]] = {}
+        node_ramp_thresholds: dict[str, list[list[float]]] = {}
+        for lag in ramp_lags:
+            pair_complete = complete[:, lag:] & complete[:, :-lag]
+            aggregate_mismatch = np.abs(
+                aggregate_residual[:, lag:] - aggregate_residual[:, :-lag]
+            )[pair_complete]
+            aggregate_ramp_thresholds[str(lag)] = [
+                float(value)
+                for value in np.quantile(aggregate_mismatch, ramp_quantiles)
+            ]
+            station_thresholds = []
+            for station_index in wind_indices:
+                pair_valid = (
+                    valid[:, lag:, station_index]
+                    & valid[:, :-lag, station_index]
+                )
+                mismatch = np.abs(
+                    residual[:, lag:, station_index]
+                    - residual[:, :-lag, station_index]
+                )[pair_valid]
+                station_thresholds.append(
+                    [
+                        float(value)
+                        for value in np.quantile(mismatch, ramp_quantiles)
+                    ]
+                )
+            node_ramp_thresholds[str(lag)] = station_thresholds
+        node_level_thresholds = []
+        for station_index in wind_indices:
+            station_negative = np.maximum(
+                -residual[:, :, station_index][valid[:, :, station_index]], 0.0
+            )
+            node_level_thresholds.append(
+                [
+                    float(value)
+                    for value in np.quantile(station_negative, level_quantiles)
+                ]
+            )
+        context_hours = int(config.get("event_context_hours", 3))
+        if not 0 <= context_hours <= 12:
+            raise ValueError("event_context_hours must be in [0,12]")
+        return {
+            "method": "train_forecast_mismatch_event_weighting_v1",
+            "fit_split": "train",
+            "used_for": "training_loss_weight_only",
+            "future_actual_used_as_condition": False,
+            "applied_to_validation_or_generation": False,
+            "formula": (
+                "level=max(forecast-actual,0); ramp=abs(delta(actual)-delta(forecast))"
+            ),
+            "max_weight": float(config.get("event_max_weight", 3.0)),
+            "level_quantiles": list(level_quantiles),
+            "aggregate_level_thresholds": [
+                float(value) for value in aggregate_level_thresholds
+            ],
+            "node_level_thresholds": node_level_thresholds,
+            "ramp_mismatch_quantiles": list(ramp_quantiles),
+            "ramp_lags": list(ramp_lags),
+            "aggregate_ramp_mismatch_thresholds": aggregate_ramp_thresholds,
+            "node_ramp_mismatch_thresholds": node_ramp_thresholds,
+            "context_hours": context_hours,
+            "use_aggregate_events": bool(
+                config.get("event_use_aggregate_events", True)
+            ),
+            "use_node_events": bool(config.get("event_use_node_events", True)),
+            "wind_station_indices": [int(value) for value in wind_indices],
+            "wind_capacity_weights": [float(value) for value in wind_weight],
+        }
 
     negative = np.maximum(-aggregate_residual[complete], 0.0)
     negative_quantiles = tuple(
@@ -592,7 +691,31 @@ def validate_station_event_weighting(
     weights = np.asarray(specification.get("wind_capacity_weights"), dtype=float)
     if indices.ndim != 1 or weights.shape != indices.shape or weights.sum() <= 0:
         raise ValueError("invalid wind station weights")
+    method = str(specification.get("method", ""))
+    if method == "train_forecast_mismatch_event_weighting_v1":
+        context = int(specification.get("context_hours", -1))
+        if not 0 <= context <= 12:
+            raise ValueError("invalid forecast-mismatch context hours")
+        node_level = np.asarray(
+            specification.get("node_level_thresholds"), dtype=float
+        )
+        if node_level.shape != (len(indices), 2):
+            raise ValueError("invalid node forecast-mismatch level thresholds")
+        if not bool(specification.get("use_aggregate_events", False)) and not bool(
+            specification.get("use_node_events", False)
+        ):
+            raise ValueError("forecast mismatch weighting has no enabled scope")
     return specification
+
+
+def _dilate_event_severity(values: np.ndarray, radius: int) -> np.ndarray:
+    """Max-pool event severity over a symmetric temporal context."""
+    output = np.asarray(values, dtype=np.float64).copy()
+    source = output.copy()
+    for shift in range(1, int(radius) + 1):
+        output[..., shift:] = np.maximum(output[..., shift:], source[..., :-shift])
+        output[..., :-shift] = np.maximum(output[..., :-shift], source[..., shift:])
+    return output
 
 
 def build_station_event_loss_weights(
@@ -621,6 +744,71 @@ def build_station_event_loss_weights(
         start, full = (float(thresholds[0]), float(thresholds[1]))
         denominator = max(full - start, 1e-6)
         return np.clip((value - start) / denominator, 0.0, 1.0)
+
+    if spec.get("method") == "train_forecast_mismatch_event_weighting_v1":
+        aggregate_event = severity(
+            np.maximum(-aggregate_residual, 0.0),
+            spec["aggregate_level_thresholds"],
+        )
+        node_event = np.zeros((len(indices), length), dtype=np.float64)
+        node_level_thresholds = np.asarray(
+            spec["node_level_thresholds"], dtype=np.float64
+        )
+        for local_index, station_index in enumerate(indices):
+            node_event[local_index] = severity(
+                np.maximum(-residual[station_index], 0.0),
+                node_level_thresholds[local_index],
+            )
+        for lag in (int(value) for value in spec["ramp_lags"]):
+            aggregate_mismatch = np.zeros(length, dtype=np.float64)
+            aggregate_mismatch[lag:] = np.abs(
+                aggregate_residual[lag:] - aggregate_residual[:-lag]
+            )
+            aggregate_event = np.maximum(
+                aggregate_event,
+                severity(
+                    aggregate_mismatch,
+                    spec["aggregate_ramp_mismatch_thresholds"][str(lag)],
+                ),
+            )
+            node_thresholds = np.asarray(
+                spec["node_ramp_mismatch_thresholds"][str(lag)],
+                dtype=np.float64,
+            )
+            for local_index, station_index in enumerate(indices):
+                mismatch = np.zeros(length, dtype=np.float64)
+                mismatch[lag:] = np.abs(
+                    residual[station_index, lag:]
+                    - residual[station_index, :-lag]
+                )
+                node_event[local_index] = np.maximum(
+                    node_event[local_index],
+                    severity(mismatch, node_thresholds[local_index]),
+                )
+        aggregate_event = _dilate_event_severity(
+            aggregate_event, int(spec["context_hours"])
+        )
+        node_event = _dilate_event_severity(
+            node_event, int(spec["context_hours"])
+        )
+        aggregate_event *= complete
+        node_event *= valid_mask[indices]
+        maximum = float(spec["max_weight"])
+        if bool(spec["use_aggregate_events"]):
+            time_weight = (1.0 + (maximum - 1.0) * aggregate_event).astype(
+                np.float32
+            )
+        if not bool(spec["use_node_events"]):
+            node_event.fill(0.0)
+        combined = node_event
+        if bool(spec["use_aggregate_events"]):
+            combined = np.maximum(combined, aggregate_event[None])
+        loss_weight[indices] = 1.0 + (maximum - 1.0) * combined
+        denominator = float((loss_weight * valid_mask).sum())
+        numerator = float(valid_mask.sum())
+        if denominator > 0:
+            loss_weight *= numerator / denominator
+        return loss_weight.astype(np.float32), time_weight.astype(np.float32)
 
     event = severity(
         np.maximum(-aggregate_residual, 0.0), spec["negative_thresholds"]

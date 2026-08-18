@@ -360,6 +360,7 @@ def main() -> None:
         f"residual_scaling={residual_scale.get('method', 'per_station_std')} "
         f"ramp_aux_weight={model.diffusion.ramp_auxiliary_loss_weight} "
         f"common_event_weight={model.diffusion.wind_common_event_loss_weight} "
+        f"event_weighting_method={event_weighting.get('method') if event_weighting else None} "
         f"common_gate={model.wind_common_gate_value} "
         f"condition_gates={model.condition_gate_values} parameters={parameter_count} "
         f"state_gates={model.state_gate_values} "
@@ -492,6 +493,11 @@ def main() -> None:
         ),
         "wind_common_event_loss_weight": float(
             model.diffusion.wind_common_event_loss_weight
+        ),
+        "event_weighting_method": (
+            str(event_weighting.get("method"))
+            if event_weighting is not None
+            else None
         ),
         "parameter_count": parameter_count,
         "best_epoch": best_epoch,

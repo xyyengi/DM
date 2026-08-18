@@ -260,6 +260,11 @@ def main() -> None:
             else None
         ),
         "event_weighting_applied_during_generation": False,
+        "event_weighting_method": (
+            str(checkpoint["event_weighting"].get("method"))
+            if checkpoint.get("event_weighting") is not None
+            else None
+        ),
         "state_thresholds_file": (
             str(run_dir / "state_thresholds.json")
             if (run_dir / "state_thresholds.json").is_file()

@@ -21,6 +21,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-path", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--top-issues", type=int, default=3)
+    parser.add_argument("--baseline-label", default="Baseline")
+    parser.add_argument("--candidate-label", default="Candidate")
     return parser.parse_args()
 
 
@@ -128,7 +130,7 @@ def main() -> None:
         figure, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True, sharey=True)
         for axis, name, values in zip(
             axes,
-            ("2D baseline", "2F common-event"),
+            (args.baseline_label, args.candidate_label),
             (base_wind, candidate_wind),
         ):
             ensemble = values[issue_index]
