@@ -195,6 +195,7 @@ class StationConditionEncoder(nn.Module):
         revision_mask: torch.Tensor | None = None,
         recent_error: torch.Tensor | None = None,
         recent_error_mask: torch.Tensor | None = None,
+        forecast_condition_strength: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
         if forecast.ndim != 3:
             raise ValueError(f"forecast must be [B,S,L], got {tuple(forecast.shape)}")
@@ -208,7 +209,21 @@ class StationConditionEncoder(nn.Module):
         if station_features.shape[0] != stations:
             raise ValueError("station feature order/count does not match forecast")
 
+        if forecast_condition_strength is None:
+            forecast_condition_strength = torch.ones(
+                batch, 1, 1, device=forecast.device, dtype=forecast.dtype
+            )
+        if forecast_condition_strength.shape != (batch, 1, 1):
+            raise ValueError(
+                "forecast_condition_strength must be [B,1,1], got "
+                f"{tuple(forecast_condition_strength.shape)}"
+            )
+        local_strength = forecast_condition_strength[:, None, :, :].expand(
+            -1, stations, -1, -1
+        ).reshape(batch * stations, 1, 1)
+
         local = self.forecast_stem(forecast.reshape(batch * stations, 1, length))
+        local = local * local_strength
         temporal = self.temporal_stem(torch.cat([calendar, lead], dim=1))
         temporal = temporal[:, None, :, :].expand(-1, stations, -1, -1)
         temporal = temporal.reshape(batch * stations, temporal.shape[2], length)
@@ -233,6 +248,7 @@ class StationConditionEncoder(nn.Module):
                     batch * stations, len(self.forecast_ramp_lags), length
                 )
             )
+            extras["ramp"] = extras["ramp"] * local_strength
         if self.use_forecast_revision:
             expected = (batch, stations, length)
             if (
@@ -246,6 +262,7 @@ class StationConditionEncoder(nn.Module):
                 [forecast_revision, revision_mask], dim=2
             ).reshape(batch * stations, 2, length)
             extras["revision"] = self.extra_stems["revision"](revision_input)
+            extras["revision"] = extras["revision"] * local_strength
         if self.use_recent_error:
             expected_error = (batch, stations, self.recent_error_hours)
             expected_mask = (batch, stations, 1)
@@ -913,6 +930,21 @@ class StationConditionalResUNet1D(nn.Module):
         self.station_count = int(config.get("station_count", 24))
         self.spatial_mode = str(config.get("spatial_mode", "none"))
         self.use_state_encoder = bool(config.get("use_state_encoder", False))
+        self.forecast_condition_dropout_prob = float(
+            config.get("forecast_condition_dropout_prob", 0.0)
+        )
+        if not 0.0 <= self.forecast_condition_dropout_prob < 1.0:
+            raise ValueError("forecast_condition_dropout_prob must be in [0,1)")
+        self.register_buffer(
+            "_forecast_condition_sample_count",
+            torch.zeros((), dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_forecast_condition_drop_count",
+            torch.zeros((), dtype=torch.long),
+            persistent=False,
+        )
         self.use_dual_fixed_graph = bool(config.get("use_dual_fixed_graph", False))
         if self.use_dual_fixed_graph != (secondary_adjacency is not None):
             raise ValueError(
@@ -1257,6 +1289,7 @@ class StationConditionalResUNet1D(nn.Module):
         recent_error: torch.Tensor | None = None,
         recent_error_mask: torch.Tensor | None = None,
         node_state: torch.Tensor | None = None,
+        forecast_condition_strength: torch.Tensor | float | None = None,
     ) -> torch.Tensor:
         if noisy_residual.shape[1:] != (self.station_count, self.sequence_length):
             raise ValueError(
@@ -1264,6 +1297,38 @@ class StationConditionalResUNet1D(nn.Module):
                 f"{tuple(noisy_residual.shape)}"
             )
         batch, stations, length = noisy_residual.shape
+        if forecast_condition_strength is None:
+            if self.training and self.forecast_condition_dropout_prob > 0.0:
+                keep = torch.rand(
+                    batch, 1, 1, device=forecast.device, dtype=forecast.dtype
+                ) >= self.forecast_condition_dropout_prob
+                condition_strength = keep.to(forecast.dtype)
+                with torch.no_grad():
+                    self._forecast_condition_sample_count.add_(batch)
+                    self._forecast_condition_drop_count.add_((~keep).sum())
+            else:
+                condition_strength = torch.ones(
+                    batch, 1, 1, device=forecast.device, dtype=forecast.dtype
+                )
+        elif isinstance(forecast_condition_strength, (int, float)):
+            condition_strength = torch.full(
+                (batch, 1, 1),
+                float(forecast_condition_strength),
+                device=forecast.device,
+                dtype=forecast.dtype,
+            )
+        else:
+            condition_strength = forecast_condition_strength.to(
+                device=forecast.device, dtype=forecast.dtype
+            )
+            if condition_strength.ndim == 1:
+                condition_strength = condition_strength[:, None, None]
+        if condition_strength.shape != (batch, 1, 1):
+            raise ValueError(
+                "forecast_condition_strength must be scalar, [B], or [B,1,1]"
+            )
+        if torch.any(condition_strength < 0.0) or torch.any(condition_strength > 1.0):
+            raise ValueError("forecast_condition_strength must be in [0,1]")
         time_embedding = self.timestep_embedding(timestep)
         conditions = self.condition_encoder(
             forecast,
@@ -1275,12 +1340,18 @@ class StationConditionalResUNet1D(nn.Module):
             revision_mask=revision_mask,
             recent_error=recent_error,
             recent_error_mask=recent_error_mask,
+            forecast_condition_strength=condition_strength,
         )
         state_conditions = None
         if self.use_state_encoder:
             if node_state is None:
                 raise ValueError("node_state is required when use_state_encoder=true")
             state_conditions = self.state_encoder(node_state)
+            state_strength = condition_strength[:, :, None, :]
+            state_conditions = [
+                state_condition * state_strength
+                for state_condition in state_conditions
+            ]
         hidden = self.state_stem(noisy_residual.reshape(batch * stations, 1, length))
         hidden = _restore_stations(hidden, batch, stations)
         skips = []
@@ -1360,6 +1431,16 @@ class StationConditionalResUNet1D(nn.Module):
                 * self.wind_station_mask[None, :, None]
             )
         return output
+
+    def forecast_condition_dropout_statistics(self) -> dict[str, float | int]:
+        total = int(self._forecast_condition_sample_count.detach().cpu())
+        dropped = int(self._forecast_condition_drop_count.detach().cpu())
+        return {
+            "configured_probability": self.forecast_condition_dropout_prob,
+            "observed_sample_count": total,
+            "observed_drop_count": dropped,
+            "observed_drop_rate": dropped / total if total else 0.0,
+        }
 
 
 class StationGaussianDiffusion(nn.Module):
@@ -1441,6 +1522,7 @@ class StationGaussianDiffusion(nn.Module):
         timestep: torch.Tensor | None = None,
         noise: torch.Tensor | None = None,
         include_auxiliary: bool = True,
+        forecast_condition_strength: torch.Tensor | float | None = None,
     ) -> torch.Tensor:
         if timestep is None:
             timestep = torch.randint(
@@ -1459,6 +1541,7 @@ class StationGaussianDiffusion(nn.Module):
             recent_error=recent_error,
             recent_error_mask=recent_error_mask,
             node_state=node_state,
+            forecast_condition_strength=forecast_condition_strength,
         )
         squared_error = (prediction - noise) ** 2
         valid_mask = valid_mask.to(squared_error.dtype)
@@ -1580,13 +1663,12 @@ class StationGaussianDiffusion(nn.Module):
         recent_error: torch.Tensor | None = None,
         recent_error_mask: torch.Tensor | None = None,
         node_state: torch.Tensor | None = None,
+        forecast_guidance_scale: float = 1.0,
     ) -> torch.Tensor:
-        predicted_noise = self.denoiser(
-            noisy,
-            timestep,
-            forecast,
-            calendar,
-            lead,
+        forecast_guidance_scale = float(forecast_guidance_scale)
+        if not 0.0 <= forecast_guidance_scale <= 1.0:
+            raise ValueError("forecast_guidance_scale must be in [0,1]")
+        denoiser_kwargs = dict(
             forecast_ramps=forecast_ramps,
             forecast_revision=forecast_revision,
             revision_mask=revision_mask,
@@ -1594,6 +1676,30 @@ class StationGaussianDiffusion(nn.Module):
             recent_error_mask=recent_error_mask,
             node_state=node_state,
         )
+        predicted_conditional = self.denoiser(
+            noisy,
+            timestep,
+            forecast,
+            calendar,
+            lead,
+            forecast_condition_strength=1.0,
+            **denoiser_kwargs,
+        )
+        if forecast_guidance_scale == 1.0:
+            predicted_noise = predicted_conditional
+        else:
+            predicted_neutral = self.denoiser(
+                noisy,
+                timestep,
+                forecast,
+                calendar,
+                lead,
+                forecast_condition_strength=0.0,
+                **denoiser_kwargs,
+            )
+            predicted_noise = predicted_neutral + forecast_guidance_scale * (
+                predicted_conditional - predicted_neutral
+            )
         alpha = self.alpha[timestep].view(-1, 1, 1)
         alpha_hat = self.alpha_hat[timestep].view(-1, 1, 1)
         coefficient = (1.0 - alpha) / (1.0 - alpha_hat).sqrt()
@@ -1616,6 +1722,7 @@ class StationGaussianDiffusion(nn.Module):
         recent_error: torch.Tensor | None = None,
         recent_error_mask: torch.Tensor | None = None,
         node_state: torch.Tensor | None = None,
+        forecast_guidance_scale: float = 1.0,
     ) -> torch.Tensor:
         batch, stations, length = forecast.shape
         n_samples = int(n_samples)
@@ -1654,6 +1761,7 @@ class StationGaussianDiffusion(nn.Module):
                 forecast,
                 calendar,
                 lead,
+                forecast_guidance_scale=forecast_guidance_scale,
                 **optional_conditions,
             )
         return noisy.reshape(batch, n_samples, stations, length)
@@ -1764,6 +1872,10 @@ class Station24DiffusionModel(nn.Module):
         return self.denoiser.condition_encoder.gate_values()
 
     @property
+    def forecast_condition_dropout_statistics(self) -> dict[str, float | int]:
+        return self.denoiser.forecast_condition_dropout_statistics()
+
+    @property
     def state_gate_values(self) -> dict[str, float]:
         if not self.denoiser.use_state_encoder:
             return {}
@@ -1790,6 +1902,7 @@ class Station24DiffusionModel(nn.Module):
         timestep: torch.Tensor | None = None,
         noise: torch.Tensor | None = None,
         include_auxiliary: bool = True,
+        forecast_condition_strength: torch.Tensor | float | None = None,
     ) -> torch.Tensor:
         return self.diffusion.training_loss(
             batch["residual_target"],
@@ -1809,18 +1922,21 @@ class Station24DiffusionModel(nn.Module):
             timestep=timestep,
             noise=noise,
             include_auxiliary=include_auxiliary,
+            forecast_condition_strength=forecast_condition_strength,
         )
 
     def generate(
         self,
         batch: Mapping[str, torch.Tensor],
         n_samples: int,
+        forecast_guidance_scale: float = 1.0,
     ) -> torch.Tensor:
         return self.diffusion.sample(
             batch["forecast"],
             batch["calendar"],
             batch["lead"],
             n_samples,
+            forecast_guidance_scale=forecast_guidance_scale,
             forecast_ramps=batch.get("forecast_ramps"),
             forecast_revision=batch.get("forecast_revision"),
             revision_mask=batch.get("revision_mask"),

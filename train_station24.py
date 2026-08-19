@@ -171,6 +171,12 @@ def save_checkpoint(
         ),
         "condition_variant": str(config.get("experiment", {}).get("variant", "baseline")),
         "condition_gate_values": model.condition_gate_values,
+        "forecast_condition_dropout_prob": float(
+            model.denoiser.forecast_condition_dropout_prob
+        ),
+        "forecast_condition_dropout_statistics": (
+            model.forecast_condition_dropout_statistics
+        ),
         "state_gate_values": model.state_gate_values,
         "wind_common_gate_value": model.wind_common_gate_value,
         "state_thresholds": (
@@ -357,6 +363,7 @@ def main() -> None:
         f"parallel_adjacency={model.parallel_spatial_adjacency_mode} "
         f"graph_mode={graph_manifest['mode']} "
         f"condition_variant={config.get('experiment', {}).get('variant', 'baseline')} "
+        f"forecast_condition_dropout={model.denoiser.forecast_condition_dropout_prob} "
         f"residual_scaling={residual_scale.get('method', 'per_station_std')} "
         f"ramp_aux_weight={model.diffusion.ramp_auxiliary_loss_weight} "
         f"common_event_weight={model.diffusion.wind_common_event_loss_weight} "
@@ -476,6 +483,12 @@ def main() -> None:
             config.get("experiment", {}).get("variant", "baseline")
         ),
         "condition_gate_values": model.condition_gate_values,
+        "forecast_condition_dropout_prob": float(
+            model.denoiser.forecast_condition_dropout_prob
+        ),
+        "forecast_condition_dropout_statistics": (
+            model.forecast_condition_dropout_statistics
+        ),
         "spatial_gate_values": model.spatial_gate_values,
         "parallel_spatial_gate_statistics": (
             model.parallel_spatial_gate_statistics

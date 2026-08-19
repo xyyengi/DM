@@ -76,6 +76,128 @@ class Station24ModelTests(unittest.TestCase):
         self.assertLess(counts["fixed_graph"] - counts["none"], 1000)
         self.assertLess(counts["type_gated_graph"] - counts["none"], 1000)
 
+    def test_forecast_condition_dropout_is_parameter_free_and_switchable(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        base_config = self.config("fixed_graph")
+        dropout_config = copy.deepcopy(base_config)
+        dropout_config.update(
+            {
+                "forecast_condition_dropout_prob": 0.10,
+                "use_state_encoder": True,
+                "state_feature_dim": 4,
+                "state_channels": [4, 8, 16],
+            }
+        )
+        state_base_config = copy.deepcopy(dropout_config)
+        state_base_config["forecast_condition_dropout_prob"] = 0.0
+        baseline = Station24DiffusionModel(
+            state_base_config, features, adjacency
+        )
+        candidate = Station24DiffusionModel(
+            dropout_config, features, adjacency
+        )
+        candidate.load_state_dict(baseline.state_dict())
+        self.assertEqual(
+            sum(parameter.numel() for parameter in baseline.parameters()),
+            sum(parameter.numel() for parameter in candidate.parameters()),
+        )
+
+        candidate.train()
+        candidate(
+            self.batch(),
+            timestep=torch.tensor([0, 1]),
+            noise=torch.randn(2, 24, 16),
+            include_auxiliary=False,
+        )
+        dropout_audit = candidate.forecast_condition_dropout_statistics
+        self.assertEqual(dropout_audit["observed_sample_count"], 2)
+        self.assertEqual(dropout_audit["configured_probability"], 0.10)
+
+        candidate.eval()
+        batch = self.batch()
+        timestep = torch.tensor([0, 1])
+        noise = torch.randn_like(batch["residual_target"])
+        conditional = candidate(
+            batch,
+            timestep=timestep,
+            noise=noise,
+            include_auxiliary=False,
+            forecast_condition_strength=1.0,
+        )
+        neutral = candidate(
+            batch,
+            timestep=timestep,
+            noise=noise,
+            include_auxiliary=False,
+            forecast_condition_strength=0.0,
+        )
+        self.assertTrue(torch.isfinite(conditional))
+        self.assertTrue(torch.isfinite(neutral))
+        self.assertNotAlmostEqual(
+            float(conditional.detach()), float(neutral.detach()), places=7
+        )
+
+    def test_forecast_guidance_interpolates_denoiser_predictions(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        config = self.config("fixed_graph")
+        config.update(
+            {
+                "forecast_condition_dropout_prob": 0.10,
+                "use_state_encoder": True,
+                "state_feature_dim": 4,
+                "state_channels": [4, 8, 16],
+            }
+        )
+        model = Station24DiffusionModel(config, features, adjacency)
+        model.eval()
+        batch = self.batch(batch_size=1)
+        noisy = torch.randn(1, 24, 16)
+        timestep = torch.zeros(1, dtype=torch.long)
+        kwargs = {
+            "forecast_ramps": batch["forecast_ramps"],
+            "forecast_revision": batch["forecast_revision"],
+            "revision_mask": batch["revision_mask"],
+            "recent_error": batch["recent_error"],
+            "recent_error_mask": batch["recent_error_mask"],
+            "node_state": batch["node_state"],
+        }
+        neutral = model.diffusion.denoise_step(
+            noisy,
+            timestep,
+            batch["forecast"],
+            batch["calendar"],
+            batch["lead"],
+            forecast_guidance_scale=0.0,
+            **kwargs,
+        )
+        halfway = model.diffusion.denoise_step(
+            noisy,
+            timestep,
+            batch["forecast"],
+            batch["calendar"],
+            batch["lead"],
+            forecast_guidance_scale=0.5,
+            **kwargs,
+        )
+        conditional = model.diffusion.denoise_step(
+            noisy,
+            timestep,
+            batch["forecast"],
+            batch["calendar"],
+            batch["lead"],
+            forecast_guidance_scale=1.0,
+            **kwargs,
+        )
+        self.assertTrue(
+            torch.allclose(halfway, 0.5 * (neutral + conditional), atol=1e-6)
+        )
+        with self.assertRaisesRegex(ValueError, "must be in"):
+            model.generate(batch, n_samples=1, forecast_guidance_scale=1.1)
+
     def test_dual_fixed_graph_adds_only_four_shared_projection_logits(self):
         from src.models.station_conditioned_diffusion import Station24DiffusionModel
 
@@ -772,6 +894,7 @@ class Station24DatasetTests(unittest.TestCase):
                 "num_steps": 2,
                 "beta_start": 1e-4,
                 "beta_end": 0.02,
+                "forecast_condition_dropout_prob": 0.10,
                 "use_forecast_ramps": False,
                 "forecast_ramp_lags": [3, 6],
                 "use_recent_error": True,
@@ -879,6 +1002,8 @@ class Station24DatasetTests(unittest.TestCase):
                     "2",
                     "--member-chunk-size",
                     "1",
+                    "--forecast-guidance-scale",
+                    "0.75",
                     "--allow-cpu",
                 ],
                 check=True,
@@ -895,6 +1020,8 @@ class Station24DatasetTests(unittest.TestCase):
                 metrics,
             )
             self.assertIn('"ramp_auxiliary_loss_weight": 0.05', metrics)
+            self.assertIn('"forecast_guidance_scale": 0.75', metrics)
+            self.assertIn('"forecast_condition_dropout_prob": 0.1', metrics)
             self.assertIn(
                 '"event_weighting_method": '
                 '"train_forecast_mismatch_event_weighting_v1"',

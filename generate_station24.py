@@ -33,6 +33,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--issue-batch-size", type=int, default=None)
     parser.add_argument("--member-chunk-size", type=int, default=None)
     parser.add_argument(
+        "--forecast-guidance-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Interpolate denoiser predictions between the forecast-neutral path "
+            "(0) and full forecast conditioning (1)"
+        ),
+    )
+    parser.add_argument(
         "--energy-score-member-limit",
         type=int,
         default=None,
@@ -84,6 +93,9 @@ def main() -> None:
     )
     if n_samples <= 0 or member_chunk_size <= 0:
         raise ValueError("n_samples and member_chunk_size must be positive")
+    forecast_guidance_scale = float(args.forecast_guidance_scale)
+    if not 0.0 <= forecast_guidance_scale <= 1.0:
+        raise ValueError("forecast-guidance-scale must be in [0,1]")
     output_dir = Path(
         args.output_dir
         or run_dir / f"generation_{args.split}_n{n_samples}_seed{seed}"
@@ -163,7 +175,13 @@ def main() -> None:
         while remaining > 0:
             current = min(member_chunk_size, remaining)
             with torch.no_grad():
-                chunks.append(model.generate(batch, n_samples=current).cpu())
+                chunks.append(
+                    model.generate(
+                        batch,
+                        n_samples=current,
+                        forecast_guidance_scale=forecast_guidance_scale,
+                    ).cpu()
+                )
             remaining -= current
         standardized = torch.cat(chunks, dim=1).numpy()  # [B,K,S,T]
         scale_tensor = raw_batch["residual_scale"].numpy()  # [B,S,T]
@@ -252,6 +270,13 @@ def main() -> None:
             config.get("experiment", {}).get("variant", "baseline")
         ),
         "condition_gate_values": model.condition_gate_values,
+        "forecast_condition_dropout_prob": float(
+            model.denoiser.forecast_condition_dropout_prob
+        ),
+        "training_forecast_condition_dropout_statistics": checkpoint.get(
+            "forecast_condition_dropout_statistics"
+        ),
+        "forecast_guidance_scale": forecast_guidance_scale,
         "state_gate_values": model.state_gate_values,
         "wind_common_gate_value": model.wind_common_gate_value,
         "event_weighting_file": (
