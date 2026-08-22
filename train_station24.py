@@ -177,6 +177,13 @@ def save_checkpoint(
         "forecast_condition_dropout_statistics": (
             model.forecast_condition_dropout_statistics
         ),
+        "forecast_correction_mode": model.forecast_correction_mode,
+        "forecast_correction_loss_weight": float(
+            model.forecast_correction_loss_weight
+        ),
+        "forecast_correction_huber_beta": float(
+            model.forecast_correction_huber_beta
+        ),
         "state_gate_values": model.state_gate_values,
         "wind_common_gate_value": model.wind_common_gate_value,
         "state_thresholds": (
@@ -364,6 +371,8 @@ def main() -> None:
         f"graph_mode={graph_manifest['mode']} "
         f"condition_variant={config.get('experiment', {}).get('variant', 'baseline')} "
         f"forecast_condition_dropout={model.denoiser.forecast_condition_dropout_prob} "
+        f"forecast_correction={model.forecast_correction_mode} "
+        f"correction_loss_weight={model.forecast_correction_loss_weight} "
         f"residual_scaling={residual_scale.get('method', 'per_station_std')} "
         f"ramp_aux_weight={model.diffusion.ramp_auxiliary_loss_weight} "
         f"common_event_weight={model.diffusion.wind_common_event_loss_weight} "

@@ -44,8 +44,11 @@ class Station24ModelTests(unittest.TestCase):
         }
 
     def batch(self, batch_size=2):
+        residual_target = torch.randn(batch_size, 24, 16)
         return {
-            "residual_target": torch.randn(batch_size, 24, 16),
+            "residual_target": residual_target,
+            "residual": residual_target.clone(),
+            "residual_scale": torch.ones(batch_size, 24, 16),
             "forecast": torch.rand(batch_size, 24, 16),
             "calendar": torch.randn(batch_size, 8, 16),
             "lead": torch.rand(batch_size, 2, 16),
@@ -588,6 +591,48 @@ class Station24ModelTests(unittest.TestCase):
             self.assertEqual(tuple(generated.shape), (1, 2, 24, 16))
             self.assertEqual(set(model.condition_gate_values), expected_gates)
 
+    def test_forecast_correction_direct_and_decomposed_are_causal_and_trainable(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        counts = {}
+        for mode, expected_components in [("direct", 1), ("decomposed", 6)]:
+            config = self.config("fixed_graph")
+            config.update(
+                {
+                    "use_forecast_correction": True,
+                    "forecast_correction_mode": mode,
+                    "forecast_correction_channels": 8,
+                    "forecast_correction_use_revision": True,
+                    "forecast_correction_use_recent_error": True,
+                    "forecast_correction_max_abs": 1.0,
+                    "forecast_correction_loss_weight": 0.25,
+                    "forecast_correction_huber_beta": 0.05,
+                    "recent_error_hours": 24,
+                }
+            )
+            model = Station24DiffusionModel(config, features, adjacency)
+            batch = self.batch()
+            correction = model.predict_forecast_correction(batch)
+            self.assertEqual(tuple(correction.shape), (2, 24, 16))
+            self.assertTrue(torch.equal(correction, torch.zeros_like(correction)))
+            components = model.forecast_correction_head._forecast_components(
+                batch["forecast"].reshape(2 * 24, 16)
+            )
+            self.assertEqual(tuple(components.shape), (2 * 24, expected_components, 16))
+            loss = model(batch)
+            self.assertTrue(torch.isfinite(loss))
+            loss.backward()
+            self.assertIsNotNone(model.forecast_correction_head.output.weight.grad)
+            with torch.no_grad():
+                model.forecast_correction_head.output.bias.fill_(0.1)
+            shifted = model.predict_forecast_correction(batch)
+            self.assertGreater(float(shifted.detach().mean()), 0.0)
+            generated = model.generate(self.batch(batch_size=1), n_samples=2)
+            self.assertEqual(tuple(generated.shape), (1, 2, 24, 16))
+            counts[mode] = sum(parameter.numel() for parameter in model.parameters())
+        self.assertGreater(counts["decomposed"], counts["direct"])
+
     def test_state_v1_lightweight_encoder_shapes_forward_and_zero_init(self):
         from src.models.station_conditioned_diffusion import Station24DiffusionModel
 
@@ -894,6 +939,14 @@ class Station24DatasetTests(unittest.TestCase):
                 "num_steps": 2,
                 "beta_start": 1e-4,
                 "beta_end": 0.02,
+                "use_forecast_correction": True,
+                "forecast_correction_mode": "direct",
+                "forecast_correction_channels": 4,
+                "forecast_correction_use_revision": True,
+                "forecast_correction_use_recent_error": True,
+                "forecast_correction_max_abs": 1.0,
+                "forecast_correction_loss_weight": 0.25,
+                "forecast_correction_huber_beta": 0.05,
                 "forecast_condition_dropout_prob": 0.10,
                 "use_forecast_ramps": False,
                 "forecast_ramp_lags": [3, 6],
@@ -924,7 +977,7 @@ class Station24DatasetTests(unittest.TestCase):
                 "experiment": {"name": "smoke", "family": "test"},
                 "data": {"data_path": str(data_dir)},
                 "target": {
-                    "type": "residual",
+                    "type": "corrected_residual",
                     "residual_scaling": {
                         "method": "wind_factorized_condition_std",
                         "epsilon": 1e-4,
@@ -1022,12 +1075,35 @@ class Station24DatasetTests(unittest.TestCase):
             self.assertIn('"ramp_auxiliary_loss_weight": 0.05', metrics)
             self.assertIn('"forecast_guidance_scale": 0.75', metrics)
             self.assertIn('"forecast_condition_dropout_prob": 0.1', metrics)
+            self.assertIn('"forecast_correction_mode": "direct"', metrics)
+            self.assertIn(
+                '"checkpoint_validation_objective_type": '
+                '"diffusion_epsilon_plus_forecast_correction_huber"',
+                metrics,
+            )
             self.assertIn(
                 '"event_weighting_method": '
                 '"train_forecast_mismatch_event_weighting_v1"',
                 metrics,
             )
             self.assertTrue((output_dir / "station_daylight_mask.npy").is_file())
+            self.assertTrue(
+                (output_dir / "forecast_correction_normalized.npy").is_file()
+            )
+            self.assertTrue(
+                (
+                    output_dir
+                    / "generated_stochastic_residual_standardized.npy"
+                ).is_file()
+            )
+            scale = np.load(output_dir / "generated_residual_normalized.npy")
+            scenario = np.load(output_dir / "actual_scenarios_raw_normalized.npy")
+            forecast = np.load(output_dir / "forecast_data_normalized.npy")
+            np.testing.assert_allclose(
+                scenario,
+                forecast[:, None, :, :] + scale,
+                atol=1e-6,
+            )
 
             comparison_inputs = []
             for mode in ["none", "fixed_graph", "type_gated_graph"]:

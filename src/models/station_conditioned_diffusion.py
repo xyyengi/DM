@@ -300,6 +300,191 @@ class StationConditionEncoder(nn.Module):
         }
 
 
+class StationForecastCorrectionHead(nn.Module):
+    """Predict a causal forecast correction before stochastic residual diffusion.
+
+    The head predicts a correction in normalized physical-power units.  Its
+    inputs are restricted to information available at issue time.  The
+    ``decomposed`` mode differs from ``direct`` only in the representation of
+    the issued forecast, keeping the A1/A2 ablation identifiable.
+    """
+
+    MODES = {"direct", "decomposed"}
+
+    def __init__(
+        self,
+        config: Mapping[str, object],
+        station_features: torch.Tensor,
+        groups: int,
+    ) -> None:
+        super().__init__()
+        self.mode = str(config.get("forecast_correction_mode", "direct"))
+        if self.mode not in self.MODES:
+            raise ValueError(
+                f"forecast_correction_mode must be one of {sorted(self.MODES)}"
+            )
+        self.station_count = int(config.get("station_count", 24))
+        self.recent_error_hours = int(config.get("recent_error_hours", 24))
+        self.use_revision = bool(
+            config.get("forecast_correction_use_revision", True)
+        )
+        self.use_recent_error = bool(
+            config.get("forecast_correction_use_recent_error", True)
+        )
+        self.max_abs = float(config.get("forecast_correction_max_abs", 1.0))
+        if self.max_abs <= 0:
+            raise ValueError("forecast_correction_max_abs must be positive")
+        hidden = int(config.get("forecast_correction_channels", 32))
+        if hidden <= 0:
+            raise ValueError("forecast_correction_channels must be positive")
+
+        forecast_channels = 1 if self.mode == "direct" else 6
+        revision_channels = 2 if self.use_revision else 0
+        main_channels = forecast_channels + 10 + revision_channels
+        self.main_stem = nn.Sequential(
+            nn.Conv1d(main_channels, hidden, kernel_size=5, padding=2),
+            nn.GroupNorm(_group_count(hidden, groups), hidden),
+            nn.SiLU(),
+            nn.Conv1d(hidden, hidden, kernel_size=3, padding=2, dilation=2),
+            nn.GroupNorm(_group_count(hidden, groups), hidden),
+            nn.SiLU(),
+        )
+        self.station_projection = nn.Linear(
+            int(station_features.shape[1]), hidden
+        )
+        self.register_buffer(
+            "station_features", station_features.float(), persistent=False
+        )
+        self.recent_encoder = None
+        if self.use_recent_error:
+            self.recent_encoder = nn.Sequential(
+                nn.Conv1d(1, hidden, kernel_size=3, padding=1),
+                nn.GroupNorm(_group_count(hidden, groups), hidden),
+                nn.SiLU(),
+                nn.Conv1d(hidden, hidden, kernel_size=3, padding=1),
+                nn.SiLU(),
+            )
+        fusion_channels = hidden * (3 if self.use_recent_error else 2)
+        self.fusion = nn.Sequential(
+            nn.Conv1d(fusion_channels, hidden, kernel_size=3, padding=1),
+            nn.GroupNorm(_group_count(hidden, groups), hidden),
+            nn.SiLU(),
+            nn.Conv1d(hidden, hidden, kernel_size=3, padding=4, dilation=4),
+            nn.GroupNorm(_group_count(hidden, groups), hidden),
+            nn.SiLU(),
+        )
+        self.output = nn.Conv1d(hidden, 1, kernel_size=1)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    @staticmethod
+    def _moving_average(value: torch.Tensor, kernel_size: int) -> torch.Tensor:
+        if kernel_size % 2 != 1:
+            raise ValueError("moving-average kernel must be odd")
+        padding = kernel_size // 2
+        padded = F.pad(value, (padding, padding), mode="replicate")
+        return F.avg_pool1d(padded, kernel_size=kernel_size, stride=1)
+
+    @staticmethod
+    def _difference(value: torch.Tensor, lag: int) -> torch.Tensor:
+        output = torch.zeros_like(value)
+        output[..., lag:] = value[..., lag:] - value[..., :-lag]
+        return output
+
+    def _forecast_components(self, forecast: torch.Tensor) -> torch.Tensor:
+        if self.mode == "direct":
+            return forecast[:, None, :]
+        source = forecast[:, None, :]
+        low_day = self._moving_average(source, 25)
+        low_multi_day = self._moving_average(source, 73)
+        event = source - low_day
+        return torch.cat(
+            [
+                low_day,
+                low_multi_day,
+                event,
+                self._difference(source, 1),
+                self._difference(source, 3),
+                self._difference(source, 6),
+            ],
+            dim=1,
+        )
+
+    def forward(
+        self,
+        forecast: torch.Tensor,
+        calendar: torch.Tensor,
+        lead: torch.Tensor,
+        forecast_revision: torch.Tensor | None = None,
+        revision_mask: torch.Tensor | None = None,
+        recent_error: torch.Tensor | None = None,
+        recent_error_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if forecast.ndim != 3:
+            raise ValueError("forecast correction expects forecast [B,S,L]")
+        batch, stations, length = forecast.shape
+        if stations != self.station_count:
+            raise ValueError("forecast correction station count mismatch")
+        if calendar.shape != (batch, 8, length):
+            raise ValueError("forecast correction calendar must be [B,8,L]")
+        if lead.shape != (batch, 2, length):
+            raise ValueError("forecast correction lead must be [B,2,L]")
+
+        flat_forecast = forecast.reshape(batch * stations, length)
+        pieces = [self._forecast_components(flat_forecast)]
+        temporal = torch.cat([calendar, lead], dim=1)
+        temporal = temporal[:, None].expand(-1, stations, -1, -1)
+        pieces.append(temporal.reshape(batch * stations, 10, length))
+        if self.use_revision:
+            expected = (batch, stations, length)
+            if (
+                forecast_revision is None
+                or revision_mask is None
+                or forecast_revision.shape != expected
+                or revision_mask.shape != expected
+            ):
+                raise ValueError(
+                    "forecast correction revision and mask must be [B,S,L]"
+                )
+            pieces.extend(
+                [
+                    (forecast_revision * revision_mask).reshape(
+                        batch * stations, 1, length
+                    ),
+                    revision_mask.reshape(batch * stations, 1, length),
+                ]
+            )
+        main = self.main_stem(torch.cat(pieces, dim=1))
+
+        station = self.station_projection(self.station_features)
+        station = station[None, :, :, None].expand(batch, -1, -1, length)
+        station = station.reshape(batch * stations, station.shape[2], length)
+        fusion_inputs = [main, station]
+        if self.use_recent_error:
+            expected_error = (batch, stations, self.recent_error_hours)
+            expected_mask = (batch, stations, 1)
+            if (
+                recent_error is None
+                or recent_error_mask is None
+                or recent_error.shape != expected_error
+                or recent_error_mask.shape != expected_mask
+            ):
+                raise ValueError(
+                    "forecast correction recent error/mask shape mismatch"
+                )
+            assert self.recent_encoder is not None
+            recent = self.recent_encoder(
+                recent_error.reshape(batch * stations, 1, self.recent_error_hours)
+            )
+            recent = 0.5 * (recent.mean(dim=-1) + recent[:, :, -1])
+            recent = recent * recent_error_mask.reshape(batch * stations, 1)
+            fusion_inputs.append(recent[:, :, None].expand(-1, -1, length))
+
+        raw = self.output(self.fusion(torch.cat(fusion_inputs, dim=1)))
+        correction = self.max_abs * torch.tanh(raw / self.max_abs)
+        return correction.reshape(batch, stations, length)
+
+
 class StationStateEncoder(nn.Module):
     """Lightweight multi-scale encoder for four causal state-v1 features."""
 
@@ -1782,6 +1967,37 @@ class Station24DiffusionModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = dict(config)
+        self.forecast_correction_mode = (
+            str(self.config.get("forecast_correction_mode", "direct"))
+            if bool(self.config.get("use_forecast_correction", False))
+            else "none"
+        )
+        self.forecast_correction_loss_weight = float(
+            self.config.get("forecast_correction_loss_weight", 0.0)
+        )
+        self.forecast_correction_huber_beta = float(
+            self.config.get("forecast_correction_huber_beta", 0.05)
+        )
+        if self.forecast_correction_mode != "none":
+            if self.forecast_correction_loss_weight <= 0:
+                raise ValueError(
+                    "forecast_correction_loss_weight must be positive when enabled"
+                )
+            if self.forecast_correction_huber_beta <= 0:
+                raise ValueError("forecast_correction_huber_beta must be positive")
+            self.forecast_correction_head: StationForecastCorrectionHead | None = (
+                StationForecastCorrectionHead(
+                    self.config,
+                    station_features,
+                    int(self.config.get("group_norm_groups", 8)),
+                )
+            )
+        else:
+            if self.forecast_correction_loss_weight != 0:
+                raise ValueError(
+                    "forecast correction loss weight must be zero when disabled"
+                )
+            self.forecast_correction_head = None
         self.denoiser = StationConditionalResUNet1D(
             self.config,
             station_features,
@@ -1896,6 +2112,24 @@ class Station24DiffusionModel(nn.Module):
             return None
         return float(torch.sigmoid(gate.detach()).cpu())
 
+    def predict_forecast_correction(
+        self, batch: Mapping[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Return the causal correction center in normalized power units."""
+
+        forecast = batch["forecast"]
+        if self.forecast_correction_head is None:
+            return torch.zeros_like(forecast)
+        return self.forecast_correction_head(
+            forecast,
+            batch["calendar"],
+            batch["lead"],
+            forecast_revision=batch.get("forecast_revision"),
+            revision_mask=batch.get("revision_mask"),
+            recent_error=batch.get("recent_error"),
+            recent_error_mask=batch.get("recent_error_mask"),
+        )
+
     def forward(
         self,
         batch: Mapping[str, torch.Tensor],
@@ -1904,9 +2138,24 @@ class Station24DiffusionModel(nn.Module):
         include_auxiliary: bool = True,
         forecast_condition_strength: torch.Tensor | float | None = None,
     ) -> torch.Tensor:
-        return self.diffusion.training_loss(
-            batch["residual_target"],
-            batch["forecast"],
+        correction = self.predict_forecast_correction(batch)
+        clean = batch["residual_target"]
+        condition_forecast = batch["forecast"]
+        if self.forecast_correction_head is not None:
+            scale = batch.get("residual_scale")
+            if scale is None or scale.shape != correction.shape:
+                raise ValueError(
+                    "forecast correction requires residual_scale [B,S,L]"
+                )
+            # The correction head is trained by its explicit supervised loss.
+            # Detaching here prevents an unidentifiable trade between the
+            # deterministic center and the stochastic diffusion residual.
+            detached = correction.detach()
+            clean = clean - detached / scale
+            condition_forecast = condition_forecast + detached
+        diffusion_loss = self.diffusion.training_loss(
+            clean,
+            condition_forecast,
             batch["calendar"],
             batch["lead"],
             batch["valid_mask"],
@@ -1924,6 +2173,19 @@ class Station24DiffusionModel(nn.Module):
             include_auxiliary=include_auxiliary,
             forecast_condition_strength=forecast_condition_strength,
         )
+        if self.forecast_correction_head is None:
+            return diffusion_loss
+        correction_error = F.smooth_l1_loss(
+            correction,
+            batch["residual"],
+            reduction="none",
+            beta=self.forecast_correction_huber_beta,
+        )
+        valid = batch["valid_mask"].to(correction_error.dtype)
+        correction_loss = (correction_error * valid).sum() / valid.sum().clamp(
+            min=1.0
+        )
+        return diffusion_loss + self.forecast_correction_loss_weight * correction_loss
 
     def generate(
         self,
@@ -1931,8 +2193,9 @@ class Station24DiffusionModel(nn.Module):
         n_samples: int,
         forecast_guidance_scale: float = 1.0,
     ) -> torch.Tensor:
+        correction = self.predict_forecast_correction(batch)
         return self.diffusion.sample(
-            batch["forecast"],
+            batch["forecast"] + correction,
             batch["calendar"],
             batch["lead"],
             n_samples,

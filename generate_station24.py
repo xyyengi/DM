@@ -140,6 +140,10 @@ def main() -> None:
         model.parallel_spatial_adjacency_mode
     ):
         raise ValueError("checkpoint parallel adjacency mode does not match config")
+    if checkpoint.get("forecast_correction_mode", "none") != (
+        model.forecast_correction_mode
+    ):
+        raise ValueError("checkpoint forecast correction mode does not match config")
     state = checkpoint.get("ema_model_state_dict", checkpoint["model_state_dict"])
     model.load_state_dict(state, strict=True)
     model.eval()
@@ -157,7 +161,9 @@ def main() -> None:
     )
     daylight_mask, daylight_audit = build_station_daylight_mask(data_path, args.split)
     generated_standardized = []
+    generated_stochastic_standardized = []
     generated_residual = []
+    forecast_corrections = []
     raw_actual_scenarios = []
     projected_actual_scenarios = []
     actual_values = []
@@ -170,6 +176,8 @@ def main() -> None:
     )
     for batch_index, raw_batch in enumerate(loader, start=1):
         batch = move_batch(raw_batch, device)
+        with torch.no_grad():
+            correction = model.predict_forecast_correction(batch).cpu().numpy()
         chunks = []
         remaining = n_samples
         while remaining > 0:
@@ -183,16 +191,24 @@ def main() -> None:
                     ).cpu()
                 )
             remaining -= current
-        standardized = torch.cat(chunks, dim=1).numpy()  # [B,K,S,T]
+        stochastic_standardized = torch.cat(chunks, dim=1).numpy()  # [B,K,S,T]
         scale_tensor = raw_batch["residual_scale"].numpy()  # [B,S,T]
-        residual = standardized * scale_tensor[:, None, :, :]
+        stochastic_residual = (
+            stochastic_standardized * scale_tensor[:, None, :, :]
+        )
+        residual = correction[:, None, :, :] + stochastic_residual
+        standardized = residual / scale_tensor[:, None, :, :]
         forecast = raw_batch["forecast"].numpy()  # [B,S,T]
         actual = raw_batch["actual"].numpy()
         raw_scenarios = forecast[:, None, :, :] + residual
         projected = np.clip(raw_scenarios, 0.0, 1.0)
 
         generated_standardized.append(standardized.transpose(0, 1, 3, 2))
+        generated_stochastic_standardized.append(
+            stochastic_standardized.transpose(0, 1, 3, 2)
+        )
         generated_residual.append(residual.transpose(0, 1, 3, 2))
+        forecast_corrections.append(correction.transpose(0, 2, 1))
         raw_actual_scenarios.append(raw_scenarios.transpose(0, 1, 3, 2))
         projected_actual_scenarios.append(projected.transpose(0, 1, 3, 2))
         actual_values.append(actual.transpose(0, 2, 1))
@@ -200,7 +216,11 @@ def main() -> None:
         print(f"generated issue batch {batch_index}/{len(loader)}")
 
     standardized_array = np.concatenate(generated_standardized, axis=0)
+    stochastic_standardized_array = np.concatenate(
+        generated_stochastic_standardized, axis=0
+    )
     residual_array = np.concatenate(generated_residual, axis=0)
+    correction_array = np.concatenate(forecast_corrections, axis=0)
     raw_array = np.concatenate(raw_actual_scenarios, axis=0)
     projected_array = np.concatenate(projected_actual_scenarios, axis=0)
     actual_array = np.concatenate(actual_values, axis=0)
@@ -212,7 +232,16 @@ def main() -> None:
     ).astype(np.float32, copy=False)
 
     np.save(output_dir / "generated_residual_standardized.npy", standardized_array)
+    np.save(
+        output_dir / "generated_stochastic_residual_standardized.npy",
+        stochastic_standardized_array,
+    )
     np.save(output_dir / "generated_residual_normalized.npy", residual_array)
+    np.save(output_dir / "forecast_correction_normalized.npy", correction_array)
+    np.save(
+        output_dir / "corrected_forecast_center_normalized.npy",
+        forecast_array + correction_array,
+    )
     np.save(output_dir / "actual_scenarios_raw_normalized.npy", raw_array)
     np.save(output_dir / "actual_scenarios_normalized.npy", projected_array)
     np.save(output_dir / "actual_data_normalized.npy", actual_array)
@@ -252,6 +281,12 @@ def main() -> None:
         "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": int(checkpoint["epoch"]),
         "checkpoint_validation_mse": float(checkpoint["val_loss"]),
+        "checkpoint_validation_objective": float(checkpoint["val_loss"]),
+        "checkpoint_validation_objective_type": (
+            "diffusion_epsilon_plus_forecast_correction_huber"
+            if model.forecast_correction_mode != "none"
+            else "diffusion_epsilon_mse"
+        ),
         "architecture": model.architecture,
         "spatial_mode": model.spatial_mode,
         "spatial_mix_levels": list(model.spatial_mix_levels),
@@ -277,6 +312,19 @@ def main() -> None:
             "forecast_condition_dropout_statistics"
         ),
         "forecast_guidance_scale": forecast_guidance_scale,
+        "forecast_correction_mode": model.forecast_correction_mode,
+        "forecast_correction_loss_weight": float(
+            model.forecast_correction_loss_weight
+        ),
+        "forecast_correction_huber_beta": float(
+            model.forecast_correction_huber_beta
+        ),
+        "forecast_correction_mean_abs_normalized": float(
+            np.mean(np.abs(correction_array))
+        ),
+        "forecast_correction_max_abs_normalized": float(
+            np.max(np.abs(correction_array))
+        ),
         "state_gate_values": model.state_gate_values,
         "wind_common_gate_value": model.wind_common_gate_value,
         "event_weighting_file": (
