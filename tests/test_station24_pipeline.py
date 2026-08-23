@@ -294,6 +294,66 @@ class Station24ModelTests(unittest.TestCase):
             )
         )
 
+    def test_event_replay_x0_loss_is_parameter_free_finite_and_train_only(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        capacities = torch.linspace(10.0, 100.0, 24)
+        baseline_config = self.config("fixed_graph")
+        candidate_config = copy.deepcopy(baseline_config)
+        candidate_config.update(
+            {
+                "event_x0_magnitude_loss_weight": 0.05,
+                "event_x0_timing_loss_weight": 0.005,
+                "event_x0_sync_loss_weight": 0.025,
+                "event_x0_window_hours": 6,
+                "event_x0_error_scale": 0.10,
+                "event_x0_timing_temperature": 0.05,
+            }
+        )
+        baseline = Station24DiffusionModel(
+            baseline_config, features, adjacency, capacities
+        )
+        candidate = Station24DiffusionModel(
+            candidate_config, features, adjacency, capacities
+        )
+        candidate.load_state_dict(baseline.state_dict())
+        self.assertEqual(
+            sum(parameter.numel() for parameter in baseline.parameters()),
+            sum(parameter.numel() for parameter in candidate.parameters()),
+        )
+
+        batch = self.batch()
+        batch["residual_scale"] = torch.full_like(
+            batch["residual_target"], 0.2
+        )
+        batch["event_active"] = torch.tensor([1.0, 0.0])
+        batch["event_start"] = torch.tensor([5, 0])
+        batch["event_window_mask"] = torch.zeros(2, 16)
+        batch["event_window_mask"][0, 5:11] = 1.0
+        batch["event_sync_station_weight"] = torch.zeros(2, 24)
+        batch["event_sync_station_weight"][0, :4] = 1.0
+        timestep = torch.zeros(2, dtype=torch.long)
+        noise = torch.randn_like(batch["residual_target"])
+        baseline_loss = baseline(batch, timestep=timestep, noise=noise)
+        candidate_loss = candidate(batch, timestep=timestep, noise=noise)
+        epsilon_only = candidate(
+            batch,
+            timestep=timestep,
+            noise=noise,
+            include_auxiliary=False,
+        )
+        self.assertTrue(torch.isfinite(candidate_loss))
+        self.assertTrue(torch.allclose(epsilon_only, baseline_loss, atol=1e-7))
+        self.assertGreater(float(candidate_loss.detach()), float(baseline_loss.detach()))
+        candidate_loss.backward()
+        self.assertTrue(
+            all(
+                parameter.grad is None or torch.isfinite(parameter.grad).all()
+                for parameter in candidate.parameters()
+            )
+        )
+
     def test_common_wind_head_and_event_loss_are_lightweight_and_trainable(self):
         from src.models.station_conditioned_diffusion import Station24DiffusionModel
 
@@ -366,6 +426,7 @@ class Station24ModelTests(unittest.TestCase):
                 sum(parameter.numel() for parameter in model.parameters()),
                 None,
                 event_weighting,
+                None,
                 {},
             )
             saved = torch.load(
@@ -875,6 +936,60 @@ class Station24DatasetTests(unittest.TestCase):
             self.assertAlmostEqual(float(train_item["loss_weight"].mean()), 1.0, places=5)
             self.assertTrue(torch.equal(val_item["loss_weight"], torch.ones_like(val_item["loss_weight"])))
             self.assertTrue(torch.equal(val_item["event_time_weight"], torch.ones_like(val_item["event_time_weight"])))
+
+    def test_independent_event_replay_is_deduplicated_and_train_only(self):
+        from station_dataset import (
+            StationForecastDataset,
+            fit_station_event_replay,
+            fit_station_residual_scale,
+            get_station_dataloader,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_data(root)
+            scale = fit_station_residual_scale(root)
+            specification = fit_station_event_replay(
+                root,
+                {
+                    "event_replay_window_hours": 6,
+                    "event_replay_merge_gap_hours": 24,
+                    "event_replay_quantiles": [0.50, 0.75],
+                    "event_replay_weights": [2.0, 4.0],
+                },
+            )
+            self.assertEqual(specification["fit_split"], "train")
+            self.assertFalse(specification["future_actual_used_as_condition"])
+            self.assertFalse(specification["ordinary_epsilon_loss_reweighted"])
+            self.assertEqual(
+                specification["representative_issue_count"],
+                specification["independent_event_count"],
+            )
+            self.assertLessEqual(
+                specification["representative_issue_count"],
+                specification["overlapping_issue_count"],
+            )
+            train_dataset = StationForecastDataset(
+                root, "train", scale, event_replay=specification
+            )
+            val_dataset = StationForecastDataset(
+                root, "val", scale, event_replay=specification
+            )
+            self.assertGreater(
+                sum(float(train_dataset[i]["event_active"]) for i in range(2)),
+                0.0,
+            )
+            self.assertEqual(float(val_dataset[0]["event_active"]), 0.0)
+            self.assertFalse(val_dataset.condition_audit["event_replay_applied"])
+            loader, _ = get_station_dataloader(
+                root,
+                "train",
+                scale,
+                batch_size=1,
+                seed=2027,
+                event_replay=specification,
+            )
+            self.assertEqual(loader.sampler.num_samples, 2)
 
     def test_forecast_mismatch_weighting_targets_event_and_context(self):
         from station_dataset import build_station_event_loss_weights

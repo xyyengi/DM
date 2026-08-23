@@ -10,7 +10,7 @@ from typing import Mapping
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from src.eval.physical_projection import _solar_elevation_degrees
 
@@ -708,6 +708,240 @@ def validate_station_event_weighting(
     return specification
 
 
+def fit_station_event_replay(
+    data_dir: str | Path,
+    condition_config: Mapping[str, object],
+) -> dict[str, object]:
+    """Build train-only, issue-deduplicated wind event replay targets.
+
+    A 168-hour rolling issuance can expose the same physical wind event in
+    several training samples.  This routine first identifies each issue's
+    worst valid six-hour aggregate forecast over-estimate, then merges event
+    timestamps less than ``merge_gap_hours`` apart.  Only the most severe
+    issue in each merged group receives replay weight and x0 event targets.
+    """
+
+    data_dir = validate_station_data_dir(data_dir)
+    config = dict(condition_config)
+    forecast = np.asarray(
+        np.load(data_dir / "train_forecast.npy", mmap_mode="r"),
+        dtype=np.float64,
+    )
+    actual = np.asarray(
+        np.load(data_dir / "train_actual.npy", mmap_mode="r"),
+        dtype=np.float64,
+    )
+    residual = np.asarray(
+        np.load(data_dir / "train_residual.npy", mmap_mode="r"),
+        dtype=np.float64,
+    )
+    valid = np.asarray(
+        np.load(data_dir / "train_fill_mask.npy", mmap_mode="r")
+    ) == 0
+    issues = pd.read_csv(data_dir / "train_issue_dates.csv")
+    stations = pd.read_csv(data_dir / "station_order.csv").sort_values(
+        "channel_index"
+    ).reset_index(drop=True)
+    if len(issues) != len(forecast):
+        raise ValueError("train issue dates do not match train arrays")
+    if np.max(np.abs(residual - (actual - forecast))) > 1e-6:
+        raise ValueError("event replay requires residual=actual-forecast")
+
+    window = int(config.get("event_replay_window_hours", 6))
+    merge_gap = int(config.get("event_replay_merge_gap_hours", 24))
+    quantiles = tuple(
+        float(value)
+        for value in config.get("event_replay_quantiles", [0.80, 0.90])
+    )
+    replay_weights = tuple(
+        float(value)
+        for value in config.get("event_replay_weights", [2.0, 4.0])
+    )
+    if not 1 <= window <= 24:
+        raise ValueError("event_replay_window_hours must be in [1,24]")
+    if not 0 <= merge_gap <= EXPECTED_HOURS:
+        raise ValueError("event_replay_merge_gap_hours must be in [0,168]")
+    if len(quantiles) != 2 or not 0 < quantiles[0] < quantiles[1] < 1:
+        raise ValueError("event_replay_quantiles must contain two values in (0,1)")
+    if (
+        len(replay_weights) != 2
+        or replay_weights[0] < 1.0
+        or replay_weights[1] < replay_weights[0]
+        or replay_weights[1] > 5.0
+    ):
+        raise ValueError("event_replay_weights must be increasing within [1,5]")
+
+    wind_indices = stations.index[stations.data_type.eq("wind")].to_numpy(int)
+    capacities = stations.capacity_mw.to_numpy(dtype=np.float64)
+    wind_capacity = capacities[wind_indices]
+    wind_weight = wind_capacity / wind_capacity.sum()
+    aggregate_residual = np.einsum(
+        "nts,s->nt", residual[:, :, wind_indices], wind_weight
+    )
+    complete = valid[:, :, wind_indices].all(axis=-1)
+
+    severity = np.full(len(forecast), np.nan, dtype=np.float64)
+    event_start = np.zeros(len(forecast), dtype=np.int64)
+    for sample_index in range(len(forecast)):
+        mismatch = -aggregate_residual[sample_index]
+        rolling = np.convolve(mismatch, np.ones(window) / window, mode="valid")
+        rolling_valid = (
+            np.convolve(
+                complete[sample_index].astype(np.int64),
+                np.ones(window, dtype=np.int64),
+                mode="valid",
+            )
+            == window
+        )
+        rolling = np.where(rolling_valid, rolling, np.nan)
+        if np.any(np.isfinite(rolling)):
+            start = int(np.nanargmax(rolling))
+            event_start[sample_index] = start
+            severity[sample_index] = float(rolling[start])
+
+    finite = severity[np.isfinite(severity)]
+    if finite.size != len(forecast):
+        raise ValueError("every train issue must contain a valid wind event window")
+    thresholds = np.quantile(finite, quantiles)
+    target_start_column = "target_start" if "target_start" in issues else "issue_date"
+    target_starts = pd.to_datetime(issues[target_start_column])
+    event_timestamps = target_starts + pd.to_timedelta(event_start, unit="h")
+
+    selected = np.flatnonzero(severity >= thresholds[0])
+    selected = selected[np.argsort(event_timestamps.iloc[selected].to_numpy())]
+    groups: list[list[int]] = []
+    current: list[int] = []
+    previous: pd.Timestamp | None = None
+    for sample_index in selected:
+        timestamp = pd.Timestamp(event_timestamps.iloc[int(sample_index)])
+        if previous is None or timestamp - previous > pd.Timedelta(hours=merge_gap):
+            if current:
+                groups.append(current)
+            current = [int(sample_index)]
+        else:
+            current.append(int(sample_index))
+        previous = timestamp
+    if current:
+        groups.append(current)
+
+    sample_count = len(forecast)
+    active = np.zeros(sample_count, dtype=np.float32)
+    starts = np.zeros(sample_count, dtype=np.int64)
+    tiers = np.zeros(sample_count, dtype=np.int64)
+    sample_weights = np.ones(sample_count, dtype=np.float64)
+    sync_weights = np.zeros((sample_count, EXPECTED_STATIONS), dtype=np.float32)
+    station_tail_threshold = np.full(EXPECTED_STATIONS, np.nan, dtype=np.float64)
+    for station_index in wind_indices:
+        station_values = residual[:, :, station_index][valid[:, :, station_index]]
+        station_tail_threshold[station_index] = float(
+            np.quantile(station_values, 0.10)
+        )
+
+    catalog: list[dict[str, object]] = []
+    for event_number, members in enumerate(groups, start=1):
+        representative = max(members, key=lambda value: severity[value])
+        tier_index = int(severity[representative] >= thresholds[1])
+        tier = int(round(quantiles[tier_index] * 100))
+        start = int(event_start[representative])
+        stop = start + window
+        station_mean = residual[representative, start:stop][
+            :, wind_indices
+        ].mean(axis=0)
+        synchronous = station_mean <= station_tail_threshold[wind_indices]
+        if not np.any(synchronous):
+            synchronous[int(np.argmin(station_mean))] = True
+        active[representative] = 1.0
+        starts[representative] = start
+        tiers[representative] = tier
+        sample_weights[representative] = replay_weights[tier_index]
+        sync_weights[representative, wind_indices] = synchronous.astype(np.float32)
+        catalog.append(
+            {
+                "event_id": f"train_q{tier}_event_{event_number:03d}",
+                "tier": tier,
+                "threshold": float(thresholds[tier_index]),
+                "representative_sample_index": int(representative),
+                "representative_issue_date": str(issues.iloc[representative]["issue_date"]),
+                "event_timestamp": pd.Timestamp(
+                    event_timestamps.iloc[representative]
+                ).isoformat(),
+                "lead_start": start,
+                "lead_end": stop - 1,
+                "severity": float(severity[representative]),
+                "member_issue_count": int(len(members)),
+                "member_sample_indices": [int(value) for value in members],
+                "synchronous_station_count": int(np.sum(synchronous)),
+                "replay_weight": float(replay_weights[tier_index]),
+            }
+        )
+
+    total_weight = float(sample_weights.sum())
+    expected_event_draws = float(sample_weights[active > 0].sum() / total_weight * sample_count)
+    return {
+        "method": "train_independent_wind_event_replay_x0_v1",
+        "fit_split": "train",
+        "used_for": ["training_sampler", "training_x0_event_loss"],
+        "future_actual_used_as_condition": False,
+        "applied_to_validation_or_generation": False,
+        "ordinary_epsilon_loss_reweighted": False,
+        "event_definition": "maximum_valid_6h_capacity_weighted_forecast_minus_actual",
+        "event_window_hours": window,
+        "merge_gap_hours": merge_gap,
+        "quantiles": list(quantiles),
+        "severity_thresholds": [float(value) for value in thresholds],
+        "replay_weights": list(replay_weights),
+        "sample_replay_weights": [float(value) for value in sample_weights],
+        "sample_event_active": [float(value) for value in active],
+        "sample_event_start": [int(value) for value in starts],
+        "sample_event_tier": [int(value) for value in tiers],
+        "sample_sync_station_weight": sync_weights.tolist(),
+        "wind_station_indices": [int(value) for value in wind_indices],
+        "wind_capacity_weights": [float(value) for value in wind_weight],
+        "wind_station_lower_tail_q10": [
+            None if not np.isfinite(value) else float(value)
+            for value in station_tail_threshold
+        ],
+        "independent_event_count": int(len(catalog)),
+        "q90_event_count": int(sum(row["tier"] == 90 for row in catalog)),
+        "overlapping_issue_count": int(sum(len(row["member_sample_indices"]) for row in catalog)),
+        "representative_issue_count": int(active.sum()),
+        "expected_event_draws_per_epoch": expected_event_draws,
+        "catalog": catalog,
+    }
+
+
+def validate_station_event_replay(
+    specification: Mapping[str, object],
+    sample_count: int | None = None,
+) -> dict[str, object]:
+    specification = dict(specification)
+    if specification.get("method") != "train_independent_wind_event_replay_x0_v1":
+        raise ValueError("unsupported event replay method")
+    if specification.get("fit_split") != "train":
+        raise ValueError("event replay must be fitted on train")
+    if bool(specification.get("future_actual_used_as_condition", True)):
+        raise ValueError("event replay targets cannot be generation conditions")
+    if bool(specification.get("applied_to_validation_or_generation", True)):
+        raise ValueError("event replay must be disabled outside training")
+    weights = np.asarray(specification.get("sample_replay_weights"), dtype=float)
+    active = np.asarray(specification.get("sample_event_active"), dtype=float)
+    starts = np.asarray(specification.get("sample_event_start"), dtype=int)
+    sync = np.asarray(specification.get("sample_sync_station_weight"), dtype=float)
+    expected_count = int(sample_count) if sample_count is not None else len(weights)
+    if weights.shape != (expected_count,) or active.shape != (expected_count,):
+        raise ValueError("event replay sample arrays do not match train sample count")
+    if starts.shape != (expected_count,) or sync.shape != (expected_count, EXPECTED_STATIONS):
+        raise ValueError("event replay target arrays have invalid shapes")
+    if np.any(weights < 1.0) or np.any(weights > 5.0):
+        raise ValueError("event replay sample weights must stay in [1,5]")
+    window = int(specification.get("event_window_hours", 0))
+    if np.any(starts[active > 0] < 0) or np.any(
+        starts[active > 0] + window > EXPECTED_HOURS
+    ):
+        raise ValueError("event replay windows leave the 168-hour target")
+    return specification
+
+
 def _dilate_event_severity(values: np.ndarray, radius: int) -> np.ndarray:
     """Max-pool event severity over a symmetric temporal context."""
     output = np.asarray(values, dtype=np.float64).copy()
@@ -859,6 +1093,7 @@ class StationForecastDataset(Dataset):
         condition_config: Mapping[str, object] | None = None,
         state_thresholds: Mapping[str, object] | None = None,
         event_weighting: Mapping[str, object] | None = None,
+        event_replay: Mapping[str, object] | None = None,
     ) -> None:
         if split not in {"train", "val", "test"}:
             raise ValueError(f"unsupported split={split!r}")
@@ -876,6 +1111,13 @@ class StationForecastDataset(Dataset):
         self.event_weighting = (
             validate_station_event_weighting(event_weighting)
             if event_weighting is not None
+            else None
+        )
+        # The train-fitted object may be passed to construct all loaders, but
+        # labels and sampler weights are never attached outside train.
+        self.event_replay = (
+            validate_station_event_replay(event_replay, len(self.forecast))
+            if event_replay is not None and split == "train"
             else None
         )
         self.use_state_encoder = bool(
@@ -944,6 +1186,14 @@ class StationForecastDataset(Dataset):
                 self.event_weighting is not None and split == "train"
             ),
             "event_weighting_uses_target_as_condition": False,
+            "event_replay_enabled": event_replay is not None,
+            "event_replay_applied": bool(event_replay is not None and split == "train"),
+            "event_replay_uses_target_as_condition": False,
+            "event_replay_independent_event_count": (
+                int(event_replay["independent_event_count"])
+                if event_replay is not None and split == "train"
+                else 0
+            ),
         }
         self._validate_shapes()
 
@@ -1053,6 +1303,26 @@ class StationForecastDataset(Dataset):
             self.event_weighting,
             self.split,
         )
+        event_active = np.float32(0.0)
+        event_start = np.int64(0)
+        event_window_mask = np.zeros(EXPECTED_HOURS, dtype=np.float32)
+        event_sync_station_weight = np.zeros(EXPECTED_STATIONS, dtype=np.float32)
+        if self.event_replay is not None:
+            event_active = np.float32(
+                self.event_replay["sample_event_active"][index]
+            )
+            event_start = np.int64(
+                self.event_replay["sample_event_start"][index]
+            )
+            if event_active > 0:
+                stop = int(event_start) + int(
+                    self.event_replay["event_window_hours"]
+                )
+                event_window_mask[int(event_start):stop] = 1.0
+                event_sync_station_weight[:] = np.asarray(
+                    self.event_replay["sample_sync_station_weight"][index],
+                    dtype=np.float32,
+                )
         return {
             "sample_index": torch.tensor(index, dtype=torch.long),
             "forecast": torch.from_numpy(forecast),
@@ -1075,6 +1345,12 @@ class StationForecastDataset(Dataset):
             "node_state": torch.from_numpy(node_state),
             "loss_weight": torch.from_numpy(loss_weight),
             "event_time_weight": torch.from_numpy(event_time_weight),
+            "event_active": torch.tensor(event_active, dtype=torch.float32),
+            "event_start": torch.tensor(event_start, dtype=torch.long),
+            "event_window_mask": torch.from_numpy(event_window_mask),
+            "event_sync_station_weight": torch.from_numpy(
+                event_sync_station_weight
+            ),
         }
 
 
@@ -1160,6 +1436,7 @@ def get_station_dataloader(
     condition_config: Mapping[str, object] | None = None,
     state_thresholds: Mapping[str, object] | None = None,
     event_weighting: Mapping[str, object] | None = None,
+    event_replay: Mapping[str, object] | None = None,
 ) -> tuple[DataLoader, StationForecastDataset]:
     dataset = StationForecastDataset(
         data_dir,
@@ -1168,14 +1445,25 @@ def get_station_dataloader(
         condition_config=condition_config,
         state_thresholds=state_thresholds,
         event_weighting=event_weighting,
+        event_replay=event_replay,
     )
     generator = torch.Generator()
     split_offset = {"train": 0, "val": 10_000, "test": 20_000}[split]
     generator.manual_seed(int(seed) + split_offset)
+    sampler = None
+    if split == "train" and event_replay is not None:
+        replay = validate_station_event_replay(event_replay, len(dataset))
+        sampler = WeightedRandomSampler(
+            torch.as_tensor(replay["sample_replay_weights"], dtype=torch.double),
+            num_samples=len(dataset),
+            replacement=True,
+            generator=generator,
+        )
     loader = DataLoader(
         dataset,
         batch_size=int(batch_size),
-        shuffle=split == "train",
+        shuffle=split == "train" and sampler is None,
+        sampler=sampler,
         num_workers=int(num_workers),
         pin_memory=torch.cuda.is_available(),
         generator=generator,
@@ -1201,6 +1489,15 @@ def write_station_state_thresholds(
 
 
 def write_station_event_weighting(
+    path: str | Path, specification: Mapping[str, object]
+) -> None:
+    Path(path).write_text(
+        json.dumps(dict(specification), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def write_station_event_replay(
     path: str | Path, specification: Mapping[str, object]
 ) -> None:
     Path(path).write_text(

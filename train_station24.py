@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 from src.models.station_conditioned_diffusion import Station24DiffusionModel
 from station_graph_prior import prepare_training_graphs
 from station_dataset import (
+    fit_station_event_replay,
     fit_station_event_weighting,
     fit_station_residual_scale,
     fit_station_state_thresholds,
@@ -28,6 +29,7 @@ from station_dataset import (
     load_station_static_data,
     write_residual_scale,
     write_station_event_weighting,
+    write_station_event_replay,
     write_station_state_thresholds,
 )
 
@@ -144,6 +146,7 @@ def save_checkpoint(
     parameter_count: int,
     state_thresholds: Mapping[str, object] | None,
     event_weighting: Mapping[str, object] | None,
+    event_replay: Mapping[str, object] | None,
     graph_manifest: Mapping[str, object],
 ) -> None:
     payload = {
@@ -194,6 +197,11 @@ def save_checkpoint(
         "event_weighting": (
             copy.deepcopy(dict(event_weighting))
             if event_weighting is not None
+            else None
+        ),
+        "event_replay": (
+            copy.deepcopy(dict(event_replay))
+            if event_replay is not None
             else None
         ),
         "graph_manifest": copy.deepcopy(dict(graph_manifest)),
@@ -297,6 +305,20 @@ def main() -> None:
         write_station_event_weighting(
             run_dir / "event_weighting.json", event_weighting
         )
+    event_replay = None
+    if bool(config["model"].get("use_event_replay_x0", False)):
+        if event_weighting is not None:
+            raise ValueError(
+                "B1 event replay cannot be combined with legacy event weighting"
+            )
+        if str(config["model"].get("forecast_correction_mode", "none")) != "none":
+            raise ValueError(
+                "B1 event replay must not use the A1/A2 forecast correction head"
+            )
+        event_replay = fit_station_event_replay(data_path, config["model"])
+        write_station_event_replay(
+            run_dir / "event_replay.json", event_replay
+        )
     (run_dir / "config_used.yaml").write_text(
         yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8"
     )
@@ -311,6 +333,7 @@ def main() -> None:
         condition_config=config["model"],
         state_thresholds=state_thresholds,
         event_weighting=event_weighting,
+        event_replay=event_replay,
     )
     val_loader, val_dataset = get_station_dataloader(
         data_path,
@@ -322,6 +345,7 @@ def main() -> None:
         condition_config=config["model"],
         state_thresholds=state_thresholds,
         event_weighting=event_weighting,
+        event_replay=event_replay,
     )
     (run_dir / "condition_feature_audit.json").write_text(
         json.dumps(
@@ -341,6 +365,23 @@ def main() -> None:
         static["station_capacities"],
         secondary_adjacency,
     ).to(device)
+    configured_event_x0_weight = sum(
+        [
+            model.diffusion.event_x0_magnitude_loss_weight,
+            model.diffusion.event_x0_timing_loss_weight,
+            model.diffusion.event_x0_sync_loss_weight,
+        ]
+    )
+    if (event_replay is None) != (configured_event_x0_weight <= 0.0):
+        raise ValueError(
+            "event replay and positive event x0 loss weights must be enabled together"
+        )
+    if event_replay is not None and int(event_replay["event_window_hours"]) != int(
+        model.diffusion.event_x0_window_hours
+    ):
+        raise ValueError(
+            "event replay window and event x0 loss window must match"
+        )
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     trainable_count = sum(
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
@@ -377,6 +418,11 @@ def main() -> None:
         f"ramp_aux_weight={model.diffusion.ramp_auxiliary_loss_weight} "
         f"common_event_weight={model.diffusion.wind_common_event_loss_weight} "
         f"event_weighting_method={event_weighting.get('method') if event_weighting else None} "
+        f"event_replay_method={event_replay.get('method') if event_replay else None} "
+        f"event_replay_count={event_replay.get('independent_event_count') if event_replay else 0} "
+        f"event_x0_weights=({model.diffusion.event_x0_magnitude_loss_weight},"
+        f"{model.diffusion.event_x0_timing_loss_weight},"
+        f"{model.diffusion.event_x0_sync_loss_weight}) "
         f"common_gate={model.wind_common_gate_value} "
         f"condition_gates={model.condition_gate_values} parameters={parameter_count} "
         f"state_gates={model.state_gate_values} "
@@ -395,9 +441,12 @@ def main() -> None:
         model.train()
         total_loss = 0.0
         total_samples = 0
+        event_draws = 0
         for batch_index, raw_batch in enumerate(train_loader, start=1):
             batch = move_batch(raw_batch, device)
             batch_size = batch["forecast"].shape[0]
+            if event_replay is not None:
+                event_draws += int(batch["event_active"].sum().detach().cpu())
             with torch.cuda.amp.autocast(enabled=amp_enabled):
                 loss = model(batch)
                 scaled_loss = loss / accumulation
@@ -415,7 +464,11 @@ def main() -> None:
             total_loss += float(loss.detach()) * batch_size
             total_samples += batch_size
         train_loss = total_loss / max(total_samples, 1)
-        row: dict[str, float] = {"epoch": epoch, "train_loss": train_loss}
+        row: dict[str, float] = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "event_replay_draws": float(event_draws),
+        }
 
         should_validate = epoch == 1 or epoch % validation_every == 0 or epoch == epochs
         if should_validate:
@@ -438,11 +491,13 @@ def main() -> None:
                     parameter_count,
                     state_thresholds,
                     event_weighting,
+                    event_replay,
                     graph_manifest,
                 )
             print(
                 f"epoch={epoch:04d} train={train_loss:.7f} val={val_loss:.7f} "
                 f"best_epoch={best_epoch} spatial_gates={model.denoiser.spatial_block.gate_values()} "
+                f"event_draws={event_draws} "
                 f"condition_gates={model.condition_gate_values}"
                 f" state_gates={model.state_gate_values}"
             )
@@ -451,7 +506,10 @@ def main() -> None:
                 print(f"EARLY_STOP best_epoch={best_epoch} best_val={best_val:.7f}")
                 break
         else:
-            print(f"epoch={epoch:04d} train={train_loss:.7f}")
+            print(
+                f"epoch={epoch:04d} train={train_loss:.7f} "
+                f"event_draws={event_draws}"
+            )
         history.append(row)
 
         if epoch % save_every == 0:
@@ -469,6 +527,7 @@ def main() -> None:
                 parameter_count,
                 state_thresholds,
                 event_weighting,
+                event_replay,
                 graph_manifest,
             )
 
@@ -520,6 +579,35 @@ def main() -> None:
             str(event_weighting.get("method"))
             if event_weighting is not None
             else None
+        ),
+        "event_replay_method": (
+            str(event_replay.get("method"))
+            if event_replay is not None
+            else None
+        ),
+        "event_replay_independent_event_count": (
+            int(event_replay.get("independent_event_count", 0))
+            if event_replay is not None
+            else 0
+        ),
+        "event_replay_expected_draws_per_epoch": (
+            float(event_replay.get("expected_event_draws_per_epoch", 0.0))
+            if event_replay is not None
+            else 0.0
+        ),
+        "event_replay_observed_draws_mean": (
+            float(np.mean([row["event_replay_draws"] for row in history]))
+            if event_replay is not None and history
+            else 0.0
+        ),
+        "event_x0_magnitude_loss_weight": float(
+            model.diffusion.event_x0_magnitude_loss_weight
+        ),
+        "event_x0_timing_loss_weight": float(
+            model.diffusion.event_x0_timing_loss_weight
+        ),
+        "event_x0_sync_loss_weight": float(
+            model.diffusion.event_x0_sync_loss_weight
         ),
         "parameter_count": parameter_count,
         "best_epoch": best_epoch,

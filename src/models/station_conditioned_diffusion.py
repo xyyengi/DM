@@ -1640,6 +1640,12 @@ class StationGaussianDiffusion(nn.Module):
         ramp_auxiliary_lag_weights: tuple[float, ...] = (0.5, 0.3, 0.2),
         wind_common_event_loss_weight: float = 0.0,
         wind_common_event_level_fraction: float = 0.5,
+        event_x0_magnitude_loss_weight: float = 0.0,
+        event_x0_timing_loss_weight: float = 0.0,
+        event_x0_sync_loss_weight: float = 0.0,
+        event_x0_window_hours: int = 6,
+        event_x0_error_scale: float = 0.10,
+        event_x0_timing_temperature: float = 0.05,
     ) -> None:
         super().__init__()
         self.denoiser = denoiser
@@ -1661,10 +1667,30 @@ class StationGaussianDiffusion(nn.Module):
         self.wind_common_event_level_fraction = float(
             wind_common_event_level_fraction
         )
+        self.event_x0_magnitude_loss_weight = float(
+            event_x0_magnitude_loss_weight
+        )
+        self.event_x0_timing_loss_weight = float(event_x0_timing_loss_weight)
+        self.event_x0_sync_loss_weight = float(event_x0_sync_loss_weight)
+        self.event_x0_window_hours = int(event_x0_window_hours)
+        self.event_x0_error_scale = float(event_x0_error_scale)
+        self.event_x0_timing_temperature = float(
+            event_x0_timing_temperature
+        )
         if self.ramp_auxiliary_loss_weight < 0:
             raise ValueError("ramp auxiliary loss weight must be non-negative")
         if self.wind_common_event_loss_weight < 0:
             raise ValueError("wind common event loss weight must be non-negative")
+        if min(
+            self.event_x0_magnitude_loss_weight,
+            self.event_x0_timing_loss_weight,
+            self.event_x0_sync_loss_weight,
+        ) < 0:
+            raise ValueError("event x0 loss weights must be non-negative")
+        if not 1 <= self.event_x0_window_hours <= 24:
+            raise ValueError("event x0 window must be in [1,24]")
+        if self.event_x0_error_scale <= 0 or self.event_x0_timing_temperature <= 0:
+            raise ValueError("event x0 scales must be positive")
         if not 0.0 <= self.wind_common_event_level_fraction <= 1.0:
             raise ValueError("wind common event level fraction must be in [0,1]")
         if (
@@ -1704,6 +1730,10 @@ class StationGaussianDiffusion(nn.Module):
         residual_scale: torch.Tensor | None = None,
         loss_weight: torch.Tensor | None = None,
         event_time_weight: torch.Tensor | None = None,
+        event_active: torch.Tensor | None = None,
+        event_start: torch.Tensor | None = None,
+        event_window_mask: torch.Tensor | None = None,
+        event_sync_station_weight: torch.Tensor | None = None,
         timestep: torch.Tensor | None = None,
         noise: torch.Tensor | None = None,
         include_auxiliary: bool = True,
@@ -1739,6 +1769,9 @@ class StationGaussianDiffusion(nn.Module):
         needs_x0 = include_auxiliary and (
             self.ramp_auxiliary_loss_weight > 0
             or self.wind_common_event_loss_weight > 0
+            or self.event_x0_magnitude_loss_weight > 0
+            or self.event_x0_timing_loss_weight > 0
+            or self.event_x0_sync_loss_weight > 0
         )
         if not needs_x0:
             return epsilon_loss
@@ -1819,10 +1852,113 @@ class StationGaussianDiffusion(nn.Module):
             fraction = self.wind_common_event_level_fraction
             common_event_loss = fraction * level_loss + (1.0 - fraction) * common_ramp
 
+        event_magnitude_loss = torch.zeros(
+            (), device=clean.device, dtype=clean.dtype
+        )
+        event_timing_loss = torch.zeros_like(event_magnitude_loss)
+        event_sync_loss = torch.zeros_like(event_magnitude_loss)
+        event_x0_enabled = (
+            self.event_x0_magnitude_loss_weight > 0
+            or self.event_x0_timing_loss_weight > 0
+            or self.event_x0_sync_loss_weight > 0
+        )
+        if event_x0_enabled:
+            batch, stations, length = clean.shape
+            if (
+                event_active is None
+                or event_start is None
+                or event_window_mask is None
+                or event_sync_station_weight is None
+            ):
+                raise ValueError("event x0 loss requires replay labels in the training batch")
+            if event_active.shape != (batch,) or event_start.shape != (batch,):
+                raise ValueError("event_active/event_start must be [B]")
+            if event_window_mask.shape != (batch, length):
+                raise ValueError("event_window_mask must be [B,L]")
+            if event_sync_station_weight.shape != (batch, stations):
+                raise ValueError("event_sync_station_weight must be [B,S]")
+            window = self.event_x0_window_hours
+            if window >= length:
+                raise ValueError("event x0 window must be shorter than sequence")
+
+            predicted_residual = predicted_clean * physical_scale
+            target_residual = clean * physical_scale
+            wind_weight = self.denoiser.wind_capacity_weight.to(clean.dtype)
+            predicted_wind = torch.einsum(
+                "s,bst->bt", wind_weight, predicted_residual
+            )
+            target_wind = torch.einsum(
+                "s,bst->bt", wind_weight, target_residual
+            )
+            wind_mask = self.denoiser.wind_station_mask.to(clean.dtype)
+            wind_valid = (
+                valid_mask * wind_mask[None, :, None]
+            ).sum(dim=1) / wind_mask.sum().clamp(min=1.0)
+            active_weight = (
+                event_active.to(clean.dtype)
+                * snr_weight[:, 0, 0]
+            )
+
+            window_mask = (
+                event_window_mask.to(clean.dtype) * wind_valid
+            )
+            window_count = window_mask.sum(dim=1).clamp(min=1.0)
+            predicted_level = (predicted_wind * window_mask).sum(dim=1) / window_count
+            target_level = (target_wind * window_mask).sum(dim=1) / window_count
+            magnitude_error = torch.abs(predicted_level - target_level) / self.event_x0_error_scale
+            event_magnitude_loss = (
+                magnitude_error * active_weight
+            ).sum() / active_weight.sum().clamp(min=1.0)
+
+            predicted_curve = -F.avg_pool1d(
+                predicted_wind[:, None, :], kernel_size=window, stride=1
+            )[:, 0]
+            rolling_valid = F.avg_pool1d(
+                wind_valid[:, None, :], kernel_size=window, stride=1
+            )[:, 0]
+            timing_logits = (
+                predicted_curve / self.event_x0_timing_temperature
+            ).clamp(min=-30.0, max=30.0)
+            timing_logits = timing_logits.masked_fill(rolling_valid < 0.999, -1.0e4)
+            target_start = event_start.long().clamp(
+                min=0, max=timing_logits.shape[1] - 1
+            )
+            timing_error = F.cross_entropy(
+                timing_logits, target_start, reduction="none"
+            )
+            event_timing_loss = (
+                timing_error * active_weight
+            ).sum() / active_weight.sum().clamp(min=1.0)
+
+            station_window_mask = (
+                valid_mask * event_window_mask[:, None, :].to(clean.dtype)
+            )
+            station_window_count = station_window_mask.sum(dim=2).clamp(min=1.0)
+            predicted_station_level = (
+                predicted_residual * station_window_mask
+            ).sum(dim=2) / station_window_count
+            target_station_level = (
+                target_residual * station_window_mask
+            ).sum(dim=2) / station_window_count
+            sync_weight = (
+                event_sync_station_weight.to(clean.dtype)
+                * wind_mask[None]
+                * active_weight[:, None]
+            )
+            sync_error = torch.abs(
+                predicted_station_level - target_station_level
+            ) / self.event_x0_error_scale
+            event_sync_loss = (
+                sync_error * sync_weight
+            ).sum() / sync_weight.sum().clamp(min=1.0)
+
         return (
             epsilon_loss
             + self.ramp_auxiliary_loss_weight * ramp_loss
             + self.wind_common_event_loss_weight * common_event_loss
+            + self.event_x0_magnitude_loss_weight * event_magnitude_loss
+            + self.event_x0_timing_loss_weight * event_timing_loss
+            + self.event_x0_sync_loss_weight * event_sync_loss
         )
 
     def reverse_variance(self, timestep: torch.Tensor) -> torch.Tensor:
@@ -2029,6 +2165,24 @@ class Station24DiffusionModel(nn.Module):
             wind_common_event_level_fraction=float(
                 self.config.get("wind_common_event_level_fraction", 0.5)
             ),
+            event_x0_magnitude_loss_weight=float(
+                self.config.get("event_x0_magnitude_loss_weight", 0.0)
+            ),
+            event_x0_timing_loss_weight=float(
+                self.config.get("event_x0_timing_loss_weight", 0.0)
+            ),
+            event_x0_sync_loss_weight=float(
+                self.config.get("event_x0_sync_loss_weight", 0.0)
+            ),
+            event_x0_window_hours=int(
+                self.config.get("event_x0_window_hours", 6)
+            ),
+            event_x0_error_scale=float(
+                self.config.get("event_x0_error_scale", 0.10)
+            ),
+            event_x0_timing_temperature=float(
+                self.config.get("event_x0_timing_temperature", 0.05)
+            ),
         )
 
     @property
@@ -2168,6 +2322,12 @@ class Station24DiffusionModel(nn.Module):
             residual_scale=batch.get("residual_scale"),
             loss_weight=batch.get("loss_weight"),
             event_time_weight=batch.get("event_time_weight"),
+            event_active=batch.get("event_active"),
+            event_start=batch.get("event_start"),
+            event_window_mask=batch.get("event_window_mask"),
+            event_sync_station_weight=batch.get(
+                "event_sync_station_weight"
+            ),
             timestep=timestep,
             noise=noise,
             include_auxiliary=include_auxiliary,

@@ -158,6 +158,7 @@ def main() -> None:
         condition_config=config["model"],
         state_thresholds=checkpoint.get("state_thresholds"),
         event_weighting=checkpoint.get("event_weighting"),
+        event_replay=checkpoint.get("event_replay"),
     )
     daylight_mask, daylight_audit = build_station_daylight_mask(data_path, args.split)
     generated_standardized = []
@@ -336,6 +337,17 @@ def main() -> None:
         "event_weighting_method": (
             str(checkpoint["event_weighting"].get("method"))
             if checkpoint.get("event_weighting") is not None
+            else None
+        ),
+        "event_replay_file": (
+            str(run_dir / "event_replay.json")
+            if (run_dir / "event_replay.json").is_file()
+            else None
+        ),
+        "event_replay_applied_during_generation": False,
+        "event_replay_method": (
+            str(checkpoint["event_replay"].get("method"))
+            if checkpoint.get("event_replay") is not None
             else None
         ),
         "state_thresholds_file": (
