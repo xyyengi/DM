@@ -13,6 +13,7 @@ from typing import Mapping
 import matplotlib
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 
 matplotlib.use("Agg")
@@ -45,6 +46,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--secondary-adjacency", default=None)
+    parser.add_argument(
+        "--initialize-checkpoint",
+        default=None,
+        help="Initialize a parameter-isolated expert from an existing checkpoint",
+    )
     parser.add_argument("--allow-cpu", action="store_true")
     return parser.parse_args()
 
@@ -82,9 +88,14 @@ def update_ema(
     ema_state: dict[str, torch.Tensor],
     model: torch.nn.Module,
     decay: float,
+    trainable_state_names: set[str] | None = None,
 ) -> None:
     for name, value in model.state_dict().items():
-        if value.is_floating_point():
+        if trainable_state_names is not None and name not in trainable_state_names:
+            # Preserve a frozen source model bit-for-bit. Repeated EMA arithmetic
+            # on an unchanged tensor can otherwise accumulate round-off drift.
+            ema_state[name].copy_(value.detach())
+        elif value.is_floating_point():
             ema_state[name].mul_(decay).add_(value.detach(), alpha=1.0 - decay)
         else:
             ema_state[name].copy_(value.detach())
@@ -95,17 +106,64 @@ def state_to_cpu(state: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
 
 
 @torch.no_grad()
+def build_body_tail_validation_events(
+    batch: Mapping[str, torch.Tensor],
+    model: Station24DiffusionModel,
+    event_replay: Mapping[str, object],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Label validation events with train-fitted thresholds for model selection.
+
+    These labels are used only to choose a checkpoint. They are never passed to
+    generation or to the causal risk gate as inputs.
+    """
+
+    window = int(event_replay["event_window_hours"])
+    threshold = float(event_replay["severity_thresholds"][0])
+    forecast = batch["forecast"]
+    actual = batch["actual"]
+    valid = batch["valid_mask"]
+    wind_weight = model.denoiser.wind_capacity_weight.to(forecast.dtype)
+    wind_mask = model.denoiser.wind_station_mask.bool()
+    mismatch = torch.einsum(
+        "s,bst->bt", wind_weight, forecast - actual
+    )
+    complete = valid[:, wind_mask].amin(dim=1)
+    rolling = F.avg_pool1d(
+        mismatch[:, None, :], kernel_size=window, stride=1
+    )[:, 0]
+    rolling_valid = F.avg_pool1d(
+        complete[:, None, :].to(forecast.dtype),
+        kernel_size=window,
+        stride=1,
+    )[:, 0] >= 1.0 - 1.0e-6
+    rolling = rolling.masked_fill(~rolling_valid, float("-inf"))
+    severity, start = rolling.max(dim=1)
+    if torch.any(~torch.isfinite(severity)):
+        raise ValueError("validation issue has no complete wind event window")
+    active = (severity >= threshold).to(forecast.dtype)
+    event_window = torch.zeros_like(mismatch)
+    offsets = torch.arange(window, device=forecast.device)[None, :]
+    indices = start[:, None] + offsets
+    event_window.scatter_(1, indices, active[:, None].expand(-1, window))
+    return active, event_window, severity
+
+
+@torch.no_grad()
 def validate(
     model: Station24DiffusionModel,
     loader,
     device: torch.device,
     seed: int,
-) -> float:
+    event_replay: Mapping[str, object] | None = None,
+) -> tuple[float, dict[str, float]]:
     model.eval()
     generator = torch.Generator(device=device)
     generator.manual_seed(int(seed))
     total_loss = 0.0
-    total_samples = 0
+    total_weight = 0.0
+    gate_error_sum = 0.0
+    gate_samples = 0
+    tail_event_count = 0
     for raw_batch in loader:
         batch = move_batch(raw_batch, device)
         batch_size = batch["forecast"].shape[0]
@@ -122,15 +180,57 @@ def validate(
             device=device,
             dtype=batch["residual_target"].dtype,
         )
-        loss = model(
-            batch,
-            timestep=timestep,
-            noise=noise,
-            include_auxiliary=False,
-        )
-        total_loss += float(loss) * batch_size
-        total_samples += batch_size
-    return total_loss / max(total_samples, 1)
+        if model.use_body_tail_experts:
+            if event_replay is None:
+                raise ValueError("body-tail validation requires train event thresholds")
+            active, event_window, _ = build_body_tail_validation_events(
+                batch, model, event_replay
+            )
+            batch["event_active"] = active
+            batch["event_window_mask"] = event_window
+            support = model.body_tail_epsilon_weight(batch) * batch[
+                "valid_mask"
+            ].to(active.dtype)
+            support_count = float(support.sum())
+            loss = model(
+                batch,
+                timestep=timestep,
+                noise=noise,
+                include_auxiliary=False,
+                body_tail_event_masking=True,
+            )
+            total_loss += float(loss) * support_count
+            total_weight += support_count
+            target = active
+            logits = model.tail_risk_logits(batch)
+            gate_error_sum += float(
+                F.binary_cross_entropy_with_logits(
+                    logits, target, reduction="sum"
+                )
+            )
+            gate_samples += batch_size
+            tail_event_count += int(active.sum())
+        else:
+            loss = model(
+                batch,
+                timestep=timestep,
+                noise=noise,
+                include_auxiliary=False,
+            )
+            total_loss += float(loss) * batch_size
+            total_weight += batch_size
+    if model.use_body_tail_experts:
+        if total_weight <= 0.0 or tail_event_count <= 0:
+            raise ValueError("validation split contains no train-threshold tail event")
+        tail_epsilon = total_loss / total_weight
+        gate_bce = gate_error_sum / max(gate_samples, 1)
+        objective = tail_epsilon + model.tail_gate_loss_weight * gate_bce
+        return objective, {
+            "val_tail_epsilon_loss": tail_epsilon,
+            "val_tail_gate_bce": gate_bce,
+            "val_tail_event_count": float(tail_event_count),
+        }
+    return total_loss / max(total_weight, 1.0), {}
 
 
 def save_checkpoint(
@@ -189,6 +289,12 @@ def save_checkpoint(
         ),
         "state_gate_values": model.state_gate_values,
         "wind_common_gate_value": model.wind_common_gate_value,
+        "use_body_tail_experts": bool(model.use_body_tail_experts),
+        "tail_gate_loss_weight": float(model.tail_gate_loss_weight),
+        "tail_common_gate_value": model.tail_common_gate_value,
+        "body_tail_trainable_parameter_names": list(
+            model.body_tail_trainable_parameter_names
+        ),
         "state_thresholds": (
             copy.deepcopy(dict(state_thresholds))
             if state_thresholds is not None
@@ -365,6 +471,57 @@ def main() -> None:
         static["station_capacities"],
         secondary_adjacency,
     ).to(device)
+    initialization_manifest = None
+    if model.use_body_tail_experts:
+        if args.initialize_checkpoint is None:
+            raise ValueError(
+                "body-tail expert training requires --initialize-checkpoint"
+            )
+        initialization_path = Path(args.initialize_checkpoint)
+        if not initialization_path.is_file():
+            raise FileNotFoundError(
+                f"initialization checkpoint not found: {initialization_path}"
+            )
+        initialization = torch.load(
+            initialization_path, map_location="cpu", weights_only=False
+        )
+        if initialization.get("condition_variant") != "geo_history_actual_dual":
+            raise ValueError(
+                "body-tail expert must initialize from geo_history_actual_dual"
+            )
+        source_state = initialization.get(
+            "ema_model_state_dict", initialization["model_state_dict"]
+        )
+        incompatible = model.load_state_dict(source_state, strict=False)
+        expected_missing = set(model.body_tail_state_dict_keys)
+        if set(incompatible.missing_keys) != expected_missing:
+            raise ValueError(
+                "unexpected body-tail initialization gaps: "
+                f"{sorted(incompatible.missing_keys)}"
+            )
+        if incompatible.unexpected_keys:
+            raise ValueError(
+                "unexpected body-tail initialization keys: "
+                f"{sorted(incompatible.unexpected_keys)}"
+            )
+        trainable_names = model.configure_body_tail_training()
+        initialization_manifest = {
+            "method": "frozen_historical_spatial_body_plus_tail_residual_adapter",
+            "checkpoint": str(initialization_path),
+            "source_condition_variant": str(initialization["condition_variant"]),
+            "source_epoch": int(initialization["epoch"]),
+            "source_validation_mse": float(initialization["val_loss"]),
+            "body_frozen": True,
+            "trainable_parameter_names": list(trainable_names),
+        }
+        (run_dir / "body_tail_initialization.json").write_text(
+            json.dumps(initialization_manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    elif args.initialize_checkpoint is not None:
+        raise ValueError(
+            "--initialize-checkpoint is reserved for parameter-isolated experts"
+        )
     configured_event_x0_weight = sum(
         [
             model.diffusion.event_x0_magnitude_loss_weight,
@@ -382,12 +539,17 @@ def main() -> None:
         raise ValueError(
             "event replay window and event x0 loss window must match"
         )
+    if model.use_body_tail_experts and event_replay is None:
+        raise ValueError("body-tail expert training requires event replay labels")
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     trainable_count = sum(
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
     )
+    trainable_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        trainable_parameters,
         lr=float(train_config["lr"]),
         weight_decay=float(train_config["weight_decay"]),
     )
@@ -395,6 +557,11 @@ def main() -> None:
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
     ema_decay = float(train_config.get("ema_decay", 0.999))
     ema_state = create_ema(model)
+    ema_trainable_state_names = (
+        set(model.body_tail_state_dict_keys)
+        if model.use_body_tail_experts
+        else None
+    )
     accumulation = int(train_config.get("gradient_accumulation_steps", 1))
     clip_norm = float(train_config.get("gradient_clip_norm", 1.0))
     epochs = int(train_config["epochs"])
@@ -423,6 +590,9 @@ def main() -> None:
         f"event_x0_weights=({model.diffusion.event_x0_magnitude_loss_weight},"
         f"{model.diffusion.event_x0_timing_loss_weight},"
         f"{model.diffusion.event_x0_sync_loss_weight}) "
+        f"body_tail_experts={model.use_body_tail_experts} "
+        f"tail_gate_weight={model.tail_gate_loss_weight} "
+        f"tail_common_gate={model.tail_common_gate_value} "
         f"common_gate={model.wind_common_gate_value} "
         f"condition_gates={model.condition_gate_values} parameters={parameter_count} "
         f"state_gates={model.state_gate_values} "
@@ -456,11 +626,16 @@ def main() -> None:
             )
             if should_step:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+                torch.nn.utils.clip_grad_norm_(trainable_parameters, clip_norm)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-                update_ema(ema_state, model, ema_decay)
+                update_ema(
+                    ema_state,
+                    model,
+                    ema_decay,
+                    trainable_state_names=ema_trainable_state_names,
+                )
             total_loss += float(loss.detach()) * batch_size
             total_samples += batch_size
         train_loss = total_loss / max(total_samples, 1)
@@ -472,8 +647,15 @@ def main() -> None:
 
         should_validate = epoch == 1 or epoch % validation_every == 0 or epoch == epochs
         if should_validate:
-            val_loss = validate(model, val_loader, device, validation_seed)
+            val_loss, validation_details = validate(
+                model,
+                val_loader,
+                device,
+                validation_seed,
+                event_replay=event_replay,
+            )
             row["val_loss"] = val_loss
+            row.update(validation_details)
             improved = val_loss < best_val - min_delta
             if improved:
                 best_val = val_loss
@@ -562,6 +744,13 @@ def main() -> None:
             model.parallel_spatial_gate_statistics
         ),
         "state_gate_values": model.state_gate_values,
+        "use_body_tail_experts": bool(model.use_body_tail_experts),
+        "tail_gate_loss_weight": float(model.tail_gate_loss_weight),
+        "tail_common_gate_value": model.tail_common_gate_value,
+        "body_tail_initialization": initialization_manifest,
+        "body_tail_trainable_parameter_names": list(
+            model.body_tail_trainable_parameter_names
+        ),
         "residual_scaling_method": str(
             residual_scale.get("method", "per_station_std")
         ),

@@ -1408,6 +1408,15 @@ class StationConditionalResUNet1D(nn.Module):
             _group_count(self.channels[0], groups), self.channels[0]
         )
         self.output = nn.Conv1d(self.channels[0], 1, kernel_size=1)
+        self.use_body_tail_experts = bool(
+            config.get("use_body_tail_experts", False)
+        )
+        self.tail_station_adapter: nn.Module | None = None
+        self.tail_common_adapter: nn.Module | None = None
+        self.tail_common_gate: nn.Parameter | None = None
+        self.tail_risk_encoder: nn.Module | None = None
+        self.tail_risk_output: nn.Linear | None = None
+        self.tail_signal_attention: nn.Module | None = None
         self.use_wind_common_residual_head = bool(
             config.get("use_wind_common_residual_head", False)
         )
@@ -1426,6 +1435,77 @@ class StationConditionalResUNet1D(nn.Module):
             wind_capacity / wind_capacity.sum(),
             persistent=False,
         )
+        if self.use_body_tail_experts:
+            tail_channels = int(config.get("tail_expert_channels", 16))
+            gate_channels = int(config.get("tail_gate_channels", 16))
+            tail_prior = float(config.get("tail_gate_prior_probability", 0.08))
+            if tail_channels <= 0 or gate_channels <= 0:
+                raise ValueError("body-tail expert channels must be positive")
+            if not 0.0 < tail_prior < 1.0:
+                raise ValueError("tail_gate_prior_probability must be in (0,1)")
+
+            def tail_adapter() -> nn.Sequential:
+                adapter = nn.Sequential(
+                    nn.Conv1d(
+                        self.channels[0], tail_channels, kernel_size=3, padding=1
+                    ),
+                    nn.GroupNorm(_group_count(tail_channels, groups), tail_channels),
+                    nn.SiLU(),
+                    nn.Conv1d(
+                        tail_channels,
+                        tail_channels,
+                        kernel_size=3,
+                        padding=2,
+                        dilation=2,
+                    ),
+                    nn.GroupNorm(_group_count(tail_channels, groups), tail_channels),
+                    nn.SiLU(),
+                    nn.Conv1d(tail_channels, 1, kernel_size=1),
+                )
+                nn.init.zeros_(adapter[-1].weight)
+                nn.init.zeros_(adapter[-1].bias)
+                return adapter
+
+            # The station path learns local event morphology; the common path
+            # learns a synchronized wind-fleet perturbation.  Both are residual
+            # adapters on the frozen baseline denoiser, so route=0 is exactly the
+            # historical-spatial body model at initialization and after training.
+            self.tail_station_adapter = tail_adapter()
+            self.tail_common_adapter = tail_adapter()
+            self.tail_common_gate = nn.Parameter(
+                torch.tensor(float(config.get("tail_common_gate_init", -1.0)))
+            )
+
+            # Six causal-at-generation signals: issued wind forecast, downward
+            # forecast ramp, aligned forecast revision, forecast-derived low and
+            # down-ramp states, and the most recent observed forecast error.
+            self.tail_signal_attention = nn.Sequential(
+                nn.Linear(12, 12),
+                nn.SiLU(),
+                nn.Linear(12, 6),
+            )
+            nn.init.zeros_(self.tail_signal_attention[-1].weight)
+            nn.init.zeros_(self.tail_signal_attention[-1].bias)
+            self.tail_risk_encoder = nn.Sequential(
+                nn.Conv1d(6, gate_channels, kernel_size=5, padding=2),
+                nn.GroupNorm(_group_count(gate_channels, groups), gate_channels),
+                nn.SiLU(),
+                nn.Conv1d(
+                    gate_channels,
+                    gate_channels,
+                    kernel_size=5,
+                    padding=4,
+                    dilation=2,
+                ),
+                nn.GroupNorm(_group_count(gate_channels, groups), gate_channels),
+                nn.SiLU(),
+            )
+            self.tail_risk_output = nn.Linear(2 * gate_channels, 1)
+            nn.init.zeros_(self.tail_risk_output.weight)
+            nn.init.constant_(
+                self.tail_risk_output.bias,
+                math.log(tail_prior / (1.0 - tail_prior)),
+            )
         self.wind_common_head = None
         self.wind_common_gate = None
         if self.use_wind_common_residual_head:
@@ -1475,6 +1555,7 @@ class StationConditionalResUNet1D(nn.Module):
         recent_error_mask: torch.Tensor | None = None,
         node_state: torch.Tensor | None = None,
         forecast_condition_strength: torch.Tensor | float | None = None,
+        tail_expert_route: torch.Tensor | float | None = None,
     ) -> torch.Tensor:
         if noisy_residual.shape[1:] != (self.station_count, self.sequence_length):
             raise ValueError(
@@ -1615,7 +1696,135 @@ class StationConditionalResUNet1D(nn.Module):
                 * common
                 * self.wind_station_mask[None, :, None]
             )
+        if self.use_body_tail_experts:
+            if tail_expert_route is None:
+                route = torch.zeros(
+                    batch, 1, 1, device=output.device, dtype=output.dtype
+                )
+            elif isinstance(tail_expert_route, (int, float)):
+                route = torch.full(
+                    (batch, 1, 1),
+                    float(tail_expert_route),
+                    device=output.device,
+                    dtype=output.dtype,
+                )
+            else:
+                route = tail_expert_route.to(device=output.device, dtype=output.dtype)
+                if route.ndim == 1:
+                    route = route[:, None, None]
+            if route.shape != (batch, 1, 1):
+                raise ValueError("tail_expert_route must be scalar, [B], or [B,1,1]")
+            if torch.any(route < 0.0) or torch.any(route > 1.0):
+                raise ValueError("tail_expert_route must be in [0,1]")
+            if (
+                self.tail_station_adapter is None
+                or self.tail_common_adapter is None
+                or self.tail_common_gate is None
+            ):
+                raise RuntimeError("body-tail expert adapters were not initialized")
+            station_delta = self.tail_station_adapter(flattened).reshape(
+                batch, stations, length
+            )
+            pooled = torch.einsum("s,bsct->bct", self.wind_capacity_weight, hidden)
+            common_delta = self.tail_common_adapter(pooled)
+            tail_delta = station_delta + (
+                torch.sigmoid(self.tail_common_gate) * common_delta
+            )
+            tail_delta = tail_delta * self.wind_station_mask[None, :, None]
+            output = output + route * tail_delta
         return output
+
+    def tail_risk_logits(
+        self,
+        forecast: torch.Tensor,
+        forecast_revision: torch.Tensor | None = None,
+        revision_mask: torch.Tensor | None = None,
+        recent_error: torch.Tensor | None = None,
+        recent_error_mask: torch.Tensor | None = None,
+        node_state: torch.Tensor | None = None,
+        return_attention: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Predict an issuance-level tail probability from available conditions."""
+
+        if not self.use_body_tail_experts:
+            raise RuntimeError("tail risk gate is disabled")
+        if (
+            self.tail_signal_attention is None
+            or self.tail_risk_encoder is None
+            or self.tail_risk_output is None
+        ):
+            raise RuntimeError("tail risk gate was not initialized")
+        if forecast.ndim != 3 or forecast.shape[1:] != (
+            self.station_count,
+            self.sequence_length,
+        ):
+            raise ValueError("forecast must be [B,S,L] for tail routing")
+        batch, _, length = forecast.shape
+        weight = self.wind_capacity_weight.to(forecast.dtype)
+        aggregate = torch.einsum("s,bst->bt", weight, forecast)
+        ramp = torch.zeros_like(aggregate)
+        ramp[:, 3:] = (aggregate[:, :-3] - aggregate[:, 3:]).clamp(min=0.0)
+
+        revision = torch.zeros_like(aggregate)
+        if forecast_revision is not None:
+            revision_values = forecast_revision
+            if revision_mask is not None:
+                revision_values = revision_values * revision_mask
+            revision = torch.einsum("s,bst->bt", weight, revision_values)
+
+        low_state = torch.zeros_like(aggregate)
+        down_state = torch.zeros_like(aggregate)
+        if node_state is not None:
+            if node_state.shape[:2] != forecast.shape[:2] or (
+                node_state.shape[-1] != length or node_state.shape[2] < 4
+            ):
+                raise ValueError("node_state must be [B,S,F,L] with F>=4")
+            low_state = torch.einsum("s,bst->bt", weight, node_state[:, :, 0])
+            down_state = torch.einsum("s,bst->bt", weight, node_state[:, :, 3])
+
+        recent = torch.zeros(batch, device=forecast.device, dtype=forecast.dtype)
+        if recent_error is not None:
+            recent_station = recent_error.mean(dim=-1)
+            if recent_error_mask is not None:
+                recent_station = recent_station * recent_error_mask[..., 0]
+            recent = torch.einsum("s,bs->b", weight, recent_station)
+        recent = recent[:, None].expand(-1, length)
+
+        signals = torch.stack(
+            [aggregate, ramp, revision, low_state, down_state, recent], dim=1
+        )
+        signal_statistics = torch.cat(
+            [
+                signals.mean(dim=-1),
+                signals.var(dim=-1, unbiased=False).add(1e-6).sqrt(),
+            ],
+            dim=1,
+        )
+        attention = torch.softmax(
+            self.tail_signal_attention(signal_statistics), dim=1
+        )
+        signals = signals * (6.0 * attention[:, :, None])
+        encoded = self.tail_risk_encoder(signals)
+        pooled = torch.cat([encoded.mean(dim=-1), encoded.amax(dim=-1)], dim=1)
+        logits = self.tail_risk_output(pooled)[:, 0]
+        if return_attention:
+            return logits, attention
+        return logits
+
+    def body_tail_parameter_names(self) -> tuple[str, ...]:
+        if not self.use_body_tail_experts:
+            return ()
+        prefixes = (
+            "tail_station_adapter.",
+            "tail_common_adapter.",
+            "tail_common_gate",
+            "tail_risk_encoder.",
+            "tail_risk_output.",
+            "tail_signal_attention.",
+        )
+        return tuple(
+            name for name, _ in self.named_parameters() if name.startswith(prefixes)
+        )
 
     def forecast_condition_dropout_statistics(self) -> dict[str, float | int]:
         total = int(self._forecast_condition_sample_count.detach().cpu())
@@ -1738,6 +1947,8 @@ class StationGaussianDiffusion(nn.Module):
         noise: torch.Tensor | None = None,
         include_auxiliary: bool = True,
         forecast_condition_strength: torch.Tensor | float | None = None,
+        tail_expert_route: torch.Tensor | float | None = None,
+        epsilon_sample_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if timestep is None:
             timestep = torch.randint(
@@ -1757,10 +1968,23 @@ class StationGaussianDiffusion(nn.Module):
             recent_error_mask=recent_error_mask,
             node_state=node_state,
             forecast_condition_strength=forecast_condition_strength,
+            tail_expert_route=tail_expert_route,
         )
         squared_error = (prediction - noise) ** 2
         valid_mask = valid_mask.to(squared_error.dtype)
         effective_mask = valid_mask
+        if epsilon_sample_weight is not None:
+            if epsilon_sample_weight.shape == (clean.shape[0],):
+                epsilon_weight = epsilon_sample_weight[:, None, None]
+            elif epsilon_sample_weight.shape == clean.shape:
+                epsilon_weight = epsilon_sample_weight
+            else:
+                raise ValueError(
+                    "epsilon_sample_weight must be [B] or match [B,S,L]"
+                )
+            effective_mask = effective_mask * epsilon_weight.to(
+                squared_error.dtype
+            )
         if include_auxiliary and loss_weight is not None:
             if loss_weight.shape != clean.shape:
                 raise ValueError("loss_weight must match residual target [B,S,L]")
@@ -1985,6 +2209,7 @@ class StationGaussianDiffusion(nn.Module):
         recent_error_mask: torch.Tensor | None = None,
         node_state: torch.Tensor | None = None,
         forecast_guidance_scale: float = 1.0,
+        tail_expert_route: torch.Tensor | float | None = None,
     ) -> torch.Tensor:
         forecast_guidance_scale = float(forecast_guidance_scale)
         if not 0.0 <= forecast_guidance_scale <= 1.0:
@@ -2004,6 +2229,7 @@ class StationGaussianDiffusion(nn.Module):
             calendar,
             lead,
             forecast_condition_strength=1.0,
+            tail_expert_route=tail_expert_route,
             **denoiser_kwargs,
         )
         if forecast_guidance_scale == 1.0:
@@ -2016,6 +2242,7 @@ class StationGaussianDiffusion(nn.Module):
                 calendar,
                 lead,
                 forecast_condition_strength=0.0,
+                tail_expert_route=tail_expert_route,
                 **denoiser_kwargs,
             )
             predicted_noise = predicted_neutral + forecast_guidance_scale * (
@@ -2044,6 +2271,7 @@ class StationGaussianDiffusion(nn.Module):
         recent_error_mask: torch.Tensor | None = None,
         node_state: torch.Tensor | None = None,
         forecast_guidance_scale: float = 1.0,
+        tail_expert_route: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, stations, length = forecast.shape
         n_samples = int(n_samples)
@@ -2066,6 +2294,16 @@ class StationGaussianDiffusion(nn.Module):
             )
             for name, value in optional_conditions.items()
         }
+        if tail_expert_route is not None:
+            route = tail_expert_route.to(device=forecast.device, dtype=forecast.dtype)
+            if route.shape == (batch, n_samples):
+                route = route.reshape(batch * n_samples)
+            elif route.shape != (batch * n_samples,):
+                raise ValueError(
+                    "tail_expert_route must be [B,K] or [B*K] during sampling"
+                )
+        else:
+            route = None
         noisy = torch.randn(
             batch * n_samples,
             stations,
@@ -2083,6 +2321,7 @@ class StationGaussianDiffusion(nn.Module):
                 calendar,
                 lead,
                 forecast_guidance_scale=forecast_guidance_scale,
+                tail_expert_route=route,
                 **optional_conditions,
             )
         return noisy.reshape(batch, n_samples, stations, length)
@@ -2103,6 +2342,25 @@ class Station24DiffusionModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = dict(config)
+        self.use_body_tail_experts = bool(
+            self.config.get("use_body_tail_experts", False)
+        )
+        self.tail_epsilon_context_hours = int(
+            self.config.get("tail_epsilon_context_hours", 6)
+        )
+        if self.tail_epsilon_context_hours < 0 or self.tail_epsilon_context_hours > 24:
+            raise ValueError("tail_epsilon_context_hours must be in [0,24]")
+        self.tail_gate_loss_weight = float(
+            self.config.get("tail_gate_loss_weight", 0.0)
+        )
+        if self.use_body_tail_experts and self.tail_gate_loss_weight <= 0.0:
+            raise ValueError(
+                "tail_gate_loss_weight must be positive for body-tail experts"
+            )
+        if not self.use_body_tail_experts and self.tail_gate_loss_weight != 0.0:
+            raise ValueError(
+                "tail_gate_loss_weight must be zero when body-tail experts are disabled"
+            )
         self.forecast_correction_mode = (
             str(self.config.get("forecast_correction_mode", "direct"))
             if bool(self.config.get("use_forecast_correction", False))
@@ -2266,6 +2524,109 @@ class Station24DiffusionModel(nn.Module):
             return None
         return float(torch.sigmoid(gate.detach()).cpu())
 
+    @property
+    def body_tail_trainable_parameter_names(self) -> tuple[str, ...]:
+        return tuple(
+            f"denoiser.{name}" for name in self.denoiser.body_tail_parameter_names()
+        )
+
+    @property
+    def body_tail_state_dict_keys(self) -> tuple[str, ...]:
+        """All serialized aliases for the shared denoiser's tail parameters."""
+
+        parameter_suffixes = self.denoiser.body_tail_parameter_names()
+        prefixes = ("denoiser.", "diffusion.denoiser.")
+        return tuple(
+            f"{prefix}{suffix}"
+            for prefix in prefixes
+            for suffix in parameter_suffixes
+        )
+
+    @property
+    def tail_common_gate_value(self) -> float | None:
+        gate = self.denoiser.tail_common_gate
+        if gate is None:
+            return None
+        return float(torch.sigmoid(gate.detach()).cpu())
+
+    def configure_body_tail_training(self) -> tuple[str, ...]:
+        """Freeze the body model and leave only tail adapters/gate trainable."""
+
+        if not self.use_body_tail_experts:
+            raise RuntimeError("body-tail expert mode is disabled")
+        allowed = set(self.body_tail_trainable_parameter_names)
+        if not allowed:
+            raise RuntimeError("body-tail expert has no trainable parameters")
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad_(name in allowed)
+        actual = {name for name, value in self.named_parameters() if value.requires_grad}
+        if actual != allowed:
+            raise RuntimeError("body-tail parameter isolation failed")
+        return tuple(sorted(actual))
+
+    def tail_risk_logits(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        logits = self.denoiser.tail_risk_logits(
+            batch["forecast"],
+            forecast_revision=batch.get("forecast_revision"),
+            revision_mask=batch.get("revision_mask"),
+            recent_error=batch.get("recent_error"),
+            recent_error_mask=batch.get("recent_error_mask"),
+            node_state=batch.get("node_state"),
+        )
+        if isinstance(logits, tuple):
+            raise RuntimeError("tail risk logits unexpectedly returned attention")
+        return logits
+
+    def tail_condition_attention(
+        self, batch: Mapping[str, torch.Tensor]
+    ) -> torch.Tensor:
+        result = self.denoiser.tail_risk_logits(
+            batch["forecast"],
+            forecast_revision=batch.get("forecast_revision"),
+            revision_mask=batch.get("revision_mask"),
+            recent_error=batch.get("recent_error"),
+            recent_error_mask=batch.get("recent_error_mask"),
+            node_state=batch.get("node_state"),
+            return_attention=True,
+        )
+        if not isinstance(result, tuple):
+            raise RuntimeError("tail condition attention was not returned")
+        return result[1]
+
+    def tail_risk_probability(
+        self, batch: Mapping[str, torch.Tensor]
+    ) -> torch.Tensor:
+        return torch.sigmoid(self.tail_risk_logits(batch))
+
+    def body_tail_epsilon_weight(
+        self, batch: Mapping[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Select wind-event support for the specialized tail denoising loss."""
+
+        event_active = batch.get("event_active")
+        event_window = batch.get("event_window_mask")
+        if event_active is None or event_window is None:
+            raise ValueError(
+                "body-tail training requires event_active and event_window_mask"
+            )
+        batch_size = batch["forecast"].shape[0]
+        if event_active.shape != (batch_size,) or event_window.shape != (
+            batch_size,
+            self.denoiser.sequence_length,
+        ):
+            raise ValueError("body-tail event targets have invalid shapes")
+        support = event_window.to(batch["forecast"].dtype)[:, None, :]
+        context = self.tail_epsilon_context_hours
+        if context > 0:
+            support = F.max_pool1d(
+                support,
+                kernel_size=2 * context + 1,
+                stride=1,
+                padding=context,
+            )
+        wind = self.denoiser.wind_station_mask.to(support.dtype)[None, :, None]
+        return support * wind * event_active.to(support.dtype)[:, None, None]
+
     def predict_forecast_correction(
         self, batch: Mapping[str, torch.Tensor]
     ) -> torch.Tensor:
@@ -2291,6 +2652,7 @@ class Station24DiffusionModel(nn.Module):
         noise: torch.Tensor | None = None,
         include_auxiliary: bool = True,
         forecast_condition_strength: torch.Tensor | float | None = None,
+        body_tail_event_masking: bool = False,
     ) -> torch.Tensor:
         correction = self.predict_forecast_correction(batch)
         clean = batch["residual_target"]
@@ -2307,6 +2669,15 @@ class Station24DiffusionModel(nn.Module):
             detached = correction.detach()
             clean = clean - detached / scale
             condition_forecast = condition_forecast + detached
+        tail_route: torch.Tensor | float | None = None
+        epsilon_sample_weight: torch.Tensor | None = None
+        if self.use_body_tail_experts:
+            # Training isolates tail gradients to replayed physical events.  The
+            # fixed-noise validation pass evaluates the complete tail denoiser on
+            # natural validation data, preventing an unconstrained event adapter.
+            tail_route = 1.0
+            if include_auxiliary or body_tail_event_masking:
+                epsilon_sample_weight = self.body_tail_epsilon_weight(batch)
         diffusion_loss = self.diffusion.training_loss(
             clean,
             condition_forecast,
@@ -2332,7 +2703,28 @@ class Station24DiffusionModel(nn.Module):
             noise=noise,
             include_auxiliary=include_auxiliary,
             forecast_condition_strength=forecast_condition_strength,
+            tail_expert_route=tail_route,
+            epsilon_sample_weight=epsilon_sample_weight,
         )
+        if self.use_body_tail_experts and include_auxiliary:
+            target = batch["event_active"].to(diffusion_loss.dtype)
+            logits = self.tail_risk_logits(batch)
+            replay_weight = batch.get("event_replay_weight")
+            if replay_weight is None or replay_weight.shape != target.shape:
+                raise ValueError(
+                    "body-tail gate training requires event_replay_weight [B]"
+                )
+            # WeightedRandomSampler changes the observed class prior.  Inverse
+            # replay weighting recovers the natural issuance distribution for
+            # the causal gate instead of calibrating it to the oversampled data.
+            importance = replay_weight.to(diffusion_loss.dtype).reciprocal()
+            gate_error = F.binary_cross_entropy_with_logits(
+                logits, target, reduction="none"
+            )
+            gate_loss = (gate_error * importance).sum() / importance.sum().clamp(
+                min=1.0
+            )
+            diffusion_loss = diffusion_loss + self.tail_gate_loss_weight * gate_loss
         if self.forecast_correction_head is None:
             return diffusion_loss
         correction_error = F.smooth_l1_loss(
@@ -2352,9 +2744,20 @@ class Station24DiffusionModel(nn.Module):
         batch: Mapping[str, torch.Tensor],
         n_samples: int,
         forecast_guidance_scale: float = 1.0,
-    ) -> torch.Tensor:
+        return_expert_audit: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         correction = self.predict_forecast_correction(batch)
-        return self.diffusion.sample(
+        tail_probability = None
+        tail_route = None
+        if self.use_body_tail_experts:
+            tail_probability = self.tail_risk_probability(batch)
+            tail_attention = self.tail_condition_attention(batch)
+            tail_route = torch.bernoulli(
+                tail_probability[:, None].expand(-1, int(n_samples))
+            )
+        else:
+            tail_attention = None
+        samples = self.diffusion.sample(
             batch["forecast"] + correction,
             batch["calendar"],
             batch["lead"],
@@ -2366,4 +2769,33 @@ class Station24DiffusionModel(nn.Module):
             recent_error=batch.get("recent_error"),
             recent_error_mask=batch.get("recent_error_mask"),
             node_state=batch.get("node_state"),
+            tail_expert_route=tail_route,
         )
+        if not return_expert_audit:
+            return samples
+        batch_size = batch["forecast"].shape[0]
+        if tail_probability is None or tail_route is None:
+            tail_probability = torch.zeros(
+                batch_size,
+                device=samples.device,
+                dtype=samples.dtype,
+            )
+            tail_route = torch.zeros(
+                batch_size,
+                int(n_samples),
+                device=samples.device,
+                dtype=samples.dtype,
+            )
+            tail_attention = torch.zeros(
+                batch_size,
+                6,
+                device=samples.device,
+                dtype=samples.dtype,
+            )
+        if tail_attention is None:
+            raise RuntimeError("tail condition attention audit is unavailable")
+        return samples, {
+            "tail_probability": tail_probability,
+            "tail_route": tail_route,
+            "tail_condition_attention": tail_attention,
+        }

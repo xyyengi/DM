@@ -354,6 +354,109 @@ class Station24ModelTests(unittest.TestCase):
             )
         )
 
+    def test_body_tail_expert_preserves_body_and_isolates_tail_gradients(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        capacities = torch.linspace(10.0, 100.0, 24)
+        body_config = self.config("fixed_graph")
+        tail_config = copy.deepcopy(body_config)
+        tail_config.update(
+            {
+                "use_body_tail_experts": True,
+                "tail_expert_channels": 4,
+                "tail_epsilon_context_hours": 2,
+                "tail_gate_channels": 4,
+                "tail_gate_prior_probability": 0.08,
+                "tail_gate_loss_weight": 0.10,
+            }
+        )
+        body = Station24DiffusionModel(
+            body_config, features, adjacency, capacities
+        )
+        candidate = Station24DiffusionModel(
+            tail_config, features, adjacency, capacities
+        )
+        incompatible = candidate.load_state_dict(body.state_dict(), strict=False)
+        self.assertEqual(
+            set(incompatible.missing_keys),
+            set(candidate.body_tail_state_dict_keys),
+        )
+        self.assertFalse(incompatible.unexpected_keys)
+
+        batch = self.batch()
+        timestep = torch.tensor([0, 1])
+        noise = torch.randn_like(batch["residual_target"])
+        body.eval()
+        candidate.eval()
+        body_loss = body(
+            batch, timestep=timestep, noise=noise, include_auxiliary=False
+        )
+        tail_at_initialization = candidate(
+            batch, timestep=timestep, noise=noise, include_auxiliary=False
+        )
+        self.assertTrue(
+            torch.allclose(body_loss, tail_at_initialization, atol=1e-7)
+        )
+
+        trainable = candidate.configure_body_tail_training()
+        self.assertEqual(set(trainable), set(candidate.body_tail_trainable_parameter_names))
+        self.assertLess(
+            sum(
+                parameter.numel()
+                for parameter in candidate.parameters()
+                if parameter.requires_grad
+            ),
+            sum(parameter.numel() for parameter in candidate.parameters()) * 0.15,
+        )
+        batch["event_active"] = torch.tensor([1.0, 0.0])
+        batch["event_replay_weight"] = torch.tensor([4.0, 1.0])
+        batch["event_window_mask"] = torch.zeros(2, 16)
+        batch["event_window_mask"][0, 5:11] = 1.0
+        epsilon_support = candidate.body_tail_epsilon_weight(batch)
+        self.assertEqual(tuple(epsilon_support.shape), (2, 24, 16))
+        self.assertTrue(torch.all(epsilon_support[0, :13, 3:13] == 1.0))
+        self.assertEqual(float(epsilon_support[0, 13:].sum()), 0.0)
+        self.assertEqual(float(epsilon_support[1].sum()), 0.0)
+        candidate.train()
+        loss = candidate(batch, timestep=timestep, noise=noise)
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        tail_names = set(candidate.body_tail_trainable_parameter_names)
+        self.assertTrue(
+            any(
+                parameter.grad is not None and torch.any(parameter.grad != 0)
+                for name, parameter in candidate.named_parameters()
+                if name in tail_names
+            )
+        )
+        self.assertTrue(
+            all(
+                parameter.grad is None
+                for name, parameter in candidate.named_parameters()
+                if name not in tail_names
+            )
+        )
+
+        candidate.eval()
+        probability = candidate.tail_risk_probability(batch)
+        self.assertEqual(tuple(probability.shape), (2,))
+        self.assertTrue(torch.all((probability > 0) & (probability < 1)))
+        samples, audit = candidate.generate(
+            self.batch(batch_size=1), n_samples=5, return_expert_audit=True
+        )
+        self.assertEqual(tuple(samples.shape), (1, 5, 24, 16))
+        self.assertEqual(tuple(audit["tail_route"].shape), (1, 5))
+        self.assertEqual(tuple(audit["tail_probability"].shape), (1,))
+        self.assertEqual(tuple(audit["tail_condition_attention"].shape), (1, 6))
+        self.assertTrue(
+            torch.allclose(
+                audit["tail_condition_attention"].sum(dim=1),
+                torch.ones(1),
+                atol=1e-6,
+            )
+        )
+
     def test_common_wind_head_and_event_loss_are_lightweight_and_trainable(self):
         from src.models.station_conditioned_diffusion import Station24DiffusionModel
 

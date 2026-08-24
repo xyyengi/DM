@@ -1304,10 +1304,14 @@ class StationForecastDataset(Dataset):
             self.split,
         )
         event_active = np.float32(0.0)
+        event_replay_weight = np.float32(1.0)
         event_start = np.int64(0)
         event_window_mask = np.zeros(EXPECTED_HOURS, dtype=np.float32)
         event_sync_station_weight = np.zeros(EXPECTED_STATIONS, dtype=np.float32)
         if self.event_replay is not None:
+            event_replay_weight = np.float32(
+                self.event_replay["sample_replay_weights"][index]
+            )
             event_active = np.float32(
                 self.event_replay["sample_event_active"][index]
             )
@@ -1346,6 +1350,9 @@ class StationForecastDataset(Dataset):
             "loss_weight": torch.from_numpy(loss_weight),
             "event_time_weight": torch.from_numpy(event_time_weight),
             "event_active": torch.tensor(event_active, dtype=torch.float32),
+            "event_replay_weight": torch.tensor(
+                event_replay_weight, dtype=torch.float32
+            ),
             "event_start": torch.tensor(event_start, dtype=torch.long),
             "event_window_mask": torch.from_numpy(event_window_mask),
             "event_sync_station_weight": torch.from_numpy(

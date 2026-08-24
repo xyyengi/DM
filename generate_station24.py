@@ -144,6 +144,10 @@ def main() -> None:
         model.forecast_correction_mode
     ):
         raise ValueError("checkpoint forecast correction mode does not match config")
+    if bool(checkpoint.get("use_body_tail_experts", False)) != bool(
+        model.use_body_tail_experts
+    ):
+        raise ValueError("checkpoint body-tail expert mode does not match config")
     state = checkpoint.get("ema_model_state_dict", checkpoint["model_state_dict"])
     model.load_state_dict(state, strict=True)
     model.eval()
@@ -169,6 +173,9 @@ def main() -> None:
     projected_actual_scenarios = []
     actual_values = []
     forecast_values = []
+    tail_probabilities = []
+    tail_routes = []
+    tail_condition_attentions = []
     model.reset_parallel_spatial_gate_statistics()
 
     print(
@@ -180,17 +187,32 @@ def main() -> None:
         with torch.no_grad():
             correction = model.predict_forecast_correction(batch).cpu().numpy()
         chunks = []
+        route_chunks = []
+        issue_tail_probability = None
+        issue_tail_attention = None
         remaining = n_samples
         while remaining > 0:
             current = min(member_chunk_size, remaining)
             with torch.no_grad():
-                chunks.append(
-                    model.generate(
+                generated = model.generate(
                         batch,
                         n_samples=current,
                         forecast_guidance_scale=forecast_guidance_scale,
-                    ).cpu()
-                )
+                        return_expert_audit=model.use_body_tail_experts,
+                    )
+                if model.use_body_tail_experts:
+                    samples, expert_audit = generated
+                    chunks.append(samples.cpu())
+                    route_chunks.append(expert_audit["tail_route"].cpu())
+                    if issue_tail_probability is None:
+                        issue_tail_probability = expert_audit[
+                            "tail_probability"
+                        ].cpu()
+                        issue_tail_attention = expert_audit[
+                            "tail_condition_attention"
+                        ].cpu()
+                else:
+                    chunks.append(generated.cpu())
             remaining -= current
         stochastic_standardized = torch.cat(chunks, dim=1).numpy()  # [B,K,S,T]
         scale_tensor = raw_batch["residual_scale"].numpy()  # [B,S,T]
@@ -214,6 +236,12 @@ def main() -> None:
         projected_actual_scenarios.append(projected.transpose(0, 1, 3, 2))
         actual_values.append(actual.transpose(0, 2, 1))
         forecast_values.append(forecast.transpose(0, 2, 1))
+        if model.use_body_tail_experts:
+            if issue_tail_probability is None or issue_tail_attention is None:
+                raise RuntimeError("body-tail generation lacks routing probability")
+            tail_probabilities.append(issue_tail_probability.numpy())
+            tail_routes.append(torch.cat(route_chunks, dim=1).numpy())
+            tail_condition_attentions.append(issue_tail_attention.numpy())
         print(f"generated issue batch {batch_index}/{len(loader)}")
 
     standardized_array = np.concatenate(generated_standardized, axis=0)
@@ -226,6 +254,21 @@ def main() -> None:
     projected_array = np.concatenate(projected_actual_scenarios, axis=0)
     actual_array = np.concatenate(actual_values, axis=0)
     forecast_array = np.concatenate(forecast_values, axis=0)
+    tail_probability_array = (
+        np.concatenate(tail_probabilities, axis=0)
+        if tail_probabilities
+        else np.zeros((projected_array.shape[0],), dtype=np.float32)
+    )
+    tail_route_array = (
+        np.concatenate(tail_routes, axis=0).astype(np.uint8)
+        if tail_routes
+        else np.zeros((projected_array.shape[0], n_samples), dtype=np.uint8)
+    )
+    tail_attention_array = (
+        np.concatenate(tail_condition_attentions, axis=0)
+        if tail_condition_attentions
+        else np.zeros((projected_array.shape[0], 6), dtype=np.float32)
+    )
     if projected_array.shape[0] != daylight_mask.shape[0]:
         raise ValueError("daylight mask issue count does not match generated scenarios")
     projected_array = np.where(
@@ -248,6 +291,9 @@ def main() -> None:
     np.save(output_dir / "actual_data_normalized.npy", actual_array)
     np.save(output_dir / "forecast_data_normalized.npy", forecast_array)
     np.save(output_dir / "station_daylight_mask.npy", daylight_mask)
+    np.save(output_dir / "tail_expert_probability.npy", tail_probability_array)
+    np.save(output_dir / "tail_expert_route.npy", tail_route_array)
+    np.save(output_dir / "tail_condition_attention.npy", tail_attention_array)
     for level, moments in model.parallel_spatial_adjacency_moments.items():
         safe_level = level.replace("/", "_")
         np.save(
@@ -328,6 +374,29 @@ def main() -> None:
         ),
         "state_gate_values": model.state_gate_values,
         "wind_common_gate_value": model.wind_common_gate_value,
+        "use_body_tail_experts": bool(model.use_body_tail_experts),
+        "tail_gate_loss_weight": float(model.tail_gate_loss_weight),
+        "tail_common_gate_value": model.tail_common_gate_value,
+        "tail_probability_mean": float(tail_probability_array.mean()),
+        "tail_probability_min": float(tail_probability_array.min()),
+        "tail_probability_max": float(tail_probability_array.max()),
+        "tail_member_fraction": float(tail_route_array.mean()),
+        "tail_condition_attention_names": [
+            "issued_wind_level",
+            "issued_wind_down_ramp_3h",
+            "aligned_forecast_revision",
+            "forecast_low_output_state",
+            "forecast_down_ramp_state",
+            "recent_observed_forecast_error",
+        ],
+        "tail_condition_attention_mean": [
+            float(value) for value in tail_attention_array.mean(axis=0)
+        ],
+        "tail_routing_method": (
+            "causal_condition_gate_with_member_level_bernoulli_routing"
+            if model.use_body_tail_experts
+            else "disabled"
+        ),
         "event_weighting_file": (
             str(run_dir / "event_weighting.json")
             if (run_dir / "event_weighting.json").is_file()
