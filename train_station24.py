@@ -101,6 +101,38 @@ def update_ema(
             ema_state[name].copy_(value.detach())
 
 
+def ema_decay_for_step(
+    max_decay: float,
+    optimization_step: int,
+    warmup: Mapping[str, object] | None = None,
+) -> float:
+    """Return a fixed or warm-up EMA decay for one optimizer update.
+
+    The warm-up schedule follows the power-law form used by modern diffusion
+    training utilities.  It prevents a newly initialized, short-trained adapter
+    from being dominated by its initialization while retaining ``max_decay`` as
+    the long-run smoothing limit.
+    """
+
+    if not 0.0 <= max_decay < 1.0:
+        raise ValueError("ema_decay must be in [0,1)")
+    if not warmup or not bool(warmup.get("enabled", False)):
+        return max_decay
+    inv_gamma = float(warmup.get("inv_gamma", 1.0))
+    power = float(warmup.get("power", 0.75))
+    min_decay = float(warmup.get("min_decay", 0.0))
+    update_after_step = int(warmup.get("update_after_step", 0))
+    if inv_gamma <= 0.0 or power <= 0.0:
+        raise ValueError("EMA warm-up inv_gamma and power must be positive")
+    if not 0.0 <= min_decay <= max_decay:
+        raise ValueError("EMA warm-up min_decay must be in [0, ema_decay]")
+    adjusted_step = max(0, int(optimization_step) - update_after_step)
+    if adjusted_step == 0:
+        return min_decay
+    decay = 1.0 - (1.0 + adjusted_step / inv_gamma) ** (-power)
+    return min(max_decay, max(min_decay, decay))
+
+
 def state_to_cpu(state: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return {name: value.detach().cpu() for name, value in state.items()}
 
@@ -248,6 +280,7 @@ def save_checkpoint(
     event_weighting: Mapping[str, object] | None,
     event_replay: Mapping[str, object] | None,
     graph_manifest: Mapping[str, object],
+    ema_metadata: Mapping[str, object] | None = None,
 ) -> None:
     payload = {
         "architecture": model.architecture,
@@ -265,6 +298,7 @@ def save_checkpoint(
         "parameter_count": int(parameter_count),
         "model_state_dict": state_to_cpu(model.state_dict()),
         "ema_model_state_dict": state_to_cpu(ema_state),
+        "ema": copy.deepcopy(dict(ema_metadata)) if ema_metadata else None,
         "optimizer_state_dict": optimizer.state_dict(),
         "residual_scale": dict(residual_scale),
         "config": copy.deepcopy(dict(config)),
@@ -556,6 +590,11 @@ def main() -> None:
     amp_enabled = bool(train_config.get("mixed_precision", True)) and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
     ema_decay = float(train_config.get("ema_decay", 0.999))
+    ema_warmup = train_config.get("ema_warmup")
+    if ema_warmup is not None and not isinstance(ema_warmup, Mapping):
+        raise ValueError("train.ema_warmup must be a mapping")
+    # Validate the schedule before the expensive training loop starts.
+    ema_decay_for_step(ema_decay, 1, ema_warmup)
     ema_state = create_ema(model)
     ema_trainable_state_names = (
         set(model.body_tail_state_dict_keys)
@@ -602,10 +641,16 @@ def main() -> None:
         f"TRAIN samples={len(train_loader.dataset)} val={len(val_loader.dataset)} "
         f"batch={train_config['batch_size']} accumulation={accumulation} epochs={epochs}"
     )
+    print(
+        f"EMA max_decay={ema_decay} warmup={dict(ema_warmup) if ema_warmup else None} "
+        f"trainable_state_only={model.use_body_tail_experts}"
+    )
 
     history: list[dict[str, float]] = []
     best_val = float("inf")
     best_epoch = 0
+    optimizer_updates = 0
+    current_ema_decay = ema_decay_for_step(ema_decay, 0, ema_warmup)
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(1, epochs + 1):
         model.train()
@@ -630,10 +675,14 @@ def main() -> None:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                optimizer_updates += 1
+                current_ema_decay = ema_decay_for_step(
+                    ema_decay, optimizer_updates, ema_warmup
+                )
                 update_ema(
                     ema_state,
                     model,
-                    ema_decay,
+                    current_ema_decay,
                     trainable_state_names=ema_trainable_state_names,
                 )
             total_loss += float(loss.detach()) * batch_size
@@ -643,6 +692,8 @@ def main() -> None:
             "epoch": epoch,
             "train_loss": train_loss,
             "event_replay_draws": float(event_draws),
+            "optimizer_updates": float(optimizer_updates),
+            "ema_decay": float(current_ema_decay),
         }
 
         should_validate = epoch == 1 or epoch % validation_every == 0 or epoch == epochs
@@ -675,6 +726,14 @@ def main() -> None:
                     event_weighting,
                     event_replay,
                     graph_manifest,
+                    {
+                        "max_decay": ema_decay,
+                        "warmup": copy.deepcopy(dict(ema_warmup))
+                        if ema_warmup
+                        else None,
+                        "optimizer_updates": optimizer_updates,
+                        "current_decay": current_ema_decay,
+                    },
                 )
             print(
                 f"epoch={epoch:04d} train={train_loss:.7f} val={val_loss:.7f} "
@@ -711,6 +770,14 @@ def main() -> None:
                 event_weighting,
                 event_replay,
                 graph_manifest,
+                {
+                    "max_decay": ema_decay,
+                    "warmup": copy.deepcopy(dict(ema_warmup))
+                    if ema_warmup
+                    else None,
+                    "optimizer_updates": optimizer_updates,
+                    "current_decay": current_ema_decay,
+                },
             )
 
     if not (checkpoint_dir / "model_best.pt").is_file():
@@ -803,6 +870,12 @@ def main() -> None:
         "best_fixed_noise_validation_mse": best_val,
         "training_seed": seed,
         "validation_seed": validation_seed,
+        "ema": {
+            "max_decay": ema_decay,
+            "warmup": copy.deepcopy(dict(ema_warmup)) if ema_warmup else None,
+            "optimizer_updates": optimizer_updates,
+            "current_decay": current_ema_decay,
+        },
         "test_used": False,
         "graph_manifest": graph_manifest,
     }

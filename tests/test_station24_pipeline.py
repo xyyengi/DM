@@ -539,6 +539,49 @@ class Station24ModelTests(unittest.TestCase):
         self.assertEqual(saved["condition_variant"], "checkpoint_smoke")
         self.assertIsNotNone(saved["wind_common_gate_value"])
 
+    def test_generation_checkpoint_state_selection_is_explicit(self):
+        from generate_station24 import select_checkpoint_state
+
+        raw = {"weight": torch.tensor([1.0])}
+        ema = {"weight": torch.tensor([2.0])}
+        checkpoint = {
+            "model_state_dict": raw,
+            "ema_model_state_dict": ema,
+        }
+        selected, key = select_checkpoint_state(checkpoint, "raw")
+        self.assertIs(selected, raw)
+        self.assertEqual(key, "model_state_dict")
+        selected, key = select_checkpoint_state(checkpoint, "ema")
+        self.assertIs(selected, ema)
+        self.assertEqual(key, "ema_model_state_dict")
+        selected, key = select_checkpoint_state(
+            {"model_state_dict": raw}, "ema"
+        )
+        self.assertIs(selected, raw)
+        self.assertEqual(key, "model_state_dict")
+        with self.assertRaises(ValueError):
+            select_checkpoint_state(checkpoint, "unknown")
+
+    def test_ema_warmup_tracks_short_trained_adapter(self):
+        from train_station24 import ema_decay_for_step
+
+        warmup = {
+            "enabled": True,
+            "inv_gamma": 1.0,
+            "power": 0.75,
+            "min_decay": 0.0,
+            "update_after_step": 0,
+        }
+        first = ema_decay_for_step(0.999, 1, warmup)
+        short_run = ema_decay_for_step(0.999, 380, warmup)
+        long_run = ema_decay_for_step(0.999, 10000, warmup)
+        self.assertAlmostEqual(first, 1.0 - 2.0 ** -0.75, places=7)
+        self.assertAlmostEqual(short_run, 0.9884, places=3)
+        self.assertEqual(long_run, 0.999)
+        self.assertEqual(ema_decay_for_step(0.999, 1, None), 0.999)
+        with self.assertRaises(ValueError):
+            ema_decay_for_step(0.999, 1, {"enabled": True, "power": 0.0})
+
     def test_type_gated_graph_has_exact_relation_gates(self):
         from src.models.station_conditioned_diffusion import Station24DiffusionModel
 
@@ -1294,6 +1337,10 @@ class Station24DatasetTests(unittest.TestCase):
             self.assertIn('"forecast_guidance_scale": 0.75', metrics)
             self.assertIn('"forecast_condition_dropout_prob": 0.1', metrics)
             self.assertIn('"forecast_correction_mode": "direct"', metrics)
+            self.assertIn('"checkpoint_state_source": "ema"', metrics)
+            self.assertIn(
+                '"checkpoint_state_key": "ema_model_state_dict"', metrics
+            )
             self.assertIn(
                 '"checkpoint_validation_objective_type": '
                 '"diffusion_epsilon_plus_forecast_correction_huber"',

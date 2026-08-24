@@ -33,6 +33,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--issue-batch-size", type=int, default=None)
     parser.add_argument("--member-chunk-size", type=int, default=None)
     parser.add_argument(
+        "--checkpoint-state",
+        choices=["ema", "raw"],
+        default="ema",
+        help=(
+            "Choose the saved parameter state used for generation. The default "
+            "keeps historical EMA behavior; raw uses model_state_dict from the "
+            "same selected checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--result-variant",
+        default=None,
+        help=(
+            "Optional evaluation identity for an inference-only ablation. The "
+            "trained condition variant is retained separately in metadata."
+        ),
+    )
+    parser.add_argument(
         "--forecast-guidance-scale",
         type=float,
         default=1.0,
@@ -69,6 +87,25 @@ def move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str
         for key, value in batch.items()
         if key != "sample_index"
     }
+
+
+def select_checkpoint_state(
+    checkpoint: dict[str, object], source: str
+) -> tuple[dict[str, torch.Tensor], str]:
+    """Select an explicit checkpoint state without silently changing semantics."""
+
+    if source == "raw":
+        key = "model_state_dict"
+    elif source == "ema":
+        key = "ema_model_state_dict"
+        if key not in checkpoint:
+            key = "model_state_dict"
+    else:
+        raise ValueError(f"unsupported checkpoint state source: {source}")
+    state = checkpoint.get(key)
+    if not isinstance(state, dict):
+        raise ValueError(f"checkpoint lacks a valid {key}")
+    return state, key
 
 
 def main() -> None:
@@ -148,9 +185,15 @@ def main() -> None:
         model.use_body_tail_experts
     ):
         raise ValueError("checkpoint body-tail expert mode does not match config")
-    state = checkpoint.get("ema_model_state_dict", checkpoint["model_state_dict"])
+    state, checkpoint_state_key = select_checkpoint_state(
+        checkpoint, args.checkpoint_state
+    )
     model.load_state_dict(state, strict=True)
     model.eval()
+    trained_condition_variant = str(
+        config.get("experiment", {}).get("variant", "baseline")
+    )
+    result_variant = str(args.result_variant or trained_condition_variant)
 
     loader, dataset = get_station_dataloader(
         data_path,
@@ -180,7 +223,8 @@ def main() -> None:
 
     print(
         f"GENERATION split={args.split} issues={len(loader.dataset)} "
-        f"members={n_samples} chunks={member_chunk_size} device={device}"
+        f"members={n_samples} chunks={member_chunk_size} device={device} "
+        f"checkpoint_state={args.checkpoint_state} key={checkpoint_state_key}"
     )
     for batch_index, raw_batch in enumerate(loader, start=1):
         batch = move_batch(raw_batch, device)
@@ -330,9 +374,19 @@ def main() -> None:
         "checkpoint_validation_mse": float(checkpoint["val_loss"]),
         "checkpoint_validation_objective": float(checkpoint["val_loss"]),
         "checkpoint_validation_objective_type": (
-            "diffusion_epsilon_plus_forecast_correction_huber"
-            if model.forecast_correction_mode != "none"
-            else "diffusion_epsilon_mse"
+            "tail_event_epsilon_plus_gate_bce"
+            if model.use_body_tail_experts
+            else (
+                "diffusion_epsilon_plus_forecast_correction_huber"
+                if model.forecast_correction_mode != "none"
+                else "diffusion_epsilon_mse"
+            )
+        ),
+        "checkpoint_state_source": args.checkpoint_state,
+        "checkpoint_state_key": checkpoint_state_key,
+        "checkpoint_state_fallback": (
+            args.checkpoint_state == "ema"
+            and checkpoint_state_key != "ema_model_state_dict"
         ),
         "architecture": model.architecture,
         "spatial_mode": model.spatial_mode,
@@ -348,9 +402,8 @@ def main() -> None:
         "parallel_spatial_gate_statistics": (
             model.parallel_spatial_gate_statistics
         ),
-        "condition_variant": str(
-            config.get("experiment", {}).get("variant", "baseline")
-        ),
+        "condition_variant": result_variant,
+        "trained_condition_variant": trained_condition_variant,
         "condition_gate_values": model.condition_gate_values,
         "forecast_condition_dropout_prob": float(
             model.denoiser.forecast_condition_dropout_prob

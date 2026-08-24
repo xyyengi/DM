@@ -16,6 +16,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--body-result", required=True)
     parser.add_argument("--candidate-run", required=True)
     parser.add_argument("--candidate-result", required=True)
+    parser.add_argument(
+        "--candidate-checkpoint-state",
+        choices=["ema", "raw"],
+        default="ema",
+    )
     parser.add_argument("--output-dir", required=True)
     return parser.parse_args()
 
@@ -58,6 +63,15 @@ def main() -> None:
         raise ValueError("event replay leaked into generation")
     if bool(candidate_meta.get("test_used", True)):
         raise ValueError("test split was used")
+    if args.candidate_checkpoint_state == "raw":
+        if candidate_meta.get("checkpoint_state_source") != "raw":
+            raise ValueError("raw audit requires raw checkpoint generation")
+        if candidate_meta.get("trained_condition_variant") != (
+            "geo_history_actual_body_tail_moe"
+        ):
+            raise ValueError("raw inference result lost its trained model identity")
+    elif candidate_meta.get("checkpoint_state_source", "ema") != "ema":
+        raise ValueError("EMA audit requires EMA checkpoint generation")
     for metadata in (body_meta, candidate_meta):
         if metadata.get("split") != "val" or int(metadata.get("n_samples", 0)) != 500:
             raise ValueError("formal audit requires validation split with 500 members")
@@ -66,9 +80,24 @@ def main() -> None:
     if not tail_names or not all(name.startswith("denoiser.tail_") for name in tail_names):
         raise ValueError("candidate trainable parameter isolation is invalid")
     body_state = body.get("ema_model_state_dict", body["model_state_dict"])
-    candidate_state = candidate.get(
-        "ema_model_state_dict", candidate["model_state_dict"]
+    candidate_state_key = (
+        "model_state_dict"
+        if args.candidate_checkpoint_state == "raw"
+        else "ema_model_state_dict"
     )
+    if candidate_state_key not in candidate:
+        if args.candidate_checkpoint_state == "ema":
+            candidate_state_key = "model_state_dict"
+        else:
+            raise ValueError("candidate checkpoint lacks raw model_state_dict")
+    candidate_state = candidate[candidate_state_key]
+    if candidate_meta.get("checkpoint_state_key") not in (
+        None,
+        candidate_state_key,
+    ):
+        raise ValueError(
+            "candidate generation metadata does not match audited checkpoint state"
+        )
     changed_body_keys: list[str] = []
     missing_body_keys: list[str] = []
     for key, value in body_state.items():
@@ -111,6 +140,8 @@ def main() -> None:
         "status": "passed",
         "body_condition_variant": body["condition_variant"],
         "candidate_condition_variant": candidate["condition_variant"],
+        "candidate_checkpoint_state_source": args.candidate_checkpoint_state,
+        "candidate_checkpoint_state_key": candidate_state_key,
         "body_parameter_keys_checked": len(body_state),
         "changed_body_parameter_keys": changed_body_keys,
         "tail_trainable_parameter_count": len(tail_names),

@@ -114,6 +114,16 @@ train:
   min_delta: 1.0e-5
   gradient_clip_norm: 1.0
   ema_decay: 0.999
+  # Power-law EMA warm-up for newly initialized tail/gate parameters. The
+  # frozen historical-spatial body is copied exactly on every EMA update.
+  # This reaches about 0.988 after 380 optimizer updates instead of applying
+  # the long-run 0.999 decay from the first update.
+  ema_warmup:
+    enabled: true
+    inv_gamma: 1.0
+    power: 0.75
+    min_decay: 0.0
+    update_after_step: 0
   mixed_precision: true
   save_every: 50
   seed: 2027
