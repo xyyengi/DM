@@ -207,8 +207,13 @@ TIMING_ROOT="${PIPELINE_ROOT}/wind_event_timing/history_vs_event_replay_x0"
 ATTRIBUTION_ROOT="${PIPELINE_ROOT}/forecast_event_attribution/history_vs_event_replay_x0"
 TAIL_ROOT="${PIPELINE_ROOT}/extreme_wind_tail/history_vs_event_replay_x0"
 REPLAY_AUDIT_ROOT="${PIPELINE_ROOT}/event_replay_audit"
-mkdir -p "${TRAIN_ROOT}" "${RESULT_ROOT}" "${COMPARISON_ROOT}" \
-  "${TIMING_ROOT}" "${TAIL_ROOT}"
+# Analysis tools intentionally refuse to overwrite an existing output
+# directory.  Create only their parents here; each tool creates its own leaf.
+mkdir -p "${TRAIN_ROOT}" "${RESULT_ROOT}" \
+  "$(dirname "${COMPARISON_ROOT}")" \
+  "$(dirname "${TIMING_ROOT}")" \
+  "$(dirname "${ATTRIBUTION_ROOT}")" \
+  "$(dirname "${TAIL_ROOT}")"
 
 ENVIRONMENT_FILE="${LOG_FILE%.log}.environment.txt"
 {
