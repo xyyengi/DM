@@ -196,9 +196,42 @@ def validate(
     gate_error_sum = 0.0
     gate_samples = 0
     tail_event_count = 0
+    location_mass_sum = 0.0
+    location_offset_sum = 0.0
     for raw_batch in loader:
         batch = move_batch(raw_batch, device)
         batch_size = batch["forecast"].shape[0]
+        if model.train_tail_time_localizer_only:
+            if event_replay is None:
+                raise ValueError(
+                    "tail time validation requires train event thresholds"
+                )
+            active, event_window, _ = build_body_tail_validation_events(
+                batch, model, event_replay
+            )
+            batch["event_active"] = active
+            batch["event_window_mask"] = event_window
+            active_count = int(active.sum())
+            if active_count:
+                loss = model.tail_time_localization_loss(batch)
+                probability = model.tail_time_probability(batch)
+                event_mass = (probability * event_window).sum(dim=-1)
+                target_index = (
+                    event_window
+                    * torch.arange(
+                        event_window.shape[-1],
+                        device=device,
+                        dtype=event_window.dtype,
+                    )[None]
+                ).sum(dim=-1) / event_window.sum(dim=-1).clamp(min=1.0)
+                predicted_index = probability.argmax(dim=-1).to(target_index.dtype)
+                offset = torch.abs(predicted_index - target_index)
+                total_loss += float(loss) * active_count
+                total_weight += active_count
+                location_mass_sum += float((event_mass * active).sum())
+                location_offset_sum += float((offset * active).sum())
+                tail_event_count += active_count
+            continue
         timestep = torch.randint(
             0,
             model.diffusion.num_steps,
@@ -251,6 +284,18 @@ def validate(
             )
             total_loss += float(loss) * batch_size
             total_weight += batch_size
+    if model.train_tail_time_localizer_only:
+        if total_weight <= 0.0:
+            raise ValueError("validation split contains no tail localization event")
+        objective = total_loss / total_weight
+        return objective, {
+            "val_tail_time_nll": objective,
+            "val_tail_time_event_mass": location_mass_sum / total_weight,
+            "val_tail_time_argmax_abs_offset_h": (
+                location_offset_sum / total_weight
+            ),
+            "val_tail_event_count": float(tail_event_count),
+        }
     if model.use_body_tail_experts:
         if total_weight <= 0.0 or tail_event_count <= 0:
             raise ValueError("validation split contains no train-threshold tail event")
@@ -324,10 +369,17 @@ def save_checkpoint(
         "state_gate_values": model.state_gate_values,
         "wind_common_gate_value": model.wind_common_gate_value,
         "use_body_tail_experts": bool(model.use_body_tail_experts),
+        "use_tail_time_localizer": bool(model.use_tail_time_localizer),
+        "train_tail_time_localizer_only": bool(
+            model.train_tail_time_localizer_only
+        ),
         "tail_gate_loss_weight": float(model.tail_gate_loss_weight),
         "tail_common_gate_value": model.tail_common_gate_value,
         "body_tail_trainable_parameter_names": list(
             model.body_tail_trainable_parameter_names
+        ),
+        "tail_time_trainable_parameter_names": list(
+            model.tail_time_trainable_parameter_names
         ),
         "state_thresholds": (
             copy.deepcopy(dict(state_thresholds))
@@ -349,7 +401,12 @@ def save_checkpoint(
     torch.save(payload, path)
 
 
-def plot_losses(history: list[dict[str, float]], output: Path) -> None:
+def plot_losses(
+    history: list[dict[str, float]],
+    output: Path,
+    ylabel: str = "Fixed-noise epsilon MSE",
+    title: str = "Station24 diffusion training",
+) -> None:
     frame_epochs = [row["epoch"] for row in history]
     train_losses = [row["train_loss"] for row in history]
     val_epochs = [row["epoch"] for row in history if "val_loss" in row]
@@ -358,8 +415,8 @@ def plot_losses(history: list[dict[str, float]], output: Path) -> None:
     axis.plot(frame_epochs, train_losses, label="train")
     axis.plot(val_epochs, val_losses, marker="o", label="validation")
     axis.set_xlabel("Epoch")
-    axis.set_ylabel("Fixed-noise epsilon MSE")
-    axis.set_title("Station24 diffusion training")
+    axis.set_ylabel(ylabel)
+    axis.set_title(title)
     axis.grid(alpha=0.25)
     axis.legend(frameon=False)
     fig.tight_layout()
@@ -519,35 +576,77 @@ def main() -> None:
         initialization = torch.load(
             initialization_path, map_location="cpu", weights_only=False
         )
-        if initialization.get("condition_variant") != "geo_history_actual_dual":
-            raise ValueError(
-                "body-tail expert must initialize from geo_history_actual_dual"
+        if model.train_tail_time_localizer_only:
+            if initialization.get("condition_variant") != (
+                "geo_history_actual_body_tail_moe"
+            ):
+                raise ValueError(
+                    "tail time localizer must initialize from the Raw "
+                    "geo_history_actual_body_tail_moe checkpoint"
+                )
+            # The raw tail checkpoint is the experimental result being retained.
+            # Do not silently fall back to the EMA state that suppressed it.
+            source_state = initialization["model_state_dict"]
+            incompatible = model.load_state_dict(source_state, strict=False)
+            expected_missing = set(model.tail_time_state_dict_keys)
+            if set(incompatible.missing_keys) != expected_missing:
+                raise ValueError(
+                    "unexpected tail-time initialization gaps: "
+                    f"{sorted(incompatible.missing_keys)}"
+                )
+            if incompatible.unexpected_keys:
+                raise ValueError(
+                    "unexpected tail-time initialization keys: "
+                    f"{sorted(incompatible.unexpected_keys)}"
+                )
+            trainable_names = model.configure_tail_time_training()
+            initialization_manifest = {
+                "method": "frozen_raw_body_tail_plus_hourly_time_localizer",
+                "checkpoint": str(initialization_path),
+                "checkpoint_state_source": "raw",
+                "checkpoint_state_key": "model_state_dict",
+                "source_condition_variant": str(
+                    initialization["condition_variant"]
+                ),
+                "source_epoch": int(initialization["epoch"]),
+                "source_validation_objective": float(initialization["val_loss"]),
+                "body_frozen": True,
+                "tail_adapters_frozen": True,
+                "issuance_gate_frozen": True,
+                "trainable_parameter_names": list(trainable_names),
+            }
+        else:
+            if initialization.get("condition_variant") != "geo_history_actual_dual":
+                raise ValueError(
+                    "body-tail expert must initialize from geo_history_actual_dual"
+                )
+            source_state = initialization.get(
+                "ema_model_state_dict", initialization["model_state_dict"]
             )
-        source_state = initialization.get(
-            "ema_model_state_dict", initialization["model_state_dict"]
-        )
-        incompatible = model.load_state_dict(source_state, strict=False)
-        expected_missing = set(model.body_tail_state_dict_keys)
-        if set(incompatible.missing_keys) != expected_missing:
-            raise ValueError(
-                "unexpected body-tail initialization gaps: "
-                f"{sorted(incompatible.missing_keys)}"
-            )
-        if incompatible.unexpected_keys:
-            raise ValueError(
-                "unexpected body-tail initialization keys: "
-                f"{sorted(incompatible.unexpected_keys)}"
-            )
-        trainable_names = model.configure_body_tail_training()
-        initialization_manifest = {
-            "method": "frozen_historical_spatial_body_plus_tail_residual_adapter",
-            "checkpoint": str(initialization_path),
-            "source_condition_variant": str(initialization["condition_variant"]),
-            "source_epoch": int(initialization["epoch"]),
-            "source_validation_mse": float(initialization["val_loss"]),
-            "body_frozen": True,
-            "trainable_parameter_names": list(trainable_names),
-        }
+            incompatible = model.load_state_dict(source_state, strict=False)
+            expected_missing = set(model.body_tail_state_dict_keys)
+            if set(incompatible.missing_keys) != expected_missing:
+                raise ValueError(
+                    "unexpected body-tail initialization gaps: "
+                    f"{sorted(incompatible.missing_keys)}"
+                )
+            if incompatible.unexpected_keys:
+                raise ValueError(
+                    "unexpected body-tail initialization keys: "
+                    f"{sorted(incompatible.unexpected_keys)}"
+                )
+            trainable_names = model.configure_body_tail_training()
+            initialization_manifest = {
+                "method": "frozen_historical_spatial_body_plus_tail_residual_adapter",
+                "checkpoint": str(initialization_path),
+                "source_condition_variant": str(
+                    initialization["condition_variant"]
+                ),
+                "source_epoch": int(initialization["epoch"]),
+                "source_validation_mse": float(initialization["val_loss"]),
+                "body_frozen": True,
+                "trainable_parameter_names": list(trainable_names),
+            }
         (run_dir / "body_tail_initialization.json").write_text(
             json.dumps(initialization_manifest, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -596,11 +695,12 @@ def main() -> None:
     # Validate the schedule before the expensive training loop starts.
     ema_decay_for_step(ema_decay, 1, ema_warmup)
     ema_state = create_ema(model)
-    ema_trainable_state_names = (
-        set(model.body_tail_state_dict_keys)
-        if model.use_body_tail_experts
-        else None
-    )
+    if model.train_tail_time_localizer_only:
+        ema_trainable_state_names = set(model.tail_time_state_dict_keys)
+    elif model.use_body_tail_experts:
+        ema_trainable_state_names = set(model.body_tail_state_dict_keys)
+    else:
+        ema_trainable_state_names = None
     accumulation = int(train_config.get("gradient_accumulation_steps", 1))
     clip_norm = float(train_config.get("gradient_clip_norm", 1.0))
     epochs = int(train_config["epochs"])
@@ -630,6 +730,8 @@ def main() -> None:
         f"{model.diffusion.event_x0_timing_loss_weight},"
         f"{model.diffusion.event_x0_sync_loss_weight}) "
         f"body_tail_experts={model.use_body_tail_experts} "
+        f"tail_time_localizer={model.use_tail_time_localizer} "
+        f"tail_time_only={model.train_tail_time_localizer_only} "
         f"tail_gate_weight={model.tail_gate_loss_weight} "
         f"tail_common_gate={model.tail_common_gate_value} "
         f"common_gate={model.wind_common_gate_value} "
@@ -663,7 +765,11 @@ def main() -> None:
             if event_replay is not None:
                 event_draws += int(batch["event_active"].sum().detach().cpu())
             with torch.cuda.amp.autocast(enabled=amp_enabled):
-                loss = model(batch)
+                loss = (
+                    model.tail_time_localization_loss(batch)
+                    if model.train_tail_time_localizer_only
+                    else model(batch)
+                )
                 scaled_loss = loss / accumulation
             scaler.scale(scaled_loss).backward()
             should_step = (
@@ -685,8 +791,13 @@ def main() -> None:
                     current_ema_decay,
                     trainable_state_names=ema_trainable_state_names,
                 )
-            total_loss += float(loss.detach()) * batch_size
-            total_samples += batch_size
+            batch_weight = (
+                int(batch["event_active"].sum().detach().cpu())
+                if model.train_tail_time_localizer_only
+                else batch_size
+            )
+            total_loss += float(loss.detach()) * batch_weight
+            total_samples += batch_weight
         train_loss = total_loss / max(total_samples, 1)
         row: dict[str, float] = {
             "epoch": epoch,
@@ -785,7 +896,20 @@ def main() -> None:
     (log_dir / "training_history.json").write_text(
         json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    plot_losses(history, log_dir / "loss_curve.png")
+    plot_losses(
+        history,
+        log_dir / "loss_curve.png",
+        ylabel=(
+            "Tail event-time NLL"
+            if model.train_tail_time_localizer_only
+            else "Fixed-noise epsilon MSE"
+        ),
+        title=(
+            "Station24 tail time localization"
+            if model.train_tail_time_localizer_only
+            else "Station24 diffusion training"
+        ),
+    )
     final_record = {
         "architecture": model.architecture,
         "spatial_mode": model.spatial_mode,
@@ -812,11 +936,18 @@ def main() -> None:
         ),
         "state_gate_values": model.state_gate_values,
         "use_body_tail_experts": bool(model.use_body_tail_experts),
+        "use_tail_time_localizer": bool(model.use_tail_time_localizer),
+        "train_tail_time_localizer_only": bool(
+            model.train_tail_time_localizer_only
+        ),
         "tail_gate_loss_weight": float(model.tail_gate_loss_weight),
         "tail_common_gate_value": model.tail_common_gate_value,
         "body_tail_initialization": initialization_manifest,
         "body_tail_trainable_parameter_names": list(
             model.body_tail_trainable_parameter_names
+        ),
+        "tail_time_trainable_parameter_names": list(
+            model.tail_time_trainable_parameter_names
         ),
         "residual_scaling_method": str(
             residual_scale.get("method", "per_station_std")

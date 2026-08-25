@@ -1417,6 +1417,24 @@ class StationConditionalResUNet1D(nn.Module):
         self.tail_risk_encoder: nn.Module | None = None
         self.tail_risk_output: nn.Linear | None = None
         self.tail_signal_attention: nn.Module | None = None
+        self.use_tail_time_localizer = bool(
+            config.get("use_tail_time_localizer", False)
+        )
+        self.tail_time_output: nn.Module | None = None
+        self.tail_time_temperature = float(
+            config.get("tail_time_temperature", 1.0)
+        )
+        self.tail_time_mask_radius_hours = int(
+            config.get("tail_time_mask_radius_hours", 9)
+        )
+        if self.use_tail_time_localizer and not self.use_body_tail_experts:
+            raise ValueError("tail time localization requires body-tail experts")
+        if self.tail_time_temperature <= 0.0:
+            raise ValueError("tail_time_temperature must be positive")
+        if not 1 <= self.tail_time_mask_radius_hours < self.sequence_length:
+            raise ValueError(
+                "tail_time_mask_radius_hours must be in [1, sequence_length)"
+            )
         self.use_wind_common_residual_head = bool(
             config.get("use_wind_common_residual_head", False)
         )
@@ -1506,6 +1524,28 @@ class StationConditionalResUNet1D(nn.Module):
                 self.tail_risk_output.bias,
                 math.log(tail_prior / (1.0 - tail_prior)),
             )
+            if self.use_tail_time_localizer:
+                # Reuse the causal hourly representation that currently feeds
+                # the issuance-level risk gate.  Only this small head is new:
+                # it predicts a conditional distribution over the 168 lead
+                # hours instead of another global condition branch.
+                self.tail_time_output = nn.Sequential(
+                    nn.Conv1d(
+                        gate_channels,
+                        gate_channels,
+                        kernel_size=3,
+                        padding=1,
+                    ),
+                    nn.GroupNorm(
+                        _group_count(gate_channels, groups), gate_channels
+                    ),
+                    nn.SiLU(),
+                    nn.Conv1d(gate_channels, 1, kernel_size=1),
+                )
+                # A uniform time distribution is the neutral initialization;
+                # the inherited body, tail adapters, and global gate are exact.
+                nn.init.zeros_(self.tail_time_output[-1].weight)
+                nn.init.zeros_(self.tail_time_output[-1].bias)
         self.wind_common_head = None
         self.wind_common_gate = None
         if self.use_wind_common_residual_head:
@@ -1556,6 +1596,7 @@ class StationConditionalResUNet1D(nn.Module):
         node_state: torch.Tensor | None = None,
         forecast_condition_strength: torch.Tensor | float | None = None,
         tail_expert_route: torch.Tensor | float | None = None,
+        tail_time_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if noisy_residual.shape[1:] != (self.station_count, self.sequence_length):
             raise ValueError(
@@ -1731,10 +1772,25 @@ class StationConditionalResUNet1D(nn.Module):
                 torch.sigmoid(self.tail_common_gate) * common_delta
             )
             tail_delta = tail_delta * self.wind_station_mask[None, :, None]
-            output = output + route * tail_delta
+            if tail_time_mask is None:
+                localized_route = route
+            else:
+                localized_route = tail_time_mask.to(
+                    device=output.device, dtype=output.dtype
+                )
+                if localized_route.ndim == 2:
+                    localized_route = localized_route[:, None, :]
+                if localized_route.shape != (batch, 1, length):
+                    raise ValueError("tail_time_mask must be [B,L] or [B,1,L]")
+                if torch.any(localized_route < 0.0) or torch.any(
+                    localized_route > 1.0
+                ):
+                    raise ValueError("tail_time_mask must be in [0,1]")
+                localized_route = route * localized_route
+            output = output + localized_route * tail_delta
         return output
 
-    def tail_risk_logits(
+    def _tail_risk_features(
         self,
         forecast: torch.Tensor,
         forecast_revision: torch.Tensor | None = None,
@@ -1742,17 +1798,12 @@ class StationConditionalResUNet1D(nn.Module):
         recent_error: torch.Tensor | None = None,
         recent_error_mask: torch.Tensor | None = None,
         node_state: torch.Tensor | None = None,
-        return_attention: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Predict an issuance-level tail probability from available conditions."""
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return causal hourly tail features and signal attention weights."""
 
         if not self.use_body_tail_experts:
             raise RuntimeError("tail risk gate is disabled")
-        if (
-            self.tail_signal_attention is None
-            or self.tail_risk_encoder is None
-            or self.tail_risk_output is None
-        ):
+        if self.tail_signal_attention is None or self.tail_risk_encoder is None:
             raise RuntimeError("tail risk gate was not initialized")
         if forecast.ndim != 3 or forecast.shape[1:] != (
             self.station_count,
@@ -1804,12 +1855,58 @@ class StationConditionalResUNet1D(nn.Module):
             self.tail_signal_attention(signal_statistics), dim=1
         )
         signals = signals * (6.0 * attention[:, :, None])
-        encoded = self.tail_risk_encoder(signals)
+        return self.tail_risk_encoder(signals), attention
+
+    def tail_risk_logits(
+        self,
+        forecast: torch.Tensor,
+        forecast_revision: torch.Tensor | None = None,
+        revision_mask: torch.Tensor | None = None,
+        recent_error: torch.Tensor | None = None,
+        recent_error_mask: torch.Tensor | None = None,
+        node_state: torch.Tensor | None = None,
+        return_attention: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Predict an issuance-level tail probability from available conditions."""
+
+        if self.tail_risk_output is None:
+            raise RuntimeError("tail risk gate was not initialized")
+        encoded, attention = self._tail_risk_features(
+            forecast,
+            forecast_revision=forecast_revision,
+            revision_mask=revision_mask,
+            recent_error=recent_error,
+            recent_error_mask=recent_error_mask,
+            node_state=node_state,
+        )
         pooled = torch.cat([encoded.mean(dim=-1), encoded.amax(dim=-1)], dim=1)
         logits = self.tail_risk_output(pooled)[:, 0]
         if return_attention:
             return logits, attention
         return logits
+
+    def tail_time_logits(
+        self,
+        forecast: torch.Tensor,
+        forecast_revision: torch.Tensor | None = None,
+        revision_mask: torch.Tensor | None = None,
+        recent_error: torch.Tensor | None = None,
+        recent_error_mask: torch.Tensor | None = None,
+        node_state: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Predict conditional event-location logits for all lead hours."""
+
+        if not self.use_tail_time_localizer or self.tail_time_output is None:
+            raise RuntimeError("tail time localizer is disabled")
+        encoded, _ = self._tail_risk_features(
+            forecast,
+            forecast_revision=forecast_revision,
+            revision_mask=revision_mask,
+            recent_error=recent_error,
+            recent_error_mask=recent_error_mask,
+            node_state=node_state,
+        )
+        return self.tail_time_output(encoded)[:, 0]
 
     def body_tail_parameter_names(self) -> tuple[str, ...]:
         if not self.use_body_tail_experts:
@@ -1821,9 +1918,19 @@ class StationConditionalResUNet1D(nn.Module):
             "tail_risk_encoder.",
             "tail_risk_output.",
             "tail_signal_attention.",
+            "tail_time_output.",
         )
         return tuple(
             name for name, _ in self.named_parameters() if name.startswith(prefixes)
+        )
+
+    def tail_time_parameter_names(self) -> tuple[str, ...]:
+        if not self.use_tail_time_localizer:
+            return ()
+        return tuple(
+            name
+            for name, _ in self.named_parameters()
+            if name.startswith("tail_time_output.")
         )
 
     def forecast_condition_dropout_statistics(self) -> dict[str, float | int]:
@@ -1948,6 +2055,7 @@ class StationGaussianDiffusion(nn.Module):
         include_auxiliary: bool = True,
         forecast_condition_strength: torch.Tensor | float | None = None,
         tail_expert_route: torch.Tensor | float | None = None,
+        tail_time_mask: torch.Tensor | None = None,
         epsilon_sample_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if timestep is None:
@@ -1969,6 +2077,7 @@ class StationGaussianDiffusion(nn.Module):
             node_state=node_state,
             forecast_condition_strength=forecast_condition_strength,
             tail_expert_route=tail_expert_route,
+            tail_time_mask=tail_time_mask,
         )
         squared_error = (prediction - noise) ** 2
         valid_mask = valid_mask.to(squared_error.dtype)
@@ -2210,6 +2319,7 @@ class StationGaussianDiffusion(nn.Module):
         node_state: torch.Tensor | None = None,
         forecast_guidance_scale: float = 1.0,
         tail_expert_route: torch.Tensor | float | None = None,
+        tail_time_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         forecast_guidance_scale = float(forecast_guidance_scale)
         if not 0.0 <= forecast_guidance_scale <= 1.0:
@@ -2230,6 +2340,7 @@ class StationGaussianDiffusion(nn.Module):
             lead,
             forecast_condition_strength=1.0,
             tail_expert_route=tail_expert_route,
+            tail_time_mask=tail_time_mask,
             **denoiser_kwargs,
         )
         if forecast_guidance_scale == 1.0:
@@ -2243,6 +2354,7 @@ class StationGaussianDiffusion(nn.Module):
                 lead,
                 forecast_condition_strength=0.0,
                 tail_expert_route=tail_expert_route,
+                tail_time_mask=tail_time_mask,
                 **denoiser_kwargs,
             )
             predicted_noise = predicted_neutral + forecast_guidance_scale * (
@@ -2272,6 +2384,7 @@ class StationGaussianDiffusion(nn.Module):
         node_state: torch.Tensor | None = None,
         forecast_guidance_scale: float = 1.0,
         tail_expert_route: torch.Tensor | None = None,
+        tail_time_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, stations, length = forecast.shape
         n_samples = int(n_samples)
@@ -2304,6 +2417,18 @@ class StationGaussianDiffusion(nn.Module):
                 )
         else:
             route = None
+        if tail_time_mask is not None:
+            time_mask = tail_time_mask.to(
+                device=forecast.device, dtype=forecast.dtype
+            )
+            if time_mask.shape == (batch, n_samples, length):
+                time_mask = time_mask.reshape(batch * n_samples, length)
+            elif time_mask.shape != (batch * n_samples, length):
+                raise ValueError(
+                    "tail_time_mask must be [B,K,L] or [B*K,L] during sampling"
+                )
+        else:
+            time_mask = None
         noisy = torch.randn(
             batch * n_samples,
             stations,
@@ -2322,6 +2447,7 @@ class StationGaussianDiffusion(nn.Module):
                 lead,
                 forecast_guidance_scale=forecast_guidance_scale,
                 tail_expert_route=route,
+                tail_time_mask=time_mask,
                 **optional_conditions,
             )
         return noisy.reshape(batch, n_samples, stations, length)
@@ -2345,6 +2471,16 @@ class Station24DiffusionModel(nn.Module):
         self.use_body_tail_experts = bool(
             self.config.get("use_body_tail_experts", False)
         )
+        self.use_tail_time_localizer = bool(
+            self.config.get("use_tail_time_localizer", False)
+        )
+        self.train_tail_time_localizer_only = bool(
+            self.config.get("train_tail_time_localizer_only", False)
+        )
+        if self.train_tail_time_localizer_only and not self.use_tail_time_localizer:
+            raise ValueError(
+                "train_tail_time_localizer_only requires use_tail_time_localizer"
+            )
         self.tail_epsilon_context_hours = int(
             self.config.get("tail_epsilon_context_hours", 6)
         )
@@ -2543,6 +2679,24 @@ class Station24DiffusionModel(nn.Module):
         )
 
     @property
+    def tail_time_trainable_parameter_names(self) -> tuple[str, ...]:
+        return tuple(
+            f"denoiser.{name}" for name in self.denoiser.tail_time_parameter_names()
+        )
+
+    @property
+    def tail_time_state_dict_keys(self) -> tuple[str, ...]:
+        """All serialized aliases for the hourly tail-location head."""
+
+        parameter_suffixes = self.denoiser.tail_time_parameter_names()
+        prefixes = ("denoiser.", "diffusion.denoiser.")
+        return tuple(
+            f"{prefix}{suffix}"
+            for prefix in prefixes
+            for suffix in parameter_suffixes
+        )
+
+    @property
     def tail_common_gate_value(self) -> float | None:
         gate = self.denoiser.tail_common_gate
         if gate is None:
@@ -2562,6 +2716,21 @@ class Station24DiffusionModel(nn.Module):
         actual = {name for name, value in self.named_parameters() if value.requires_grad}
         if actual != allowed:
             raise RuntimeError("body-tail parameter isolation failed")
+        return tuple(sorted(actual))
+
+    def configure_tail_time_training(self) -> tuple[str, ...]:
+        """Freeze inherited Raw body/tail/gate and train only time localization."""
+
+        if not self.use_tail_time_localizer:
+            raise RuntimeError("tail time localizer is disabled")
+        allowed = set(self.tail_time_trainable_parameter_names)
+        if not allowed:
+            raise RuntimeError("tail time localizer has no trainable parameters")
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad_(name in allowed)
+        actual = {name for name, value in self.named_parameters() if value.requires_grad}
+        if actual != allowed:
+            raise RuntimeError("tail time parameter isolation failed")
         return tuple(sorted(actual))
 
     def tail_risk_logits(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
@@ -2597,6 +2766,73 @@ class Station24DiffusionModel(nn.Module):
         self, batch: Mapping[str, torch.Tensor]
     ) -> torch.Tensor:
         return torch.sigmoid(self.tail_risk_logits(batch))
+
+    def tail_time_logits(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        return self.denoiser.tail_time_logits(
+            batch["forecast"],
+            forecast_revision=batch.get("forecast_revision"),
+            revision_mask=batch.get("revision_mask"),
+            recent_error=batch.get("recent_error"),
+            recent_error_mask=batch.get("recent_error_mask"),
+            node_state=batch.get("node_state"),
+        )
+
+    def tail_time_probability(
+        self, batch: Mapping[str, torch.Tensor]
+    ) -> torch.Tensor:
+        logits = self.tail_time_logits(batch) / self.denoiser.tail_time_temperature
+        return torch.softmax(logits, dim=-1)
+
+    def tail_time_localization_loss(
+        self, batch: Mapping[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Soft cross entropy on train-labelled physical event windows only."""
+
+        event_active = batch.get("event_active")
+        event_window = batch.get("event_window_mask")
+        if event_active is None or event_window is None:
+            raise ValueError("tail time training requires event replay labels")
+        logits = self.tail_time_logits(batch) / self.denoiser.tail_time_temperature
+        if event_active.shape != (logits.shape[0],) or event_window.shape != logits.shape:
+            raise ValueError("tail time event labels have invalid shapes")
+        target = event_window.to(logits.dtype)
+        target = target / target.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        per_sample = -(target * torch.log_softmax(logits, dim=-1)).sum(dim=-1)
+        active = event_active.to(per_sample.dtype)
+        return (per_sample * active).sum() / active.sum().clamp(min=1.0)
+
+    def sample_tail_time_masks(
+        self,
+        probability: torch.Tensor,
+        tail_route: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample one synchronized wind-event center and tapered mask per member."""
+
+        if probability.ndim != 2:
+            raise ValueError("tail time probability must be [B,L]")
+        if tail_route.ndim != 2 or tail_route.shape[0] != probability.shape[0]:
+            raise ValueError("tail route must be [B,K]")
+        batch, length = probability.shape
+        members = tail_route.shape[1]
+        starts = torch.multinomial(probability, members, replacement=True)
+        lead_index = torch.arange(
+            length, device=probability.device, dtype=probability.dtype
+        )[None, None, :]
+        distance = torch.abs(lead_index - starts.to(probability.dtype)[..., None])
+        radius = float(self.denoiser.tail_time_mask_radius_hours)
+        mask = torch.where(
+            distance <= radius,
+            0.5 * (1.0 + torch.cos(math.pi * distance / (radius + 1.0))),
+            torch.zeros_like(distance),
+        )
+        route = tail_route.to(mask.dtype)
+        mask = mask * route[..., None]
+        starts = torch.where(
+            tail_route.bool(), starts, torch.full_like(starts, -1)
+        )
+        if mask.shape != (batch, members, length):
+            raise RuntimeError("tail time mask construction failed")
+        return starts, mask
 
     def body_tail_epsilon_weight(
         self, batch: Mapping[str, torch.Tensor]
@@ -2749,12 +2985,20 @@ class Station24DiffusionModel(nn.Module):
         correction = self.predict_forecast_correction(batch)
         tail_probability = None
         tail_route = None
+        tail_time_probability = None
+        tail_time_start = None
+        tail_time_mask = None
         if self.use_body_tail_experts:
             tail_probability = self.tail_risk_probability(batch)
             tail_attention = self.tail_condition_attention(batch)
             tail_route = torch.bernoulli(
                 tail_probability[:, None].expand(-1, int(n_samples))
             )
+            if self.use_tail_time_localizer:
+                tail_time_probability = self.tail_time_probability(batch)
+                tail_time_start, tail_time_mask = self.sample_tail_time_masks(
+                    tail_time_probability, tail_route
+                )
         else:
             tail_attention = None
         samples = self.diffusion.sample(
@@ -2770,6 +3014,7 @@ class Station24DiffusionModel(nn.Module):
             recent_error_mask=batch.get("recent_error_mask"),
             node_state=batch.get("node_state"),
             tail_expert_route=tail_route,
+            tail_time_mask=tail_time_mask,
         )
         if not return_expert_audit:
             return samples
@@ -2792,10 +3037,26 @@ class Station24DiffusionModel(nn.Module):
                 device=samples.device,
                 dtype=samples.dtype,
             )
+        if tail_time_probability is None:
+            tail_time_probability = torch.zeros(
+                batch_size,
+                self.denoiser.sequence_length,
+                device=samples.device,
+                dtype=samples.dtype,
+            )
+        if tail_time_start is None:
+            tail_time_start = torch.full(
+                (batch_size, int(n_samples)),
+                -1,
+                device=samples.device,
+                dtype=torch.long,
+            )
         if tail_attention is None:
             raise RuntimeError("tail condition attention audit is unavailable")
         return samples, {
             "tail_probability": tail_probability,
             "tail_route": tail_route,
             "tail_condition_attention": tail_attention,
+            "tail_time_probability": tail_time_probability,
+            "tail_time_start": tail_time_start,
         }

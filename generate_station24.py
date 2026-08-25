@@ -185,6 +185,10 @@ def main() -> None:
         model.use_body_tail_experts
     ):
         raise ValueError("checkpoint body-tail expert mode does not match config")
+    if bool(checkpoint.get("use_tail_time_localizer", False)) != bool(
+        model.use_tail_time_localizer
+    ):
+        raise ValueError("checkpoint tail time localizer mode does not match config")
     state, checkpoint_state_key = select_checkpoint_state(
         checkpoint, args.checkpoint_state
     )
@@ -219,6 +223,8 @@ def main() -> None:
     tail_probabilities = []
     tail_routes = []
     tail_condition_attentions = []
+    tail_time_probabilities = []
+    tail_time_starts = []
     model.reset_parallel_spatial_gate_statistics()
 
     print(
@@ -232,8 +238,10 @@ def main() -> None:
             correction = model.predict_forecast_correction(batch).cpu().numpy()
         chunks = []
         route_chunks = []
+        time_start_chunks = []
         issue_tail_probability = None
         issue_tail_attention = None
+        issue_tail_time_probability = None
         remaining = n_samples
         while remaining > 0:
             current = min(member_chunk_size, remaining)
@@ -248,12 +256,18 @@ def main() -> None:
                     samples, expert_audit = generated
                     chunks.append(samples.cpu())
                     route_chunks.append(expert_audit["tail_route"].cpu())
+                    time_start_chunks.append(
+                        expert_audit["tail_time_start"].cpu()
+                    )
                     if issue_tail_probability is None:
                         issue_tail_probability = expert_audit[
                             "tail_probability"
                         ].cpu()
                         issue_tail_attention = expert_audit[
                             "tail_condition_attention"
+                        ].cpu()
+                        issue_tail_time_probability = expert_audit[
+                            "tail_time_probability"
                         ].cpu()
                 else:
                     chunks.append(generated.cpu())
@@ -286,6 +300,12 @@ def main() -> None:
             tail_probabilities.append(issue_tail_probability.numpy())
             tail_routes.append(torch.cat(route_chunks, dim=1).numpy())
             tail_condition_attentions.append(issue_tail_attention.numpy())
+            if issue_tail_time_probability is None:
+                raise RuntimeError("body-tail generation lacks time distribution")
+            tail_time_probabilities.append(issue_tail_time_probability.numpy())
+            tail_time_starts.append(
+                torch.cat(time_start_chunks, dim=1).numpy()
+            )
         print(f"generated issue batch {batch_index}/{len(loader)}")
 
     standardized_array = np.concatenate(generated_standardized, axis=0)
@@ -313,6 +333,21 @@ def main() -> None:
         if tail_condition_attentions
         else np.zeros((projected_array.shape[0], 6), dtype=np.float32)
     )
+    tail_time_probability_array = (
+        np.concatenate(tail_time_probabilities, axis=0)
+        if tail_time_probabilities
+        else np.zeros(
+            (projected_array.shape[0], projected_array.shape[2]),
+            dtype=np.float32,
+        )
+    )
+    tail_time_start_array = (
+        np.concatenate(tail_time_starts, axis=0).astype(np.int16)
+        if tail_time_starts
+        else np.full(
+            (projected_array.shape[0], n_samples), -1, dtype=np.int16
+        )
+    )
     if projected_array.shape[0] != daylight_mask.shape[0]:
         raise ValueError("daylight mask issue count does not match generated scenarios")
     projected_array = np.where(
@@ -338,6 +373,11 @@ def main() -> None:
     np.save(output_dir / "tail_expert_probability.npy", tail_probability_array)
     np.save(output_dir / "tail_expert_route.npy", tail_route_array)
     np.save(output_dir / "tail_condition_attention.npy", tail_attention_array)
+    np.save(
+        output_dir / "tail_event_time_probability.npy",
+        tail_time_probability_array,
+    )
+    np.save(output_dir / "tail_event_start.npy", tail_time_start_array)
     for level, moments in model.parallel_spatial_adjacency_moments.items():
         safe_level = level.replace("/", "_")
         np.save(
@@ -374,12 +414,16 @@ def main() -> None:
         "checkpoint_validation_mse": float(checkpoint["val_loss"]),
         "checkpoint_validation_objective": float(checkpoint["val_loss"]),
         "checkpoint_validation_objective_type": (
-            "tail_event_epsilon_plus_gate_bce"
-            if model.use_body_tail_experts
+            "tail_event_time_soft_cross_entropy"
+            if model.train_tail_time_localizer_only
             else (
-                "diffusion_epsilon_plus_forecast_correction_huber"
-                if model.forecast_correction_mode != "none"
-                else "diffusion_epsilon_mse"
+                "tail_event_epsilon_plus_gate_bce"
+                if model.use_body_tail_experts
+                else (
+                    "diffusion_epsilon_plus_forecast_correction_huber"
+                    if model.forecast_correction_mode != "none"
+                    else "diffusion_epsilon_mse"
+                )
             )
         ),
         "checkpoint_state_source": args.checkpoint_state,
@@ -428,12 +472,31 @@ def main() -> None:
         "state_gate_values": model.state_gate_values,
         "wind_common_gate_value": model.wind_common_gate_value,
         "use_body_tail_experts": bool(model.use_body_tail_experts),
+        "use_tail_time_localizer": bool(model.use_tail_time_localizer),
+        "tail_time_temperature": float(model.denoiser.tail_time_temperature),
+        "tail_time_mask_radius_hours": int(
+            model.denoiser.tail_time_mask_radius_hours
+        ),
         "tail_gate_loss_weight": float(model.tail_gate_loss_weight),
         "tail_common_gate_value": model.tail_common_gate_value,
         "tail_probability_mean": float(tail_probability_array.mean()),
         "tail_probability_min": float(tail_probability_array.min()),
         "tail_probability_max": float(tail_probability_array.max()),
         "tail_member_fraction": float(tail_route_array.mean()),
+        "tail_time_probability_entropy_mean": float(
+            -np.mean(
+                np.sum(
+                    tail_time_probability_array
+                    * np.log(tail_time_probability_array.clip(min=1e-12)),
+                    axis=1,
+                )
+            )
+        ),
+        "tail_time_routed_start_mean": (
+            float(tail_time_start_array[tail_time_start_array >= 0].mean())
+            if np.any(tail_time_start_array >= 0)
+            else None
+        ),
         "tail_condition_attention_names": [
             "issued_wind_level",
             "issued_wind_down_ramp_3h",

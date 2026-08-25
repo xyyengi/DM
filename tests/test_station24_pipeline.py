@@ -457,6 +457,105 @@ class Station24ModelTests(unittest.TestCase):
             )
         )
 
+    def test_tail_time_localizer_reuses_raw_tail_and_localizes_each_member(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        capacities = torch.linspace(10.0, 100.0, 24)
+        tail_config = self.config("fixed_graph")
+        tail_config.update(
+            {
+                "use_body_tail_experts": True,
+                "tail_expert_channels": 4,
+                "tail_epsilon_context_hours": 2,
+                "tail_gate_channels": 4,
+                "tail_gate_prior_probability": 0.08,
+                "tail_gate_loss_weight": 0.10,
+            }
+        )
+        raw_tail = Station24DiffusionModel(
+            tail_config, features, adjacency, capacities
+        )
+        localized_config = copy.deepcopy(tail_config)
+        localized_config.update(
+            {
+                "use_tail_time_localizer": True,
+                "train_tail_time_localizer_only": True,
+                "tail_time_temperature": 1.0,
+                "tail_time_mask_radius_hours": 3,
+            }
+        )
+        localized = Station24DiffusionModel(
+            localized_config, features, adjacency, capacities
+        )
+        incompatible = localized.load_state_dict(
+            raw_tail.state_dict(), strict=False
+        )
+        self.assertEqual(
+            set(incompatible.missing_keys),
+            set(localized.tail_time_state_dict_keys),
+        )
+        self.assertFalse(incompatible.unexpected_keys)
+
+        trainable = localized.configure_tail_time_training()
+        self.assertEqual(
+            set(trainable), set(localized.tail_time_trainable_parameter_names)
+        )
+        self.assertLess(
+            sum(
+                parameter.numel()
+                for parameter in localized.parameters()
+                if parameter.requires_grad
+            ),
+            1000,
+        )
+        batch = self.batch()
+        batch["event_active"] = torch.tensor([1.0, 0.0])
+        batch["event_window_mask"] = torch.zeros(2, 16)
+        batch["event_window_mask"][0, 5:11] = 1.0
+        loss = localized.tail_time_localization_loss(batch)
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        time_names = set(localized.tail_time_trainable_parameter_names)
+        self.assertTrue(
+            any(
+                parameter.grad is not None and torch.any(parameter.grad != 0)
+                for name, parameter in localized.named_parameters()
+                if name in time_names
+            )
+        )
+        self.assertTrue(
+            all(
+                parameter.grad is None
+                for name, parameter in localized.named_parameters()
+                if name not in time_names
+            )
+        )
+
+        localized.eval()
+        probability = localized.tail_time_probability(batch)
+        self.assertEqual(tuple(probability.shape), (2, 16))
+        self.assertTrue(
+            torch.allclose(probability.sum(dim=1), torch.ones(2), atol=1e-6)
+        )
+        route = torch.tensor([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]])
+        starts, masks = localized.sample_tail_time_masks(probability, route)
+        self.assertEqual(tuple(starts.shape), (2, 3))
+        self.assertEqual(tuple(masks.shape), (2, 3, 16))
+        self.assertTrue(torch.all(starts[~route.bool()] == -1))
+        self.assertTrue(torch.all(masks[~route.bool()] == 0.0))
+        self.assertTrue(torch.all((masks >= 0.0) & (masks <= 1.0)))
+
+        with torch.no_grad():
+            localized.denoiser.tail_risk_output.bias.fill_(10.0)
+        samples, audit = localized.generate(
+            self.batch(batch_size=1), n_samples=4, return_expert_audit=True
+        )
+        self.assertEqual(tuple(samples.shape), (1, 4, 24, 16))
+        self.assertEqual(tuple(audit["tail_time_probability"].shape), (1, 16))
+        self.assertEqual(tuple(audit["tail_time_start"].shape), (1, 4))
+        self.assertTrue(torch.all(audit["tail_time_start"] >= 0))
+
     def test_common_wind_head_and_event_loss_are_lightweight_and_trainable(self):
         from src.models.station_conditioned_diffusion import Station24DiffusionModel
 
