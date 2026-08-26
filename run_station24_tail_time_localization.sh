@@ -14,8 +14,8 @@ RESUME_PIPELINE_ROOT=${RESUME_PIPELINE_ROOT:-${3:-}}
 NSAMPLES=${NSAMPLES:-500}
 GEN_SEED=${GEN_SEED:-424242}
 ENERGY_MEMBERS=${ENERGY_MEMBERS:-80}
-ISSUE_BATCH=${ISSUE_BATCH:-1}
-MEMBER_CHUNK=${MEMBER_CHUNK:-10}
+ISSUE_BATCH=${ISSUE_BATCH:-2}
+MEMBER_CHUNK=${MEMBER_CHUNK:-256}
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -39,7 +39,8 @@ launch_background() {
   pid_file="${LOG_ROOT}/station24_tail_time_localization_${stamp}.pid"
   status_file="${LOG_ROOT}/station24_tail_time_localization_${stamp}.status"
   nohup setsid env \
-    PYTHONUNBUFFERED=1 CUBLAS_WORKSPACE_CONFIG=:4096:8 OMP_NUM_THREADS=1 \
+    PYTHONUNBUFFERED=1 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+    OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
     STATION24_TAIL_TIME_INTERNAL_WORKER=1 JOB_STAMP="${stamp}" \
     LOG_FILE="${log_file}" PID_FILE="${pid_file}" STATUS_FILE="${status_file}" \
     EXPECTED_BRANCH="${EXPECTED_BRANCH}" PYTHON_BIN="${PYTHON_BIN}" \
@@ -227,6 +228,7 @@ if [[ ! -f "${RAW_RESULT}/metrics.json" ]]; then
     --output-dir "${RAW_RESULT}" --split val --n-samples "${NSAMPLES}" \
     --seed "${GEN_SEED}" --issue-batch-size "${ISSUE_BATCH}" \
     --member-chunk-size "${MEMBER_CHUNK}" \
+    --auto-tune-member-chunk \
     --energy-score-member-limit "${ENERGY_MEMBERS}" \
     --checkpoint-state raw \
     --result-variant geo_history_actual_body_tail_time_localized_raw
@@ -241,6 +243,7 @@ if [[ ! -f "${EMA_RESULT}/metrics.json" ]]; then
     --output-dir "${EMA_RESULT}" --split val --n-samples "${NSAMPLES}" \
     --seed "${GEN_SEED}" --issue-batch-size "${ISSUE_BATCH}" \
     --member-chunk-size "${MEMBER_CHUNK}" \
+    --auto-tune-member-chunk \
     --energy-score-member-limit "${ENERGY_MEMBERS}" \
     --checkpoint-state ema \
     --result-variant geo_history_actual_body_tail_time_localized_ema

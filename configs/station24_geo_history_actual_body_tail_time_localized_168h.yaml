@@ -129,13 +129,19 @@ train:
   seed: 2027
   validation_seed: 314159
   num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 2
 
 evaluation:
   split: "val"
   n_samples: 500
   generation_seed: 424242
-  issue_batch_size: 1
-  member_chunk_size: 10
+  issue_batch_size: 2
+  member_chunk_size: 256
+  auto_tune_member_chunk: true
+  member_chunk_candidates: [256, 192, 128, 96, 64, 48, 32]
+  max_generation_memory_fraction: 0.82
+  generation_probe_steps: 8
   energy_score_member_limit: 80
   quantiles: [0.80, 0.90, 0.95, 0.99]
   physical_projection: "clip_0_1_and_station_astronomical_solar_night"

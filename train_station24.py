@@ -6,6 +6,7 @@ import argparse
 import copy
 import json
 import random
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Mapping
@@ -527,6 +528,12 @@ def main() -> None:
         batch_size=int(train_config["batch_size"]),
         seed=seed,
         num_workers=int(train_config.get("num_workers", 0)),
+        persistent_workers=bool(
+            train_config.get(
+                "persistent_workers", int(train_config.get("num_workers", 0)) > 0
+            )
+        ),
+        prefetch_factor=int(train_config.get("prefetch_factor", 2)),
         condition_config=config["model"],
         state_thresholds=state_thresholds,
         event_weighting=event_weighting,
@@ -539,6 +546,12 @@ def main() -> None:
         batch_size=int(train_config["batch_size"]),
         seed=int(train_config.get("validation_seed", 314159)),
         num_workers=int(train_config.get("num_workers", 0)),
+        persistent_workers=bool(
+            train_config.get(
+                "persistent_workers", int(train_config.get("num_workers", 0)) > 0
+            )
+        ),
+        prefetch_factor=int(train_config.get("prefetch_factor", 2)),
         condition_config=config["model"],
         state_thresholds=state_thresholds,
         event_weighting=event_weighting,
@@ -687,7 +700,7 @@ def main() -> None:
         weight_decay=float(train_config["weight_decay"]),
     )
     amp_enabled = bool(train_config.get("mixed_precision", True)) and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled)
     ema_decay = float(train_config.get("ema_decay", 0.999))
     ema_warmup = train_config.get("ema_warmup")
     if ema_warmup is not None and not isinstance(ema_warmup, Mapping):
@@ -744,6 +757,12 @@ def main() -> None:
         f"batch={train_config['batch_size']} accumulation={accumulation} epochs={epochs}"
     )
     print(
+        f"INPUT_PIPELINE workers={train_config.get('num_workers', 0)} "
+        f"persistent_workers={train_config.get('persistent_workers', int(train_config.get('num_workers', 0)) > 0)} "
+        f"prefetch_factor={train_config.get('prefetch_factor', 2)} "
+        f"pin_memory={torch.cuda.is_available()}"
+    )
+    print(
         f"EMA max_decay={ema_decay} warmup={dict(ema_warmup) if ema_warmup else None} "
         f"trainable_state_only={model.use_body_tail_experts}"
     )
@@ -755,6 +774,9 @@ def main() -> None:
     current_ema_decay = ema_decay_for_step(ema_decay, 0, ema_warmup)
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(1, epochs + 1):
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        train_started = time.perf_counter()
         model.train()
         total_loss = 0.0
         total_samples = 0
@@ -764,7 +786,7 @@ def main() -> None:
             batch_size = batch["forecast"].shape[0]
             if event_replay is not None:
                 event_draws += int(batch["event_active"].sum().detach().cpu())
-            with torch.cuda.amp.autocast(enabled=amp_enabled):
+            with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
                 loss = (
                     model.tail_time_localization_loss(batch)
                     if model.train_tail_time_localizer_only
@@ -799,9 +821,15 @@ def main() -> None:
             total_loss += float(loss.detach()) * batch_weight
             total_samples += batch_weight
         train_loss = total_loss / max(total_samples, 1)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        train_seconds = time.perf_counter() - train_started
+        train_samples_per_second = len(train_loader.dataset) / max(train_seconds, 1e-9)
         row: dict[str, float] = {
             "epoch": epoch,
             "train_loss": train_loss,
+            "train_seconds": float(train_seconds),
+            "train_samples_per_second": float(train_samples_per_second),
             "event_replay_draws": float(event_draws),
             "optimizer_updates": float(optimizer_updates),
             "ema_decay": float(current_ema_decay),
@@ -850,6 +878,7 @@ def main() -> None:
                 f"epoch={epoch:04d} train={train_loss:.7f} val={val_loss:.7f} "
                 f"best_epoch={best_epoch} spatial_gates={model.denoiser.spatial_block.gate_values()} "
                 f"event_draws={event_draws} "
+                f"train_s={train_seconds:.2f} samples_s={train_samples_per_second:.2f} "
                 f"condition_gates={model.condition_gate_values}"
                 f" state_gates={model.state_gate_values}"
             )
@@ -860,7 +889,8 @@ def main() -> None:
         else:
             print(
                 f"epoch={epoch:04d} train={train_loss:.7f} "
-                f"event_draws={event_draws}"
+                f"event_draws={event_draws} train_s={train_seconds:.2f} "
+                f"samples_s={train_samples_per_second:.2f}"
             )
         history.append(row)
 

@@ -1440,6 +1440,8 @@ def get_station_dataloader(
     batch_size: int,
     seed: int,
     num_workers: int = 0,
+    persistent_workers: bool = False,
+    prefetch_factor: int = 2,
     condition_config: Mapping[str, object] | None = None,
     state_thresholds: Mapping[str, object] | None = None,
     event_weighting: Mapping[str, object] | None = None,
@@ -1466,15 +1468,21 @@ def get_station_dataloader(
             replacement=True,
             generator=generator,
         )
+    worker_count = int(num_workers)
+    loader_options: dict[str, object] = {}
+    if worker_count > 0:
+        loader_options["persistent_workers"] = bool(persistent_workers)
+        loader_options["prefetch_factor"] = int(prefetch_factor)
     loader = DataLoader(
         dataset,
         batch_size=int(batch_size),
         shuffle=split == "train" and sampler is None,
         sampler=sampler,
-        num_workers=int(num_workers),
+        num_workers=worker_count,
         pin_memory=torch.cuda.is_available(),
         generator=generator,
         worker_init_fn=_seed_worker,
+        **loader_options,
     )
     return loader, dataset
 
