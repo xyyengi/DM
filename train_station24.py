@@ -23,6 +23,7 @@ import matplotlib.pyplot as plt
 from src.models.station_conditioned_diffusion import Station24DiffusionModel
 from station_graph_prior import prepare_training_graphs
 from station_dataset import (
+    fit_station_forecast_mismatch_replay,
     fit_station_event_replay,
     fit_station_event_weighting,
     fit_station_residual_scale,
@@ -34,6 +35,7 @@ from station_dataset import (
     write_station_event_replay,
     write_station_state_thresholds,
 )
+from station_retrieval_memory import build_retrieval_arrays
 
 
 def parse_args() -> argparse.Namespace:
@@ -150,6 +152,47 @@ def build_body_tail_validation_events(
     generation or to the causal risk gate as inputs.
     """
 
+    if event_replay.get("method") == "train_independent_forecast_missed_ramp_replay_v1":
+        window = int(event_replay["event_window_hours"])
+        forecast = batch["forecast"]
+        actual = batch["actual"]
+        valid = batch["valid_mask"]
+        wind_weight = model.denoiser.wind_capacity_weight.to(forecast.dtype)
+        wind_mask = model.denoiser.wind_station_mask.bool()
+        forecast_wind = torch.einsum("s,bst->bt", wind_weight, forecast)
+        actual_wind = torch.einsum("s,bst->bt", wind_weight, actual)
+        complete = valid[:, wind_mask].amin(dim=1) > 0.5
+        score = torch.zeros_like(forecast_wind)
+        fraction = float(event_replay["forecast_magnitude_fraction"])
+        for lag in (int(value) for value in event_replay["ramp_lags"]):
+            actual_ramp = actual_wind[:, lag:] - actual_wind[:, :-lag]
+            forecast_ramp = forecast_wind[:, lag:] - forecast_wind[:, :-lag]
+            threshold = float(
+                event_replay["actual_ramp_abs_q90_thresholds"][str(lag)]
+            )
+            pair_valid = complete[:, lag:] & complete[:, :-lag]
+            missed = pair_valid & (actual_ramp.abs() >= threshold) & (
+                (torch.sign(actual_ramp) != torch.sign(forecast_ramp))
+                | (forecast_ramp.abs() < fraction * actual_ramp.abs())
+            )
+            current = torch.where(
+                missed,
+                (actual_ramp - forecast_ramp).abs() / max(threshold, 1e-6),
+                torch.zeros_like(actual_ramp),
+            )
+            score[:, lag:] = torch.maximum(score[:, lag:], current)
+        severity, center = score.max(dim=1)
+        active = (
+            severity >= float(event_replay["severity_thresholds"][0])
+        ).to(forecast.dtype)
+        start = torch.clamp(center - window // 3, min=0, max=score.shape[1] - window)
+        event_window = torch.zeros_like(score)
+        offsets = torch.arange(window, device=forecast.device)[None]
+        event_window.scatter_(
+            1, start[:, None] + offsets, active[:, None].expand(-1, window)
+        )
+        return active, event_window, severity
+
     window = int(event_replay["event_window_hours"])
     threshold = float(event_replay["severity_thresholds"][0])
     forecast = batch["forecast"]
@@ -199,6 +242,7 @@ def validate(
     tail_event_count = 0
     location_mass_sum = 0.0
     location_offset_sum = 0.0
+    mismatch_time_error_sum = 0.0
     for raw_batch in loader:
         batch = move_batch(raw_batch, device)
         batch_size = batch["forecast"].shape[0]
@@ -268,7 +312,16 @@ def validate(
             total_loss += float(loss) * support_count
             total_weight += support_count
             target = active
-            logits = model.tail_risk_logits(batch)
+            if model.use_retrieval_mismatch_expert:
+                context, _ = model.encode_retrieval_memory(batch)
+                logits = model.mismatch_risk_logits(batch, context)
+                time_probability = model.mismatch_time_probability(batch, context)
+                time_error = F.binary_cross_entropy(
+                    time_probability, event_window, reduction="none"
+                ).mean(dim=1)
+                mismatch_time_error_sum += float(time_error.sum())
+            else:
+                logits = model.tail_risk_logits(batch)
             gate_error_sum += float(
                 F.binary_cross_entropy_with_logits(
                     logits, target, reduction="sum"
@@ -285,7 +338,9 @@ def validate(
             )
             total_loss += float(loss) * batch_size
             total_weight += batch_size
-    if model.train_tail_time_localizer_only:
+    if model.train_retrieval_mismatch_only:
+        ema_trainable_state_names = set(model.retrieval_mismatch_state_dict_keys)
+    elif model.train_tail_time_localizer_only:
         if total_weight <= 0.0:
             raise ValueError("validation split contains no tail localization event")
         objective = total_loss / total_weight
@@ -302,6 +357,19 @@ def validate(
             raise ValueError("validation split contains no train-threshold tail event")
         tail_epsilon = total_loss / total_weight
         gate_bce = gate_error_sum / max(gate_samples, 1)
+        if model.use_retrieval_mismatch_expert:
+            time_bce = mismatch_time_error_sum / max(gate_samples, 1)
+            objective = (
+                tail_epsilon
+                + model.mismatch_gate_loss_weight * gate_bce
+                + model.mismatch_time_loss_weight * time_bce
+            )
+            return objective, {
+                "val_mismatch_epsilon_loss": tail_epsilon,
+                "val_mismatch_gate_bce": gate_bce,
+                "val_mismatch_time_bce": time_bce,
+                "val_mismatch_event_count": float(tail_event_count),
+            }
         objective = tail_epsilon + model.tail_gate_loss_weight * gate_bce
         return objective, {
             "val_tail_epsilon_loss": tail_epsilon,
@@ -374,6 +442,12 @@ def save_checkpoint(
         "train_tail_time_localizer_only": bool(
             model.train_tail_time_localizer_only
         ),
+        "use_retrieval_mismatch_expert": bool(
+            model.use_retrieval_mismatch_expert
+        ),
+        "train_retrieval_mismatch_only": bool(
+            model.train_retrieval_mismatch_only
+        ),
         "tail_gate_loss_weight": float(model.tail_gate_loss_weight),
         "tail_common_gate_value": model.tail_common_gate_value,
         "body_tail_trainable_parameter_names": list(
@@ -381,6 +455,9 @@ def save_checkpoint(
         ),
         "tail_time_trainable_parameter_names": list(
             model.tail_time_trainable_parameter_names
+        ),
+        "retrieval_mismatch_trainable_parameter_names": list(
+            model.retrieval_mismatch_trainable_parameter_names
         ),
         "state_thresholds": (
             copy.deepcopy(dict(state_thresholds))
@@ -513,7 +590,12 @@ def main() -> None:
             raise ValueError(
                 "B1 event replay must not use the A1/A2 forecast correction head"
             )
-        event_replay = fit_station_event_replay(data_path, config["model"])
+        if bool(config["model"].get("use_retrieval_mismatch_expert", False)):
+            event_replay = fit_station_forecast_mismatch_replay(
+                data_path, config["model"]
+            )
+        else:
+            event_replay = fit_station_event_replay(data_path, config["model"])
         write_station_event_replay(
             run_dir / "event_replay.json", event_replay
         )
@@ -521,6 +603,25 @@ def main() -> None:
         yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8"
     )
 
+    train_retrieval = None
+    val_retrieval = None
+    if bool(config["model"].get("use_retrieval_mismatch_expert", False)):
+        retrieval_k = int(config["model"].get("retrieval_top_k", 40))
+        exclusion_days = int(config["model"].get("retrieval_exclusion_days", 6))
+        train_retrieval = build_retrieval_arrays(
+            data_path, "train", retrieval_k, exclusion_days
+        )
+        val_retrieval = build_retrieval_arrays(
+            data_path, "val", retrieval_k, exclusion_days
+        )
+        (run_dir / "retrieval_audit.json").write_text(
+            json.dumps(
+                {"train": train_retrieval.audit, "val": val_retrieval.audit},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     train_loader, train_dataset = get_station_dataloader(
         data_path,
         "train",
@@ -538,6 +639,7 @@ def main() -> None:
         state_thresholds=state_thresholds,
         event_weighting=event_weighting,
         event_replay=event_replay,
+        retrieval_arrays=train_retrieval,
     )
     val_loader, val_dataset = get_station_dataloader(
         data_path,
@@ -556,6 +658,7 @@ def main() -> None:
         state_thresholds=state_thresholds,
         event_weighting=event_weighting,
         event_replay=event_replay,
+        retrieval_arrays=val_retrieval,
     )
     (run_dir / "condition_feature_audit.json").write_text(
         json.dumps(
@@ -589,7 +692,40 @@ def main() -> None:
         initialization = torch.load(
             initialization_path, map_location="cpu", weights_only=False
         )
-        if model.train_tail_time_localizer_only:
+        if model.train_retrieval_mismatch_only:
+            if initialization.get("condition_variant") != (
+                "geo_history_actual_body_tail_moe"
+            ):
+                raise ValueError(
+                    "retrieval mismatch expert must initialize from the Raw "
+                    "geo_history_actual_body_tail_moe checkpoint"
+                )
+            source_state = initialization["model_state_dict"]
+            incompatible = model.load_state_dict(source_state, strict=False)
+            expected_missing = set(model.retrieval_mismatch_state_dict_keys)
+            if set(incompatible.missing_keys) != expected_missing:
+                raise ValueError(
+                    "unexpected retrieval-mismatch initialization gaps: "
+                    f"{sorted(incompatible.missing_keys)}"
+                )
+            if incompatible.unexpected_keys:
+                raise ValueError(
+                    "unexpected retrieval-mismatch initialization keys: "
+                    f"{sorted(incompatible.unexpected_keys)}"
+                )
+            trainable_names = model.configure_retrieval_mismatch_training()
+            initialization_manifest = {
+                "method": "frozen_raw_body_deep_tail_plus_retrieval_mismatch_expert",
+                "checkpoint": str(initialization_path),
+                "checkpoint_state_source": "raw",
+                "source_condition_variant": str(initialization["condition_variant"]),
+                "source_epoch": int(initialization["epoch"]),
+                "body_frozen": True,
+                "deep_tail_frozen": True,
+                "retrieval_top_k": int(config["model"].get("retrieval_top_k", 40)),
+                "trainable_parameter_names": list(trainable_names),
+            }
+        elif model.train_tail_time_localizer_only:
             if initialization.get("condition_variant") != (
                 "geo_history_actual_body_tail_moe"
             ):
@@ -745,6 +881,8 @@ def main() -> None:
         f"body_tail_experts={model.use_body_tail_experts} "
         f"tail_time_localizer={model.use_tail_time_localizer} "
         f"tail_time_only={model.train_tail_time_localizer_only} "
+        f"retrieval_mismatch={model.use_retrieval_mismatch_expert} "
+        f"retrieval_mismatch_only={model.train_retrieval_mismatch_only} "
         f"tail_gate_weight={model.tail_gate_loss_weight} "
         f"tail_common_gate={model.tail_common_gate_value} "
         f"common_gate={model.wind_common_gate_value} "
@@ -973,11 +1111,20 @@ def main() -> None:
         "tail_gate_loss_weight": float(model.tail_gate_loss_weight),
         "tail_common_gate_value": model.tail_common_gate_value,
         "body_tail_initialization": initialization_manifest,
+        "use_retrieval_mismatch_expert": bool(
+            model.use_retrieval_mismatch_expert
+        ),
+        "train_retrieval_mismatch_only": bool(
+            model.train_retrieval_mismatch_only
+        ),
         "body_tail_trainable_parameter_names": list(
             model.body_tail_trainable_parameter_names
         ),
         "tail_time_trainable_parameter_names": list(
             model.tail_time_trainable_parameter_names
+        ),
+        "retrieval_mismatch_trainable_parameter_names": list(
+            model.retrieval_mismatch_trainable_parameter_names
         ),
         "residual_scaling_method": str(
             residual_scale.get("method", "per_station_std")

@@ -910,12 +910,195 @@ def fit_station_event_replay(
     }
 
 
+def fit_station_forecast_mismatch_replay(
+    data_dir: str | Path,
+    condition_config: Mapping[str, object],
+) -> dict[str, object]:
+    """Fit independent, multi-duration forecast-missed wind ramp events.
+
+    Unlike the sustained-low-output replay above, this target is activated when
+    the realised 1/3/6 h aggregate ramp is large but the issued forecast has the
+    wrong sign or less than half its magnitude.  Labels are training targets;
+    they are never exposed to validation/test generation.
+    """
+
+    data_dir = validate_station_data_dir(data_dir)
+    config = dict(condition_config)
+    forecast = np.asarray(
+        np.load(data_dir / "train_forecast.npy", mmap_mode="r"), dtype=np.float64
+    )
+    actual = np.asarray(
+        np.load(data_dir / "train_actual.npy", mmap_mode="r"), dtype=np.float64
+    )
+    valid = np.asarray(np.load(data_dir / "train_fill_mask.npy", mmap_mode="r")) == 0
+    issues = pd.read_csv(data_dir / "train_issue_dates.csv")
+    stations = pd.read_csv(data_dir / "station_order.csv").sort_values(
+        "channel_index"
+    ).reset_index(drop=True)
+    wind_indices = stations.index[stations.data_type.eq("wind")].to_numpy(int)
+    capacity = stations.loc[wind_indices, "capacity_mw"].to_numpy(float)
+    weight = capacity / capacity.sum()
+    actual_wind = np.einsum("nts,s->nt", actual[:, :, wind_indices], weight)
+    forecast_wind = np.einsum("nts,s->nt", forecast[:, :, wind_indices], weight)
+    complete = valid[:, :, wind_indices].all(axis=-1)
+
+    lags = tuple(int(value) for value in config.get("mismatch_ramp_lags", [1, 3, 6]))
+    window = int(config.get("mismatch_event_window_hours", 12))
+    merge_gap = int(config.get("mismatch_merge_gap_hours", 12))
+    quantiles = tuple(
+        float(value) for value in config.get("mismatch_replay_quantiles", [0.80, 0.90])
+    )
+    replay_weights = tuple(
+        float(value) for value in config.get("mismatch_replay_weights", [2.0, 4.0])
+    )
+    magnitude_fraction = float(config.get("mismatch_forecast_magnitude_fraction", 0.5))
+    if not lags or any(lag not in {1, 3, 6, 12} for lag in lags):
+        raise ValueError("mismatch_ramp_lags must be selected from 1/3/6/12 h")
+    if not 3 <= window <= 24 or not 0 <= merge_gap <= 48:
+        raise ValueError("invalid mismatch event window/merge gap")
+    if len(quantiles) != 2 or not 0 < quantiles[0] < quantiles[1] < 1:
+        raise ValueError("mismatch replay requires two increasing quantiles")
+    if len(replay_weights) != 2 or not 1 <= replay_weights[0] <= replay_weights[1] <= 5:
+        raise ValueError("mismatch replay weights must be increasing within [1,5]")
+    if not 0 < magnitude_fraction < 1:
+        raise ValueError("mismatch forecast magnitude fraction must be in (0,1)")
+
+    ramp_thresholds: dict[str, float] = {}
+    event_score = np.zeros_like(actual_wind)
+    event_lag = np.zeros_like(actual_wind, dtype=np.int16)
+    for lag in lags:
+        actual_ramp = actual_wind[:, lag:] - actual_wind[:, :-lag]
+        forecast_ramp = forecast_wind[:, lag:] - forecast_wind[:, :-lag]
+        pair_valid = complete[:, lag:] & complete[:, :-lag]
+        threshold = float(np.quantile(np.abs(actual_ramp[pair_valid]), 0.90))
+        ramp_thresholds[str(lag)] = threshold
+        missed = pair_valid & (np.abs(actual_ramp) >= threshold) & (
+            (np.sign(actual_ramp) != np.sign(forecast_ramp))
+            | (np.abs(forecast_ramp) < magnitude_fraction * np.abs(actual_ramp))
+        )
+        score = np.where(
+            missed,
+            np.abs(actual_ramp - forecast_ramp) / max(threshold, 1e-6),
+            0.0,
+        )
+        replace = score > event_score[:, lag:]
+        event_score[:, lag:] = np.maximum(event_score[:, lag:], score)
+        event_lag[:, lag:] = np.where(replace, lag, event_lag[:, lag:])
+
+    severity = event_score.max(axis=1)
+    center = event_score.argmax(axis=1)
+    positive = severity[severity > 0]
+    if positive.size < 4:
+        raise ValueError("too few training forecast-mismatch events")
+    thresholds = np.quantile(positive, quantiles)
+    target_start_column = "target_start" if "target_start" in issues else "issue_date"
+    target_starts = pd.to_datetime(issues[target_start_column])
+    timestamps = target_starts + pd.to_timedelta(center, unit="h")
+    selected = np.flatnonzero(severity >= thresholds[0])
+    selected = selected[np.argsort(timestamps.iloc[selected].to_numpy())]
+    groups: list[list[int]] = []
+    for sample_index in selected:
+        stamp = pd.Timestamp(timestamps.iloc[int(sample_index)])
+        if not groups:
+            groups.append([int(sample_index)])
+            continue
+        previous = pd.Timestamp(timestamps.iloc[groups[-1][-1]])
+        if stamp - previous <= pd.Timedelta(hours=merge_gap):
+            groups[-1].append(int(sample_index))
+        else:
+            groups.append([int(sample_index)])
+
+    count = len(forecast)
+    active = np.zeros(count, dtype=np.float32)
+    starts = np.zeros(count, dtype=np.int64)
+    tiers = np.zeros(count, dtype=np.int64)
+    sample_weights = np.ones(count, dtype=np.float64)
+    sync_weights = np.zeros((count, EXPECTED_STATIONS), dtype=np.float32)
+    catalog: list[dict[str, object]] = []
+    half_left = window // 3
+    for event_number, members in enumerate(groups, start=1):
+        representative = max(members, key=lambda value: severity[value])
+        event_center = int(center[representative])
+        start = min(max(event_center - half_left, 0), EXPECTED_HOURS - window)
+        lag = int(event_lag[representative, event_center])
+        tier_index = int(severity[representative] >= thresholds[1])
+        tier = int(round(quantiles[tier_index] * 100))
+        station_actual_ramp = (
+            actual[representative, event_center, wind_indices]
+            - actual[representative, event_center - lag, wind_indices]
+        )
+        station_forecast_ramp = (
+            forecast[representative, event_center, wind_indices]
+            - forecast[representative, event_center - lag, wind_indices]
+        )
+        station_mismatch = np.abs(station_actual_ramp - station_forecast_ramp)
+        sync = station_mismatch >= np.quantile(station_mismatch, 0.50)
+        active[representative] = 1.0
+        starts[representative] = start
+        tiers[representative] = tier
+        sample_weights[representative] = replay_weights[tier_index]
+        sync_weights[representative, wind_indices] = sync.astype(np.float32)
+        catalog.append(
+            {
+                "event_id": f"train_mismatch_q{tier}_{event_number:03d}",
+                "tier": tier,
+                "representative_sample_index": int(representative),
+                "representative_issue_date": str(issues.iloc[representative]["issue_date"]),
+                "event_timestamp": pd.Timestamp(timestamps.iloc[representative]).isoformat(),
+                "lead_center": event_center,
+                "lead_start": start,
+                "lead_end": start + window - 1,
+                "ramp_lag_hours": lag,
+                "severity": float(severity[representative]),
+                "member_sample_indices": members,
+                "synchronous_station_count": int(sync.sum()),
+                "replay_weight": float(replay_weights[tier_index]),
+            }
+        )
+    total_weight = float(sample_weights.sum())
+    return {
+        "method": "train_independent_forecast_missed_ramp_replay_v1",
+        "fit_split": "train",
+        "used_for": ["training_sampler", "mismatch_expert", "training_x0_event_loss"],
+        "future_actual_used_as_condition": False,
+        "applied_to_validation_or_generation": False,
+        "ordinary_epsilon_loss_reweighted": False,
+        "event_definition": "large_actual_1_3_6h_ramp_wrong_sign_or_under_half_in_issued_forecast",
+        "event_window_hours": window,
+        "merge_gap_hours": merge_gap,
+        "ramp_lags": list(lags),
+        "actual_ramp_abs_q90_thresholds": ramp_thresholds,
+        "forecast_magnitude_fraction": magnitude_fraction,
+        "quantiles": list(quantiles),
+        "severity_thresholds": [float(value) for value in thresholds],
+        "replay_weights": list(replay_weights),
+        "sample_replay_weights": sample_weights.tolist(),
+        "sample_event_active": active.tolist(),
+        "sample_event_start": starts.tolist(),
+        "sample_event_tier": tiers.tolist(),
+        "sample_sync_station_weight": sync_weights.tolist(),
+        "wind_station_indices": wind_indices.tolist(),
+        "wind_capacity_weights": weight.tolist(),
+        "independent_event_count": int(len(catalog)),
+        "q90_event_count": int(sum(row["tier"] == 90 for row in catalog)),
+        "overlapping_issue_count": int(sum(len(row["member_sample_indices"]) for row in catalog)),
+        "representative_issue_count": int(active.sum()),
+        "expected_event_draws_per_epoch": float(
+            sample_weights[active > 0].sum() / total_weight * count
+        ),
+        "catalog": catalog,
+    }
+
+
 def validate_station_event_replay(
     specification: Mapping[str, object],
     sample_count: int | None = None,
 ) -> dict[str, object]:
     specification = dict(specification)
-    if specification.get("method") != "train_independent_wind_event_replay_x0_v1":
+    if specification.get("method") not in {
+        "train_independent_wind_event_replay_x0_v1",
+        "train_independent_forecast_missed_ramp_replay_v1",
+    }:
         raise ValueError("unsupported event replay method")
     if specification.get("fit_split") != "train":
         raise ValueError("event replay must be fitted on train")
@@ -1094,6 +1277,7 @@ class StationForecastDataset(Dataset):
         state_thresholds: Mapping[str, object] | None = None,
         event_weighting: Mapping[str, object] | None = None,
         event_replay: Mapping[str, object] | None = None,
+        retrieval_arrays: object | None = None,
     ) -> None:
         if split not in {"train", "val", "test"}:
             raise ValueError(f"unsupported split={split!r}")
@@ -1120,6 +1304,16 @@ class StationForecastDataset(Dataset):
             if event_replay is not None and split == "train"
             else None
         )
+        self.retrieval_arrays = retrieval_arrays
+        if retrieval_arrays is not None:
+            expected_queries = len(self.forecast)
+            for name in ("residual", "distance", "prior_weight", "train_index"):
+                value = np.asarray(getattr(retrieval_arrays, name))
+                if value.shape[0] != expected_queries:
+                    raise ValueError(
+                        f"retrieval {name} query count {value.shape[0]} "
+                        f"does not match {split}={expected_queries}"
+                    )
         self.use_state_encoder = bool(
             self.condition_config.get("use_state_encoder", False)
         )
@@ -1193,6 +1387,10 @@ class StationForecastDataset(Dataset):
                 int(event_replay["independent_event_count"])
                 if event_replay is not None and split == "train"
                 else 0
+            ),
+            "historical_retrieval_enabled": retrieval_arrays is not None,
+            "historical_retrieval": (
+                dict(retrieval_arrays.audit) if retrieval_arrays is not None else None
             ),
         }
         self._validate_shapes()
@@ -1358,6 +1556,38 @@ class StationForecastDataset(Dataset):
             "event_sync_station_weight": torch.from_numpy(
                 event_sync_station_weight
             ),
+            "retrieval_residual": torch.from_numpy(
+                np.asarray(
+                    self.retrieval_arrays.residual[index]
+                    if self.retrieval_arrays is not None
+                    else np.zeros((1, EXPECTED_STATIONS, EXPECTED_HOURS)),
+                    dtype=np.float32,
+                ).copy()
+            ),
+            "retrieval_distance": torch.from_numpy(
+                np.asarray(
+                    self.retrieval_arrays.distance[index]
+                    if self.retrieval_arrays is not None
+                    else np.zeros(1),
+                    dtype=np.float32,
+                ).copy()
+            ),
+            "retrieval_prior_weight": torch.from_numpy(
+                np.asarray(
+                    self.retrieval_arrays.prior_weight[index]
+                    if self.retrieval_arrays is not None
+                    else np.ones(1),
+                    dtype=np.float32,
+                ).copy()
+            ),
+            "retrieval_train_index": torch.from_numpy(
+                np.asarray(
+                    self.retrieval_arrays.train_index[index]
+                    if self.retrieval_arrays is not None
+                    else np.full(1, -1),
+                    dtype=np.int64,
+                ).copy()
+            ),
         }
 
 
@@ -1446,6 +1676,7 @@ def get_station_dataloader(
     state_thresholds: Mapping[str, object] | None = None,
     event_weighting: Mapping[str, object] | None = None,
     event_replay: Mapping[str, object] | None = None,
+    retrieval_arrays: object | None = None,
 ) -> tuple[DataLoader, StationForecastDataset]:
     dataset = StationForecastDataset(
         data_dir,
@@ -1455,6 +1686,7 @@ def get_station_dataloader(
         state_thresholds=state_thresholds,
         event_weighting=event_weighting,
         event_replay=event_replay,
+        retrieval_arrays=retrieval_arrays,
     )
     generator = torch.Generator()
     split_offset = {"train": 0, "val": 10_000, "test": 20_000}[split]

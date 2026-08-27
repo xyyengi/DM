@@ -65,6 +65,116 @@ class DiffusionTimestepEmbedding(nn.Module):
         return self.mlp(_sinusoidal_embedding(timestep, self.embedding_dim))
 
 
+class HistoricalRetrievalEncoder(nn.Module):
+    """Turn a Top-K set of train residual trajectories into hourly memory.
+
+    Attention is normalized across historical members independently at every
+    lead hour.  Consequently the representation retains both station and time
+    axes instead of collapsing forty histories into one global average.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        groups: int,
+        wind_capacity_weight: torch.Tensor,
+        wind_station_mask: torch.Tensor,
+    ) -> None:
+        super().__init__()
+        self.channels = int(channels)
+        self.register_buffer(
+            "wind_capacity_weight", wind_capacity_weight.float(), persistent=False
+        )
+        self.register_buffer(
+            "wind_station_mask", wind_station_mask.float(), persistent=False
+        )
+        self.query_encoder = nn.Sequential(
+            nn.Conv1d(4, channels, kernel_size=5, padding=2),
+            nn.GroupNorm(_group_count(channels, groups), channels),
+            nn.SiLU(),
+            nn.Conv1d(channels, channels, kernel_size=3, padding=2, dilation=2),
+        )
+        self.key_encoder = nn.Sequential(
+            nn.Conv1d(3, channels, kernel_size=5, padding=2),
+            nn.GroupNorm(_group_count(channels, groups), channels),
+            nn.SiLU(),
+            nn.Conv1d(channels, channels, kernel_size=3, padding=2, dilation=2),
+        )
+        self.distance_penalty = nn.Parameter(torch.tensor(1.0))
+
+    @staticmethod
+    def _ramps(value: torch.Tensor, lags: tuple[int, ...]) -> list[torch.Tensor]:
+        output = []
+        for lag in lags:
+            ramp = torch.zeros_like(value)
+            ramp[..., lag:] = value[..., lag:] - value[..., :-lag]
+            output.append(ramp)
+        return output
+
+    def forward(
+        self,
+        forecast: torch.Tensor,
+        historical_residual: torch.Tensor,
+        distance: torch.Tensor,
+        prior_weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if forecast.ndim != 3:
+            raise ValueError("retrieval forecast must be [B,S,L]")
+        if historical_residual.ndim != 4:
+            raise ValueError("historical residual must be [B,K,S,L]")
+        batch, members, stations, length = historical_residual.shape
+        if forecast.shape != (batch, stations, length):
+            raise ValueError("retrieval forecast/history axes do not match")
+        if distance.shape != (batch, members) or prior_weight.shape != (
+            batch,
+            members,
+        ):
+            raise ValueError("retrieval distance/prior weight must be [B,K]")
+        weight = self.wind_capacity_weight.to(forecast.dtype)
+        query_level = torch.einsum("s,bst->bt", weight, forecast)
+        query_signal = torch.stack(
+            [query_level, *self._ramps(query_level, (1, 3, 6))], dim=1
+        )
+        query = self.query_encoder(query_signal)
+
+        historical_aggregate = torch.einsum(
+            "s,bkst->bkt", weight, historical_residual
+        )
+        history_signal = torch.stack(
+            [
+                historical_aggregate,
+                *self._ramps(historical_aggregate, (1, 3)),
+            ],
+            dim=2,
+        )
+        key = self.key_encoder(
+            history_signal.reshape(batch * members, 3, length)
+        ).reshape(batch, members, self.channels, length)
+        logits = torch.einsum("bct,bkct->bkt", query, key) / math.sqrt(
+            self.channels
+        )
+        logits = logits + torch.log(prior_weight.clamp(min=1e-8))[:, :, None]
+        logits = logits - F.softplus(self.distance_penalty) * distance[:, :, None]
+        attention = torch.softmax(logits, dim=1)
+        prototype = torch.einsum(
+            "bkt,bkst->bst", attention, historical_residual
+        )
+        dispersion = torch.sqrt(
+            torch.einsum(
+                "bkt,bkst->bst",
+                attention,
+                (historical_residual - prototype[:, None]) ** 2,
+            ).clamp(min=1e-8)
+        )
+        entropy = -torch.sum(
+            attention * torch.log(attention.clamp(min=1e-8)), dim=1
+        ) / max(math.log(max(members, 2)), 1e-6)
+        confidence = (1.0 - entropy)[:, None, :].expand(-1, stations, -1)
+        context = torch.stack([prototype, dispersion, confidence], dim=2)
+        context = context * self.wind_station_mask[None, :, None, None]
+        return context, attention
+
+
 def _normalize_adjacency(adjacency: torch.Tensor) -> torch.Tensor:
     adjacency = adjacency.float()
     degree = adjacency.sum(dim=1).clamp(min=1e-8)
@@ -1453,6 +1563,18 @@ class StationConditionalResUNet1D(nn.Module):
             wind_capacity / wind_capacity.sum(),
             persistent=False,
         )
+        self.use_retrieval_mismatch_expert = bool(
+            config.get("use_retrieval_mismatch_expert", False)
+        )
+        self.retrieval_memory_encoder: HistoricalRetrievalEncoder | None = None
+        self.mismatch_station_adapter: nn.Module | None = None
+        self.mismatch_common_adapter: nn.Module | None = None
+        self.mismatch_common_gate: nn.Parameter | None = None
+        self.mismatch_risk_encoder: nn.Module | None = None
+        self.mismatch_risk_output: nn.Linear | None = None
+        self.mismatch_time_output: nn.Module | None = None
+        if self.use_retrieval_mismatch_expert and not self.use_body_tail_experts:
+            raise ValueError("retrieval mismatch expert requires inherited body-tail experts")
         if self.use_body_tail_experts:
             tail_channels = int(config.get("tail_expert_channels", 16))
             gate_channels = int(config.get("tail_gate_channels", 16))
@@ -1546,6 +1668,78 @@ class StationConditionalResUNet1D(nn.Module):
                 # the inherited body, tail adapters, and global gate are exact.
                 nn.init.zeros_(self.tail_time_output[-1].weight)
                 nn.init.zeros_(self.tail_time_output[-1].bias)
+        if self.use_retrieval_mismatch_expert:
+            retrieval_channels = int(config.get("retrieval_encoder_channels", 32))
+            mismatch_channels = int(config.get("mismatch_expert_channels", 16))
+            mismatch_gate_channels = int(config.get("mismatch_gate_channels", 16))
+            mismatch_prior = float(config.get("mismatch_gate_prior_probability", 0.08))
+            if min(retrieval_channels, mismatch_channels, mismatch_gate_channels) <= 0:
+                raise ValueError("retrieval/mismatch channels must be positive")
+            if not 0.0 < mismatch_prior < 1.0:
+                raise ValueError("mismatch gate prior must be in (0,1)")
+            self.retrieval_memory_encoder = HistoricalRetrievalEncoder(
+                retrieval_channels,
+                groups,
+                self.wind_capacity_weight,
+                self.wind_station_mask,
+            )
+            adapter_input = self.channels[0] + 3
+            self.mismatch_station_adapter = nn.Sequential(
+                nn.Conv1d(adapter_input, mismatch_channels, kernel_size=3, padding=1),
+                nn.GroupNorm(_group_count(mismatch_channels, groups), mismatch_channels),
+                nn.SiLU(),
+                nn.Conv1d(
+                    mismatch_channels,
+                    mismatch_channels,
+                    kernel_size=3,
+                    padding=3,
+                    dilation=3,
+                ),
+                nn.GroupNorm(_group_count(mismatch_channels, groups), mismatch_channels),
+                nn.SiLU(),
+                nn.Conv1d(mismatch_channels, 1, kernel_size=1),
+            )
+            self.mismatch_common_adapter = nn.Sequential(
+                nn.Conv1d(adapter_input, mismatch_channels, kernel_size=3, padding=1),
+                nn.GroupNorm(_group_count(mismatch_channels, groups), mismatch_channels),
+                nn.SiLU(),
+                nn.Conv1d(mismatch_channels, 1, kernel_size=1),
+            )
+            nn.init.zeros_(self.mismatch_station_adapter[-1].weight)
+            nn.init.zeros_(self.mismatch_station_adapter[-1].bias)
+            nn.init.zeros_(self.mismatch_common_adapter[-1].weight)
+            nn.init.zeros_(self.mismatch_common_adapter[-1].bias)
+            self.mismatch_common_gate = nn.Parameter(
+                torch.tensor(float(config.get("mismatch_common_gate_init", -1.0)))
+            )
+            # Issuance routing and hourly activation share a causal representation
+            # derived from forecast + retrieved train histories.
+            self.mismatch_risk_encoder = nn.Sequential(
+                nn.Conv1d(4, mismatch_gate_channels, kernel_size=5, padding=2),
+                nn.GroupNorm(
+                    _group_count(mismatch_gate_channels, groups), mismatch_gate_channels
+                ),
+                nn.SiLU(),
+                nn.Conv1d(
+                    mismatch_gate_channels,
+                    mismatch_gate_channels,
+                    kernel_size=3,
+                    padding=2,
+                    dilation=2,
+                ),
+                nn.SiLU(),
+            )
+            self.mismatch_risk_output = nn.Linear(2 * mismatch_gate_channels, 1)
+            nn.init.zeros_(self.mismatch_risk_output.weight)
+            nn.init.constant_(
+                self.mismatch_risk_output.bias,
+                math.log(mismatch_prior / (1.0 - mismatch_prior)),
+            )
+            self.mismatch_time_output = nn.Conv1d(
+                mismatch_gate_channels, 1, kernel_size=1
+            )
+            nn.init.zeros_(self.mismatch_time_output.weight)
+            nn.init.constant_(self.mismatch_time_output.bias, -2.0)
         self.wind_common_head = None
         self.wind_common_gate = None
         if self.use_wind_common_residual_head:
@@ -1597,6 +1791,9 @@ class StationConditionalResUNet1D(nn.Module):
         forecast_condition_strength: torch.Tensor | float | None = None,
         tail_expert_route: torch.Tensor | float | None = None,
         tail_time_mask: torch.Tensor | None = None,
+        retrieval_context: torch.Tensor | None = None,
+        mismatch_expert_route: torch.Tensor | float | None = None,
+        mismatch_time_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if noisy_residual.shape[1:] != (self.station_count, self.sequence_length):
             raise ValueError(
@@ -1788,7 +1985,126 @@ class StationConditionalResUNet1D(nn.Module):
                     raise ValueError("tail_time_mask must be in [0,1]")
                 localized_route = route * localized_route
             output = output + localized_route * tail_delta
+        if self.use_retrieval_mismatch_expert:
+            if retrieval_context is None or retrieval_context.shape != (
+                batch,
+                stations,
+                3,
+                length,
+            ):
+                raise ValueError("retrieval_context must be [B,S,3,L]")
+            if mismatch_expert_route is None:
+                mismatch_route = torch.zeros(
+                    batch, 1, 1, device=output.device, dtype=output.dtype
+                )
+            elif isinstance(mismatch_expert_route, (int, float)):
+                mismatch_route = torch.full(
+                    (batch, 1, 1),
+                    float(mismatch_expert_route),
+                    device=output.device,
+                    dtype=output.dtype,
+                )
+            else:
+                mismatch_route = mismatch_expert_route.to(
+                    device=output.device, dtype=output.dtype
+                )
+                if mismatch_route.ndim == 1:
+                    mismatch_route = mismatch_route[:, None, None]
+            if mismatch_route.shape != (batch, 1, 1):
+                raise ValueError("mismatch_expert_route must be scalar, [B], or [B,1,1]")
+            if (
+                self.mismatch_station_adapter is None
+                or self.mismatch_common_adapter is None
+                or self.mismatch_common_gate is None
+            ):
+                raise RuntimeError("mismatch adapters were not initialized")
+            context_flat = retrieval_context.reshape(batch * stations, 3, length)
+            mismatch_input = torch.cat([flattened, context_flat], dim=1)
+            station_delta = self.mismatch_station_adapter(mismatch_input).reshape(
+                batch, stations, length
+            )
+            pooled_hidden = torch.einsum(
+                "s,bsct->bct", self.wind_capacity_weight, hidden
+            )
+            pooled_context = torch.einsum(
+                "s,bsct->bct", self.wind_capacity_weight, retrieval_context
+            )
+            common_delta = self.mismatch_common_adapter(
+                torch.cat([pooled_hidden, pooled_context], dim=1)
+            )
+            if mismatch_time_gate is None:
+                hourly_gate = self.mismatch_time_probability(
+                    forecast, retrieval_context
+                )
+            else:
+                hourly_gate = mismatch_time_gate.to(
+                    device=output.device, dtype=output.dtype
+                )
+                if hourly_gate.shape != (batch, length):
+                    raise ValueError("mismatch_time_gate must be [B,L]")
+            hourly_gate = hourly_gate[:, None, :]
+            mismatch_delta = station_delta + (
+                torch.sigmoid(self.mismatch_common_gate) * common_delta
+            )
+            mismatch_delta = mismatch_delta * self.wind_station_mask[None, :, None]
+            output = output + mismatch_route * hourly_gate * mismatch_delta
         return output
+
+    def encode_retrieval_memory(
+        self,
+        forecast: torch.Tensor,
+        historical_residual: torch.Tensor,
+        distance: torch.Tensor,
+        prior_weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.retrieval_memory_encoder is None:
+            raise RuntimeError("retrieval memory encoder is disabled")
+        return self.retrieval_memory_encoder(
+            forecast, historical_residual, distance, prior_weight
+        )
+
+    def _mismatch_features(
+        self, forecast: torch.Tensor, retrieval_context: torch.Tensor
+    ) -> torch.Tensor:
+        if self.mismatch_risk_encoder is None:
+            raise RuntimeError("mismatch risk encoder is disabled")
+        weight = self.wind_capacity_weight.to(forecast.dtype)
+        forecast_wind = torch.einsum("s,bst->bt", weight, forecast)
+        prototype = torch.einsum(
+            "s,bst->bt", weight, retrieval_context[:, :, 0]
+        )
+        dispersion = torch.einsum(
+            "s,bst->bt", weight, retrieval_context[:, :, 1]
+        )
+        confidence = torch.einsum(
+            "s,bst->bt", weight, retrieval_context[:, :, 2]
+        )
+        return self.mismatch_risk_encoder(
+            torch.stack([forecast_wind, prototype, dispersion, confidence], dim=1)
+        )
+
+    def mismatch_risk_logits(
+        self, forecast: torch.Tensor, retrieval_context: torch.Tensor
+    ) -> torch.Tensor:
+        if self.mismatch_risk_output is None:
+            raise RuntimeError("mismatch risk output is disabled")
+        encoded = self._mismatch_features(forecast, retrieval_context)
+        pooled = torch.cat([encoded.mean(dim=-1), encoded.amax(dim=-1)], dim=1)
+        return self.mismatch_risk_output(pooled)[:, 0]
+
+    def mismatch_time_logits(
+        self, forecast: torch.Tensor, retrieval_context: torch.Tensor
+    ) -> torch.Tensor:
+        if self.mismatch_time_output is None:
+            raise RuntimeError("mismatch time output is disabled")
+        return self.mismatch_time_output(
+            self._mismatch_features(forecast, retrieval_context)
+        )[:, 0]
+
+    def mismatch_time_probability(
+        self, forecast: torch.Tensor, retrieval_context: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.sigmoid(self.mismatch_time_logits(forecast, retrieval_context))
 
     def _tail_risk_features(
         self,
@@ -1933,6 +2249,22 @@ class StationConditionalResUNet1D(nn.Module):
             if name.startswith("tail_time_output.")
         )
 
+    def retrieval_mismatch_parameter_names(self) -> tuple[str, ...]:
+        if not self.use_retrieval_mismatch_expert:
+            return ()
+        prefixes = (
+            "retrieval_memory_encoder.",
+            "mismatch_station_adapter.",
+            "mismatch_common_adapter.",
+            "mismatch_common_gate",
+            "mismatch_risk_encoder.",
+            "mismatch_risk_output.",
+            "mismatch_time_output.",
+        )
+        return tuple(
+            name for name, _ in self.named_parameters() if name.startswith(prefixes)
+        )
+
     def forecast_condition_dropout_statistics(self) -> dict[str, float | int]:
         total = int(self._forecast_condition_sample_count.detach().cpu())
         dropped = int(self._forecast_condition_drop_count.detach().cpu())
@@ -2056,6 +2388,9 @@ class StationGaussianDiffusion(nn.Module):
         forecast_condition_strength: torch.Tensor | float | None = None,
         tail_expert_route: torch.Tensor | float | None = None,
         tail_time_mask: torch.Tensor | None = None,
+        retrieval_context: torch.Tensor | None = None,
+        mismatch_expert_route: torch.Tensor | float | None = None,
+        mismatch_time_gate: torch.Tensor | None = None,
         epsilon_sample_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if timestep is None:
@@ -2078,6 +2413,9 @@ class StationGaussianDiffusion(nn.Module):
             forecast_condition_strength=forecast_condition_strength,
             tail_expert_route=tail_expert_route,
             tail_time_mask=tail_time_mask,
+            retrieval_context=retrieval_context,
+            mismatch_expert_route=mismatch_expert_route,
+            mismatch_time_gate=mismatch_time_gate,
         )
         squared_error = (prediction - noise) ** 2
         valid_mask = valid_mask.to(squared_error.dtype)
@@ -2320,6 +2658,9 @@ class StationGaussianDiffusion(nn.Module):
         forecast_guidance_scale: float = 1.0,
         tail_expert_route: torch.Tensor | float | None = None,
         tail_time_mask: torch.Tensor | None = None,
+        retrieval_context: torch.Tensor | None = None,
+        mismatch_expert_route: torch.Tensor | float | None = None,
+        mismatch_time_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
         forecast_guidance_scale = float(forecast_guidance_scale)
         if not 0.0 <= forecast_guidance_scale <= 1.0:
@@ -2331,6 +2672,8 @@ class StationGaussianDiffusion(nn.Module):
             recent_error=recent_error,
             recent_error_mask=recent_error_mask,
             node_state=node_state,
+            retrieval_context=retrieval_context,
+            mismatch_time_gate=mismatch_time_gate,
         )
         predicted_conditional = self.denoiser(
             noisy,
@@ -2341,6 +2684,7 @@ class StationGaussianDiffusion(nn.Module):
             forecast_condition_strength=1.0,
             tail_expert_route=tail_expert_route,
             tail_time_mask=tail_time_mask,
+            mismatch_expert_route=mismatch_expert_route,
             **denoiser_kwargs,
         )
         if forecast_guidance_scale == 1.0:
@@ -2355,6 +2699,7 @@ class StationGaussianDiffusion(nn.Module):
                 forecast_condition_strength=0.0,
                 tail_expert_route=tail_expert_route,
                 tail_time_mask=tail_time_mask,
+                mismatch_expert_route=mismatch_expert_route,
                 **denoiser_kwargs,
             )
             predicted_noise = predicted_neutral + forecast_guidance_scale * (
@@ -2385,6 +2730,9 @@ class StationGaussianDiffusion(nn.Module):
         forecast_guidance_scale: float = 1.0,
         tail_expert_route: torch.Tensor | None = None,
         tail_time_mask: torch.Tensor | None = None,
+        retrieval_context: torch.Tensor | None = None,
+        mismatch_expert_route: torch.Tensor | None = None,
+        mismatch_time_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, stations, length = forecast.shape
         n_samples = int(n_samples)
@@ -2398,6 +2746,8 @@ class StationGaussianDiffusion(nn.Module):
             "recent_error": recent_error,
             "recent_error_mask": recent_error_mask,
             "node_state": node_state,
+            "retrieval_context": retrieval_context,
+            "mismatch_time_gate": mismatch_time_gate,
         }
         optional_conditions = {
             name: (
@@ -2417,6 +2767,18 @@ class StationGaussianDiffusion(nn.Module):
                 )
         else:
             route = None
+        if mismatch_expert_route is not None:
+            mismatch_route = mismatch_expert_route.to(
+                device=forecast.device, dtype=forecast.dtype
+            )
+            if mismatch_route.shape == (batch, n_samples):
+                mismatch_route = mismatch_route.reshape(batch * n_samples)
+            elif mismatch_route.shape != (batch * n_samples,):
+                raise ValueError(
+                    "mismatch_expert_route must be [B,K] or [B*K] during sampling"
+                )
+        else:
+            mismatch_route = None
         if tail_time_mask is not None:
             time_mask = tail_time_mask.to(
                 device=forecast.device, dtype=forecast.dtype
@@ -2448,6 +2810,7 @@ class StationGaussianDiffusion(nn.Module):
                 forecast_guidance_scale=forecast_guidance_scale,
                 tail_expert_route=route,
                 tail_time_mask=time_mask,
+                mismatch_expert_route=mismatch_route,
                 **optional_conditions,
             )
         return noisy.reshape(batch, n_samples, stations, length)
@@ -2477,6 +2840,26 @@ class Station24DiffusionModel(nn.Module):
         self.train_tail_time_localizer_only = bool(
             self.config.get("train_tail_time_localizer_only", False)
         )
+        self.use_retrieval_mismatch_expert = bool(
+            self.config.get("use_retrieval_mismatch_expert", False)
+        )
+        self.train_retrieval_mismatch_only = bool(
+            self.config.get("train_retrieval_mismatch_only", False)
+        )
+        if self.train_retrieval_mismatch_only and not self.use_retrieval_mismatch_expert:
+            raise ValueError(
+                "train_retrieval_mismatch_only requires retrieval mismatch expert"
+            )
+        self.mismatch_gate_loss_weight = float(
+            self.config.get("mismatch_gate_loss_weight", 0.0)
+        )
+        self.mismatch_time_loss_weight = float(
+            self.config.get("mismatch_time_loss_weight", 0.0)
+        )
+        if self.use_retrieval_mismatch_expert and min(
+            self.mismatch_gate_loss_weight, self.mismatch_time_loss_weight
+        ) <= 0:
+            raise ValueError("retrieval mismatch gate/time loss weights must be positive")
         if self.train_tail_time_localizer_only and not self.use_tail_time_localizer:
             raise ValueError(
                 "train_tail_time_localizer_only requires use_tail_time_localizer"
@@ -2697,6 +3080,22 @@ class Station24DiffusionModel(nn.Module):
         )
 
     @property
+    def retrieval_mismatch_trainable_parameter_names(self) -> tuple[str, ...]:
+        return tuple(
+            f"denoiser.{name}"
+            for name in self.denoiser.retrieval_mismatch_parameter_names()
+        )
+
+    @property
+    def retrieval_mismatch_state_dict_keys(self) -> tuple[str, ...]:
+        suffixes = self.denoiser.retrieval_mismatch_parameter_names()
+        return tuple(
+            f"{prefix}{suffix}"
+            for prefix in ("denoiser.", "diffusion.denoiser.")
+            for suffix in suffixes
+        )
+
+    @property
     def tail_common_gate_value(self) -> float | None:
         gate = self.denoiser.tail_common_gate
         if gate is None:
@@ -2732,6 +3131,45 @@ class Station24DiffusionModel(nn.Module):
         if actual != allowed:
             raise RuntimeError("tail time parameter isolation failed")
         return tuple(sorted(actual))
+
+    def configure_retrieval_mismatch_training(self) -> tuple[str, ...]:
+        """Freeze inherited body/deep-tail paths and train retrieval mismatch only."""
+
+        if not self.use_retrieval_mismatch_expert:
+            raise RuntimeError("retrieval mismatch expert is disabled")
+        allowed = set(self.retrieval_mismatch_trainable_parameter_names)
+        if not allowed:
+            raise RuntimeError("retrieval mismatch expert has no trainable parameters")
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad_(name in allowed)
+        actual = {name for name, value in self.named_parameters() if value.requires_grad}
+        if actual != allowed:
+            raise RuntimeError("retrieval mismatch parameter isolation failed")
+        return tuple(sorted(actual))
+
+    def encode_retrieval_memory(
+        self, batch: Mapping[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.denoiser.encode_retrieval_memory(
+            batch["forecast"],
+            batch["retrieval_residual"],
+            batch["retrieval_distance"],
+            batch["retrieval_prior_weight"],
+        )
+
+    def mismatch_risk_logits(
+        self, batch: Mapping[str, torch.Tensor], context: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if context is None:
+            context, _ = self.encode_retrieval_memory(batch)
+        return self.denoiser.mismatch_risk_logits(batch["forecast"], context)
+
+    def mismatch_time_probability(
+        self, batch: Mapping[str, torch.Tensor], context: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if context is None:
+            context, _ = self.encode_retrieval_memory(batch)
+        return self.denoiser.mismatch_time_probability(batch["forecast"], context)
 
     def tail_risk_logits(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
         logits = self.denoiser.tail_risk_logits(
@@ -2906,8 +3344,22 @@ class Station24DiffusionModel(nn.Module):
             clean = clean - detached / scale
             condition_forecast = condition_forecast + detached
         tail_route: torch.Tensor | float | None = None
+        mismatch_route: torch.Tensor | float | None = None
+        retrieval_context: torch.Tensor | None = None
+        mismatch_time_gate: torch.Tensor | None = None
         epsilon_sample_weight: torch.Tensor | None = None
-        if self.use_body_tail_experts:
+        if self.use_retrieval_mismatch_expert:
+            retrieval_context, _ = self.encode_retrieval_memory(batch)
+            mismatch_time_gate = self.mismatch_time_probability(
+                batch, retrieval_context
+            )
+            # The inherited deep-tail path stays frozen and inactive while the
+            # new expert learns only forecast-missed events.
+            tail_route = 0.0
+            mismatch_route = 1.0
+            if include_auxiliary or body_tail_event_masking:
+                epsilon_sample_weight = self.body_tail_epsilon_weight(batch)
+        elif self.use_body_tail_experts:
             # Training isolates tail gradients to replayed physical events.  The
             # fixed-noise validation pass evaluates the complete tail denoiser on
             # natural validation data, preventing an unconstrained event adapter.
@@ -2940,9 +3392,48 @@ class Station24DiffusionModel(nn.Module):
             include_auxiliary=include_auxiliary,
             forecast_condition_strength=forecast_condition_strength,
             tail_expert_route=tail_route,
+            retrieval_context=retrieval_context,
+            mismatch_expert_route=mismatch_route,
+            mismatch_time_gate=mismatch_time_gate,
             epsilon_sample_weight=epsilon_sample_weight,
         )
-        if self.use_body_tail_experts and include_auxiliary:
+        if self.use_retrieval_mismatch_expert and include_auxiliary:
+            target = batch["event_active"].to(diffusion_loss.dtype)
+            replay_weight = batch.get("event_replay_weight")
+            if replay_weight is None or replay_weight.shape != target.shape:
+                raise ValueError("mismatch expert requires event replay weights")
+            importance = replay_weight.to(diffusion_loss.dtype).reciprocal()
+            gate_error = F.binary_cross_entropy_with_logits(
+                self.mismatch_risk_logits(batch, retrieval_context),
+                target,
+                reduction="none",
+            )
+            gate_loss = (gate_error * importance).sum() / importance.sum().clamp(
+                min=1.0
+            )
+            target_time = batch["event_window_mask"].to(diffusion_loss.dtype)
+            time_error = F.binary_cross_entropy(
+                mismatch_time_gate,
+                target_time,
+                reduction="none",
+            )
+            active = target[:, None]
+            # Negatives teach the head to stay quiet; positives receive equal
+            # total mass despite their shorter event windows.
+            time_weight = torch.where(
+                active > 0,
+                1.0 + 4.0 * target_time,
+                torch.ones_like(target_time),
+            )
+            time_loss = (time_error * time_weight * importance[:, None]).sum() / (
+                time_weight * importance[:, None]
+            ).sum().clamp(min=1.0)
+            diffusion_loss = (
+                diffusion_loss
+                + self.mismatch_gate_loss_weight * gate_loss
+                + self.mismatch_time_loss_weight * time_loss
+            )
+        elif self.use_body_tail_experts and include_auxiliary:
             target = batch["event_active"].to(diffusion_loss.dtype)
             logits = self.tail_risk_logits(batch)
             replay_weight = batch.get("event_replay_weight")
@@ -2988,12 +3479,40 @@ class Station24DiffusionModel(nn.Module):
         tail_time_probability = None
         tail_time_start = None
         tail_time_mask = None
+        retrieval_context = None
+        retrieval_attention = None
+        mismatch_probability = None
+        mismatch_route = None
+        mismatch_time_probability = None
         if self.use_body_tail_experts:
             tail_probability = self.tail_risk_probability(batch)
             tail_attention = self.tail_condition_attention(batch)
-            tail_route = torch.bernoulli(
-                tail_probability[:, None].expand(-1, int(n_samples))
-            )
+            if self.use_retrieval_mismatch_expert:
+                retrieval_context, retrieval_attention = self.encode_retrieval_memory(
+                    batch
+                )
+                mismatch_logits = self.mismatch_risk_logits(batch, retrieval_context)
+                deep_logits = torch.logit(tail_probability.clamp(1e-6, 1 - 1e-6))
+                route_probability = torch.softmax(
+                    torch.stack(
+                        [torch.zeros_like(deep_logits), deep_logits, mismatch_logits],
+                        dim=1,
+                    ),
+                    dim=1,
+                )
+                sampled_route = torch.multinomial(
+                    route_probability, int(n_samples), replacement=True
+                )
+                tail_route = (sampled_route == 1).to(batch["forecast"].dtype)
+                mismatch_route = (sampled_route == 2).to(batch["forecast"].dtype)
+                mismatch_probability = route_probability[:, 2]
+                mismatch_time_probability = self.mismatch_time_probability(
+                    batch, retrieval_context
+                )
+            else:
+                tail_route = torch.bernoulli(
+                    tail_probability[:, None].expand(-1, int(n_samples))
+                )
             if self.use_tail_time_localizer:
                 tail_time_probability = self.tail_time_probability(batch)
                 tail_time_start, tail_time_mask = self.sample_tail_time_masks(
@@ -3015,6 +3534,9 @@ class Station24DiffusionModel(nn.Module):
             node_state=batch.get("node_state"),
             tail_expert_route=tail_route,
             tail_time_mask=tail_time_mask,
+            retrieval_context=retrieval_context,
+            mismatch_expert_route=mismatch_route,
+            mismatch_time_gate=mismatch_time_probability,
         )
         if not return_expert_audit:
             return samples
@@ -3053,10 +3575,40 @@ class Station24DiffusionModel(nn.Module):
             )
         if tail_attention is None:
             raise RuntimeError("tail condition attention audit is unavailable")
+        if mismatch_probability is None:
+            mismatch_probability = torch.zeros(
+                batch_size, device=samples.device, dtype=samples.dtype
+            )
+        if mismatch_route is None:
+            mismatch_route = torch.zeros(
+                batch_size,
+                int(n_samples),
+                device=samples.device,
+                dtype=samples.dtype,
+            )
+        if mismatch_time_probability is None:
+            mismatch_time_probability = torch.zeros(
+                batch_size,
+                self.denoiser.sequence_length,
+                device=samples.device,
+                dtype=samples.dtype,
+            )
+        if retrieval_attention is None:
+            retrieval_attention = torch.zeros(
+                batch_size,
+                1,
+                self.denoiser.sequence_length,
+                device=samples.device,
+                dtype=samples.dtype,
+            )
         return samples, {
             "tail_probability": tail_probability,
             "tail_route": tail_route,
             "tail_condition_attention": tail_attention,
             "tail_time_probability": tail_time_probability,
             "tail_time_start": tail_time_start,
+            "mismatch_probability": mismatch_probability,
+            "mismatch_route": mismatch_route,
+            "mismatch_time_probability": mismatch_time_probability,
+            "retrieval_attention": retrieval_attention,
         }

@@ -556,6 +556,79 @@ class Station24ModelTests(unittest.TestCase):
         self.assertEqual(tuple(audit["tail_time_start"].shape), (1, 4))
         self.assertTrue(torch.all(audit["tail_time_start"] >= 0))
 
+    def test_retrieval_dual_tail_preserves_inherited_paths_and_routes_members(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        body_config = self.config("fixed_graph")
+        body_config.update(
+            {
+                "use_body_tail_experts": True,
+                "tail_expert_channels": 4,
+                "tail_gate_channels": 4,
+                "tail_gate_loss_weight": 0.1,
+                "tail_gate_prior_probability": 0.1,
+            }
+        )
+        body = Station24DiffusionModel(body_config, features, adjacency)
+        retrieval_config = copy.deepcopy(body_config)
+        retrieval_config.update(
+            {
+                "use_retrieval_mismatch_expert": True,
+                "train_retrieval_mismatch_only": True,
+                "retrieval_encoder_channels": 4,
+                "mismatch_expert_channels": 4,
+                "mismatch_gate_channels": 4,
+                "mismatch_gate_loss_weight": 0.1,
+                "mismatch_time_loss_weight": 0.05,
+            }
+        )
+        candidate = Station24DiffusionModel(retrieval_config, features, adjacency)
+        incompatible = candidate.load_state_dict(body.state_dict(), strict=False)
+        self.assertEqual(
+            set(incompatible.missing_keys),
+            set(candidate.retrieval_mismatch_state_dict_keys),
+        )
+        self.assertFalse(incompatible.unexpected_keys)
+        trainable = candidate.configure_retrieval_mismatch_training()
+        self.assertEqual(
+            set(trainable), set(candidate.retrieval_mismatch_trainable_parameter_names)
+        )
+        self.assertTrue(all("retrieval" in name or "mismatch" in name for name in trainable))
+
+        batch = self.batch()
+        batch["retrieval_residual"] = torch.randn(2, 4, 24, 16) * 0.1
+        batch["retrieval_distance"] = torch.rand(2, 4)
+        batch["retrieval_prior_weight"] = torch.softmax(torch.randn(2, 4), dim=1)
+        batch["event_active"] = torch.ones(2)
+        batch["event_replay_weight"] = torch.full((2,), 2.0)
+        batch["event_window_mask"] = torch.zeros(2, 16)
+        batch["event_window_mask"][:, 4:10] = 1.0
+        batch["event_start"] = torch.full((2,), 4, dtype=torch.long)
+        batch["event_sync_station_weight"] = torch.zeros(2, 24)
+        batch["event_sync_station_weight"][:, :13] = 1.0
+        loss = candidate(batch)
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        for name, parameter in candidate.named_parameters():
+            if name in set(trainable):
+                self.assertIsNotNone(parameter.grad, name)
+            else:
+                self.assertFalse(parameter.requires_grad, name)
+
+        candidate.eval()
+        one = {key: value[:1] for key, value in batch.items()}
+        samples, audit = candidate.generate(
+            one, n_samples=5, return_expert_audit=True
+        )
+        self.assertEqual(tuple(samples.shape), (1, 5, 24, 16))
+        self.assertEqual(tuple(audit["mismatch_route"].shape), (1, 5))
+        self.assertEqual(tuple(audit["mismatch_time_probability"].shape), (1, 16))
+        self.assertEqual(tuple(audit["retrieval_attention"].shape), (1, 4, 16))
+        self.assertTrue(
+            torch.allclose(audit["retrieval_attention"].sum(dim=1), torch.ones(1, 16))
+        )
+
     def test_common_wind_head_and_event_loss_are_lightweight_and_trainable(self):
         from src.models.station_conditioned_diffusion import Station24DiffusionModel
 

@@ -21,6 +21,7 @@ from station_dataset import (
     load_station_static_data,
 )
 from station_evaluation import evaluate_station_scenarios, save_evaluation
+from station_retrieval_memory import build_retrieval_arrays
 
 
 def parse_args() -> argparse.Namespace:
@@ -348,6 +349,10 @@ def main() -> None:
         model.use_tail_time_localizer
     ):
         raise ValueError("checkpoint tail time localizer mode does not match config")
+    if bool(checkpoint.get("use_retrieval_mismatch_expert", False)) != bool(
+        model.use_retrieval_mismatch_expert
+    ):
+        raise ValueError("checkpoint retrieval mismatch mode does not match config")
     state, checkpoint_state_key = select_checkpoint_state(
         checkpoint, args.checkpoint_state
     )
@@ -358,6 +363,14 @@ def main() -> None:
     )
     result_variant = str(args.result_variant or trained_condition_variant)
 
+    retrieval_arrays = None
+    if model.use_retrieval_mismatch_expert:
+        retrieval_arrays = build_retrieval_arrays(
+            data_path,
+            args.split,
+            int(config["model"].get("retrieval_top_k", 40)),
+            int(config["model"].get("retrieval_exclusion_days", 6)),
+        )
     loader, dataset = get_station_dataloader(
         data_path,
         args.split,
@@ -369,6 +382,7 @@ def main() -> None:
         state_thresholds=checkpoint.get("state_thresholds"),
         event_weighting=checkpoint.get("event_weighting"),
         event_replay=checkpoint.get("event_replay"),
+        retrieval_arrays=retrieval_arrays,
     )
     tuning_audit: dict[str, object] = {
         "enabled": False,
@@ -401,6 +415,10 @@ def main() -> None:
     tail_condition_attentions = []
     tail_time_probabilities = []
     tail_time_starts = []
+    mismatch_probabilities = []
+    mismatch_routes = []
+    mismatch_time_probabilities = []
+    retrieval_attentions = []
     model.reset_parallel_spatial_gate_statistics()
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -423,9 +441,13 @@ def main() -> None:
         chunks = []
         route_chunks = []
         time_start_chunks = []
+        mismatch_route_chunks = []
         issue_tail_probability = None
         issue_tail_attention = None
         issue_tail_time_probability = None
+        issue_mismatch_probability = None
+        issue_mismatch_time_probability = None
+        issue_retrieval_attention = None
         remaining = n_samples
         while remaining > 0:
             current = min(member_chunk_size, remaining)
@@ -453,6 +475,18 @@ def main() -> None:
                         issue_tail_time_probability = expert_audit[
                             "tail_time_probability"
                         ].cpu()
+                        issue_mismatch_probability = expert_audit[
+                            "mismatch_probability"
+                        ].cpu()
+                        issue_mismatch_time_probability = expert_audit[
+                            "mismatch_time_probability"
+                        ].cpu()
+                        issue_retrieval_attention = expert_audit[
+                            "retrieval_attention"
+                        ].cpu()
+                    mismatch_route_chunks.append(
+                        expert_audit["mismatch_route"].cpu()
+                    )
                 else:
                     chunks.append(generated.cpu())
             remaining -= current
@@ -490,6 +524,21 @@ def main() -> None:
             tail_time_starts.append(
                 torch.cat(time_start_chunks, dim=1).numpy()
             )
+            if model.use_retrieval_mismatch_expert:
+                if (
+                    issue_mismatch_probability is None
+                    or issue_mismatch_time_probability is None
+                    or issue_retrieval_attention is None
+                ):
+                    raise RuntimeError("retrieval mismatch generation audit is unavailable")
+                mismatch_probabilities.append(issue_mismatch_probability.numpy())
+                mismatch_routes.append(
+                    torch.cat(mismatch_route_chunks, dim=1).numpy()
+                )
+                mismatch_time_probabilities.append(
+                    issue_mismatch_time_probability.numpy()
+                )
+                retrieval_attentions.append(issue_retrieval_attention.numpy())
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         issue_seconds = time.perf_counter() - issue_started
@@ -549,6 +598,30 @@ def main() -> None:
             (projected_array.shape[0], n_samples), -1, dtype=np.int16
         )
     )
+    mismatch_probability_array = (
+        np.concatenate(mismatch_probabilities, axis=0)
+        if mismatch_probabilities
+        else np.zeros(projected_array.shape[0], dtype=np.float32)
+    )
+    mismatch_route_array = (
+        np.concatenate(mismatch_routes, axis=0).astype(np.uint8)
+        if mismatch_routes
+        else np.zeros((projected_array.shape[0], n_samples), dtype=np.uint8)
+    )
+    mismatch_time_probability_array = (
+        np.concatenate(mismatch_time_probabilities, axis=0)
+        if mismatch_time_probabilities
+        else np.zeros(
+            (projected_array.shape[0], projected_array.shape[2]), dtype=np.float32
+        )
+    )
+    retrieval_attention_array = (
+        np.concatenate(retrieval_attentions, axis=0)
+        if retrieval_attentions
+        else np.zeros(
+            (projected_array.shape[0], 1, projected_array.shape[2]), dtype=np.float32
+        )
+    )
     if projected_array.shape[0] != daylight_mask.shape[0]:
         raise ValueError("daylight mask issue count does not match generated scenarios")
     projected_array = np.where(
@@ -579,6 +652,16 @@ def main() -> None:
         tail_time_probability_array,
     )
     np.save(output_dir / "tail_event_start.npy", tail_time_start_array)
+    np.save(output_dir / "mismatch_expert_probability.npy", mismatch_probability_array)
+    np.save(output_dir / "mismatch_expert_route.npy", mismatch_route_array)
+    np.save(
+        output_dir / "mismatch_time_probability.npy",
+        mismatch_time_probability_array,
+    )
+    np.save(output_dir / "retrieval_attention.npy", retrieval_attention_array)
+    if retrieval_arrays is not None:
+        np.save(output_dir / "retrieval_train_index.npy", retrieval_arrays.train_index)
+        np.save(output_dir / "retrieval_distance.npy", retrieval_arrays.distance)
     for level, moments in model.parallel_spatial_adjacency_moments.items():
         safe_level = level.replace("/", "_")
         np.save(
@@ -615,7 +698,9 @@ def main() -> None:
         "checkpoint_validation_mse": float(checkpoint["val_loss"]),
         "checkpoint_validation_objective": float(checkpoint["val_loss"]),
         "checkpoint_validation_objective_type": (
-            "tail_event_time_soft_cross_entropy"
+            "retrieval_mismatch_epsilon_plus_route_and_hourly_bce"
+            if model.train_retrieval_mismatch_only
+            else "tail_event_time_soft_cross_entropy"
             if model.train_tail_time_localizer_only
             else (
                 "tail_event_epsilon_plus_gate_bce"
@@ -674,6 +759,30 @@ def main() -> None:
         "wind_common_gate_value": model.wind_common_gate_value,
         "use_body_tail_experts": bool(model.use_body_tail_experts),
         "use_tail_time_localizer": bool(model.use_tail_time_localizer),
+        "use_retrieval_mismatch_expert": bool(
+            model.use_retrieval_mismatch_expert
+        ),
+        "retrieval_method": (
+            retrieval_arrays.audit["method"] if retrieval_arrays is not None else None
+        ),
+        "retrieval_top_k": (
+            int(retrieval_arrays.audit["top_k"]) if retrieval_arrays is not None else 0
+        ),
+        "retrieval_future_actual_used": False,
+        "mismatch_probability_mean": float(mismatch_probability_array.mean()),
+        "mismatch_member_fraction": float(mismatch_route_array.mean()),
+        "mismatch_time_probability_mean": float(
+            mismatch_time_probability_array.mean()
+        ),
+        "retrieval_attention_entropy_mean": float(
+            -np.mean(
+                np.sum(
+                    retrieval_attention_array
+                    * np.log(retrieval_attention_array.clip(min=1e-12)),
+                    axis=1,
+                )
+            )
+        ),
         "tail_time_temperature": float(model.denoiser.tail_time_temperature),
         "tail_time_mask_radius_hours": int(
             model.denoiser.tail_time_mask_radius_hours
@@ -710,7 +819,9 @@ def main() -> None:
             float(value) for value in tail_attention_array.mean(axis=0)
         ],
         "tail_routing_method": (
-            "causal_condition_gate_with_member_level_bernoulli_routing"
+            "three_way_body_deep_tail_retrieval_mismatch_categorical_routing"
+            if model.use_retrieval_mismatch_expert
+            else "causal_condition_gate_with_member_level_bernoulli_routing"
             if model.use_body_tail_experts
             else "disabled"
         ),
