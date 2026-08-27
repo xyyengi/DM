@@ -315,9 +315,9 @@ def validate(
             if model.use_retrieval_mismatch_expert:
                 context, _ = model.encode_retrieval_memory(batch)
                 logits = model.mismatch_risk_logits(batch, context)
-                time_probability = model.mismatch_time_probability(batch, context)
-                time_error = F.binary_cross_entropy(
-                    time_probability, event_window, reduction="none"
+                time_logits = model.mismatch_time_logits(batch, context)
+                time_error = F.binary_cross_entropy_with_logits(
+                    time_logits, event_window, reduction="none"
                 ).mean(dim=1)
                 mismatch_time_error_sum += float(time_error.sum())
             else:

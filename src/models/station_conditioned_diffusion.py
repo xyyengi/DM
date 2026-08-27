@@ -3164,12 +3164,17 @@ class Station24DiffusionModel(nn.Module):
             context, _ = self.encode_retrieval_memory(batch)
         return self.denoiser.mismatch_risk_logits(batch["forecast"], context)
 
-    def mismatch_time_probability(
+    def mismatch_time_logits(
         self, batch: Mapping[str, torch.Tensor], context: torch.Tensor | None = None
     ) -> torch.Tensor:
         if context is None:
             context, _ = self.encode_retrieval_memory(batch)
-        return self.denoiser.mismatch_time_probability(batch["forecast"], context)
+        return self.denoiser.mismatch_time_logits(batch["forecast"], context)
+
+    def mismatch_time_probability(
+        self, batch: Mapping[str, torch.Tensor], context: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        return torch.sigmoid(self.mismatch_time_logits(batch, context))
 
     def tail_risk_logits(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
         logits = self.denoiser.tail_risk_logits(
@@ -3346,13 +3351,13 @@ class Station24DiffusionModel(nn.Module):
         tail_route: torch.Tensor | float | None = None
         mismatch_route: torch.Tensor | float | None = None
         retrieval_context: torch.Tensor | None = None
+        mismatch_time_logits: torch.Tensor | None = None
         mismatch_time_gate: torch.Tensor | None = None
         epsilon_sample_weight: torch.Tensor | None = None
         if self.use_retrieval_mismatch_expert:
             retrieval_context, _ = self.encode_retrieval_memory(batch)
-            mismatch_time_gate = self.mismatch_time_probability(
-                batch, retrieval_context
-            )
+            mismatch_time_logits = self.mismatch_time_logits(batch, retrieval_context)
+            mismatch_time_gate = torch.sigmoid(mismatch_time_logits)
             # The inherited deep-tail path stays frozen and inactive while the
             # new expert learns only forecast-missed events.
             tail_route = 0.0
@@ -3412,8 +3417,10 @@ class Station24DiffusionModel(nn.Module):
                 min=1.0
             )
             target_time = batch["event_window_mask"].to(diffusion_loss.dtype)
-            time_error = F.binary_cross_entropy(
-                mismatch_time_gate,
+            if mismatch_time_logits is None:
+                raise RuntimeError("mismatch time logits were not computed")
+            time_error = F.binary_cross_entropy_with_logits(
+                mismatch_time_logits,
                 target_time,
                 reduction="none",
             )
