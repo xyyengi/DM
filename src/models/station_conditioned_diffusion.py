@@ -1521,12 +1521,18 @@ class StationConditionalResUNet1D(nn.Module):
         self.use_body_tail_experts = bool(
             config.get("use_body_tail_experts", False)
         )
+        self.use_discrete_event_memory = bool(
+            config.get("use_discrete_event_memory", False)
+        )
+        if self.use_discrete_event_memory and not self.use_body_tail_experts:
+            raise ValueError("discrete event memory requires body-tail experts")
         self.tail_station_adapter: nn.Module | None = None
         self.tail_common_adapter: nn.Module | None = None
         self.tail_common_gate: nn.Parameter | None = None
         self.tail_risk_encoder: nn.Module | None = None
         self.tail_risk_output: nn.Linear | None = None
         self.tail_signal_attention: nn.Module | None = None
+        self.event_prototype_adapter: nn.Module | None = None
         self.use_tail_time_localizer = bool(
             config.get("use_tail_time_localizer", False)
         )
@@ -1615,6 +1621,31 @@ class StationConditionalResUNet1D(nn.Module):
             self.tail_common_gate = nn.Parameter(
                 torch.tensor(float(config.get("tail_common_gate_init", -1.0)))
             )
+            if self.use_discrete_event_memory:
+                # One selected joint event prototype is supplied per member.
+                # This path never sees an attention-weighted Top-K average.
+                self.event_prototype_adapter = nn.Sequential(
+                    nn.Conv1d(
+                        self.channels[0] + 2,
+                        tail_channels,
+                        kernel_size=5,
+                        padding=2,
+                    ),
+                    nn.GroupNorm(_group_count(tail_channels, groups), tail_channels),
+                    nn.SiLU(),
+                    nn.Conv1d(
+                        tail_channels,
+                        tail_channels,
+                        kernel_size=5,
+                        padding=4,
+                        dilation=2,
+                    ),
+                    nn.GroupNorm(_group_count(tail_channels, groups), tail_channels),
+                    nn.SiLU(),
+                    nn.Conv1d(tail_channels, 1, kernel_size=1),
+                )
+                nn.init.zeros_(self.event_prototype_adapter[-1].weight)
+                nn.init.zeros_(self.event_prototype_adapter[-1].bias)
 
             # Six causal-at-generation signals: issued wind forecast, downward
             # forecast ramp, aligned forecast revision, forecast-derived low and
@@ -1791,6 +1822,7 @@ class StationConditionalResUNet1D(nn.Module):
         forecast_condition_strength: torch.Tensor | float | None = None,
         tail_expert_route: torch.Tensor | float | None = None,
         tail_time_mask: torch.Tensor | None = None,
+        event_prototype: torch.Tensor | None = None,
         retrieval_context: torch.Tensor | None = None,
         mismatch_expert_route: torch.Tensor | float | None = None,
         mismatch_time_gate: torch.Tensor | None = None,
@@ -1969,6 +2001,36 @@ class StationConditionalResUNet1D(nn.Module):
                 torch.sigmoid(self.tail_common_gate) * common_delta
             )
             tail_delta = tail_delta * self.wind_station_mask[None, :, None]
+            if self.use_discrete_event_memory:
+                if event_prototype is None or event_prototype.shape != (
+                    batch,
+                    stations,
+                    length,
+                ):
+                    raise ValueError("event_prototype must be [B,S,L]")
+                if tail_time_mask is None:
+                    raise ValueError("discrete event memory requires tail_time_mask")
+                if self.event_prototype_adapter is None:
+                    raise RuntimeError("event prototype adapter was not initialized")
+                memory_mask = tail_time_mask.to(
+                    device=output.device, dtype=output.dtype
+                )
+                if memory_mask.ndim == 2:
+                    memory_mask = memory_mask[:, None, :]
+                memory_input = torch.stack(
+                    [
+                        event_prototype.to(output.dtype),
+                        memory_mask.expand(-1, stations, -1),
+                    ],
+                    dim=2,
+                ).reshape(batch * stations, 2, length)
+                prototype_input = torch.cat([flattened, memory_input], dim=1)
+                prototype_delta = self.event_prototype_adapter(
+                    prototype_input
+                ).reshape(batch, stations, length)
+                tail_delta = tail_delta + (
+                    prototype_delta * self.wind_station_mask[None, :, None]
+                )
             if tail_time_mask is None:
                 localized_route = route
             else:
@@ -2235,6 +2297,7 @@ class StationConditionalResUNet1D(nn.Module):
             "tail_risk_output.",
             "tail_signal_attention.",
             "tail_time_output.",
+            "event_prototype_adapter.",
         )
         return tuple(
             name for name, _ in self.named_parameters() if name.startswith(prefixes)
@@ -2388,6 +2451,7 @@ class StationGaussianDiffusion(nn.Module):
         forecast_condition_strength: torch.Tensor | float | None = None,
         tail_expert_route: torch.Tensor | float | None = None,
         tail_time_mask: torch.Tensor | None = None,
+        event_prototype: torch.Tensor | None = None,
         retrieval_context: torch.Tensor | None = None,
         mismatch_expert_route: torch.Tensor | float | None = None,
         mismatch_time_gate: torch.Tensor | None = None,
@@ -2413,6 +2477,7 @@ class StationGaussianDiffusion(nn.Module):
             forecast_condition_strength=forecast_condition_strength,
             tail_expert_route=tail_expert_route,
             tail_time_mask=tail_time_mask,
+            event_prototype=event_prototype,
             retrieval_context=retrieval_context,
             mismatch_expert_route=mismatch_expert_route,
             mismatch_time_gate=mismatch_time_gate,
@@ -2658,6 +2723,7 @@ class StationGaussianDiffusion(nn.Module):
         forecast_guidance_scale: float = 1.0,
         tail_expert_route: torch.Tensor | float | None = None,
         tail_time_mask: torch.Tensor | None = None,
+        event_prototype: torch.Tensor | None = None,
         retrieval_context: torch.Tensor | None = None,
         mismatch_expert_route: torch.Tensor | float | None = None,
         mismatch_time_gate: torch.Tensor | None = None,
@@ -2674,6 +2740,7 @@ class StationGaussianDiffusion(nn.Module):
             node_state=node_state,
             retrieval_context=retrieval_context,
             mismatch_time_gate=mismatch_time_gate,
+            event_prototype=event_prototype,
         )
         predicted_conditional = self.denoiser(
             noisy,
@@ -2730,6 +2797,7 @@ class StationGaussianDiffusion(nn.Module):
         forecast_guidance_scale: float = 1.0,
         tail_expert_route: torch.Tensor | None = None,
         tail_time_mask: torch.Tensor | None = None,
+        event_prototype: torch.Tensor | None = None,
         retrieval_context: torch.Tensor | None = None,
         mismatch_expert_route: torch.Tensor | None = None,
         mismatch_time_gate: torch.Tensor | None = None,
@@ -2791,6 +2859,18 @@ class StationGaussianDiffusion(nn.Module):
                 )
         else:
             time_mask = None
+        if event_prototype is not None:
+            prototype = event_prototype.to(
+                device=forecast.device, dtype=forecast.dtype
+            )
+            if prototype.shape == (batch, n_samples, stations, length):
+                prototype = prototype.reshape(batch * n_samples, stations, length)
+            elif prototype.shape != (batch * n_samples, stations, length):
+                raise ValueError(
+                    "event_prototype must be [B,K,S,L] or [B*K,S,L] during sampling"
+                )
+        else:
+            prototype = None
         noisy = torch.randn(
             batch * n_samples,
             stations,
@@ -2810,6 +2890,7 @@ class StationGaussianDiffusion(nn.Module):
                 forecast_guidance_scale=forecast_guidance_scale,
                 tail_expert_route=route,
                 tail_time_mask=time_mask,
+                event_prototype=prototype,
                 mismatch_expert_route=mismatch_route,
                 **optional_conditions,
             )
@@ -2843,6 +2924,20 @@ class Station24DiffusionModel(nn.Module):
         self.use_retrieval_mismatch_expert = bool(
             self.config.get("use_retrieval_mismatch_expert", False)
         )
+        self.use_discrete_event_memory = bool(
+            self.config.get("use_discrete_event_memory", False)
+        )
+        self.train_discrete_event_memory_only = bool(
+            self.config.get("train_discrete_event_memory_only", False)
+        )
+        if self.use_discrete_event_memory and self.use_retrieval_mismatch_expert:
+            raise ValueError(
+                "discrete event memory replaces, rather than adds, the mismatch expert"
+            )
+        if self.train_discrete_event_memory_only and not self.use_discrete_event_memory:
+            raise ValueError(
+                "train_discrete_event_memory_only requires discrete event memory"
+            )
         self.train_retrieval_mismatch_only = bool(
             self.config.get("train_retrieval_mismatch_only", False)
         )
@@ -2961,6 +3056,36 @@ class Station24DiffusionModel(nn.Module):
                 self.config.get("event_x0_timing_temperature", 0.05)
             ),
         )
+        self.event_selector_loss_weight = float(
+            self.config.get("event_selector_loss_weight", 0.0)
+        )
+        self.event_selector_prior_strength = float(
+            self.config.get("event_selector_prior_strength", 0.5)
+        )
+        self.event_selector_temperature = float(
+            self.config.get("event_selector_temperature", 0.75)
+        )
+        if self.use_discrete_event_memory:
+            if self.event_selector_loss_weight <= 0:
+                raise ValueError("event_selector_loss_weight must be positive")
+            if self.event_selector_temperature <= 0:
+                raise ValueError("event_selector_temperature must be positive")
+            selector_channels = int(
+                self.config.get("event_selector_channels", 32)
+            )
+            self.event_memory_selector: nn.Module | None = nn.Sequential(
+                nn.Linear(13, selector_channels),
+                nn.SiLU(),
+                nn.Linear(selector_channels, selector_channels),
+                nn.SiLU(),
+                nn.Linear(selector_channels, 1),
+            )
+            # Start from forecast-only retrieval priors. Supervision then learns
+            # which discrete morphology/time candidates deserve probability.
+            nn.init.zeros_(self.event_memory_selector[-1].weight)
+            nn.init.zeros_(self.event_memory_selector[-1].bias)
+        else:
+            self.event_memory_selector = None
 
     @property
     def spatial_mode(self) -> str:
@@ -3101,6 +3226,182 @@ class Station24DiffusionModel(nn.Module):
         if gate is None:
             return None
         return float(torch.sigmoid(gate.detach()).cpu())
+
+    @property
+    def discrete_event_trainable_parameter_names(self) -> tuple[str, ...]:
+        if not self.use_discrete_event_memory:
+            return ()
+        inherited = set(self.body_tail_trainable_parameter_names)
+        inherited.update(
+            name
+            for name, _ in self.named_parameters()
+            if name.startswith("event_memory_selector.")
+        )
+        return tuple(sorted(inherited))
+
+    @property
+    def discrete_event_new_state_dict_keys(self) -> tuple[str, ...]:
+        """Keys absent from the Raw body-tail initialization checkpoint."""
+
+        if not self.use_discrete_event_memory:
+            return ()
+        suffixes = tuple(
+            name
+            for name, _ in self.denoiser.named_parameters()
+            if name.startswith("event_prototype_adapter.")
+        )
+        keys = [
+            f"{prefix}{suffix}"
+            for prefix in ("denoiser.", "diffusion.denoiser.")
+            for suffix in suffixes
+        ]
+        keys.extend(
+            name
+            for name, _ in self.named_parameters()
+            if name.startswith("event_memory_selector.")
+        )
+        return tuple(sorted(keys))
+
+    @property
+    def discrete_event_state_dict_keys(self) -> tuple[str, ...]:
+        names = set(self.body_tail_state_dict_keys)
+        names.update(
+            name
+            for name, _ in self.named_parameters()
+            if name.startswith("event_memory_selector.")
+        )
+        return tuple(sorted(names))
+
+    def configure_discrete_event_training(self) -> tuple[str, ...]:
+        """Freeze the body while upgrading the existing tail into one event expert."""
+
+        allowed = set(self.discrete_event_trainable_parameter_names)
+        if not allowed:
+            raise RuntimeError("discrete event memory has no trainable parameters")
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad_(name in allowed)
+        actual = {name for name, value in self.named_parameters() if value.requires_grad}
+        if actual != allowed:
+            raise RuntimeError("discrete event parameter isolation failed")
+        return tuple(sorted(actual))
+
+    def event_memory_logits(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        """Score separate event/time hypotheses without mixing their trajectories."""
+
+        if self.event_memory_selector is None:
+            raise RuntimeError("discrete event memory selector is disabled")
+        residual = batch["retrieval_residual"]
+        mask = batch["retrieval_time_mask"].to(residual.dtype)
+        distance = batch["retrieval_distance"].to(residual.dtype)
+        prior = batch["retrieval_prior_weight"].to(residual.dtype)
+        event_type = batch["retrieval_event_type"].long()
+        duration = batch["retrieval_duration"].to(residual.dtype)
+        start = batch["retrieval_target_start"].to(residual.dtype)
+        if residual.ndim != 4 or mask.shape != residual.shape[:2] + (
+            residual.shape[-1],
+        ):
+            raise ValueError("discrete event candidates must be [B,K,S,L] and [B,K,L]")
+        wind_weight = self.denoiser.wind_capacity_weight.to(residual.dtype)
+        prototype = torch.einsum("s,bksl->bkl", wind_weight, residual)
+        forecast = torch.einsum(
+            "s,bsl->bl", wind_weight, batch["forecast"].to(residual.dtype)
+        )
+        mass = mask.sum(dim=-1).clamp(min=1.0)
+        prototype_mean = (prototype * mask).sum(dim=-1) / mass
+        prototype_min = torch.where(
+            mask > 0, prototype, torch.full_like(prototype, float("inf"))
+        ).amin(dim=-1)
+        prototype_abs = (prototype.abs() * mask).sum(dim=-1) / mass
+        forecast_expand = forecast[:, None, :]
+        forecast_mean = (forecast_expand * mask).sum(dim=-1) / mass
+        forecast_centered = forecast_expand - forecast_mean[:, :, None]
+        forecast_std = torch.sqrt(
+            (forecast_centered.square() * mask).sum(dim=-1) / mass + 1e-6
+        )
+        type_one_hot = F.one_hot(event_type.clamp(0, 3), num_classes=4).to(
+            residual.dtype
+        )
+        features = torch.cat(
+            [
+                torch.log(prior.clamp(min=1e-8))[:, :, None],
+                distance[:, :, None],
+                prototype_mean[:, :, None],
+                prototype_min[:, :, None],
+                prototype_abs[:, :, None],
+                forecast_mean[:, :, None],
+                forecast_std[:, :, None],
+                (start / float(self.denoiser.sequence_length))[:, :, None],
+                (duration / 24.0)[:, :, None],
+                type_one_hot,
+            ],
+            dim=-1,
+        )
+        learned = self.event_memory_selector(features).squeeze(-1)
+        return learned + self.event_selector_prior_strength * torch.log(
+            prior.clamp(min=1e-8)
+        )
+
+    def select_event_memory(
+        self,
+        batch: Mapping[str, torch.Tensor],
+        members: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        logits = self.event_memory_logits(batch) / self.event_selector_temperature
+        probability = torch.softmax(logits, dim=-1)
+        draw_count = 1 if members is None else int(members)
+        if self.training and members is None:
+            training_probability = probability
+            event_window = batch.get("event_window_mask")
+            event_active = batch.get("event_active")
+            if event_window is not None and event_active is not None:
+                candidate_mask = batch["retrieval_time_mask"].to(probability.dtype)
+                overlap = (candidate_mask * event_window[:, None, :]).sum(dim=-1)
+                overlap = overlap / event_window.sum(dim=-1, keepdim=True).clamp(min=1.0)
+                teacher = torch.softmax(logits + 6.0 * overlap, dim=-1)
+                active = event_active.to(probability.dtype)[:, None]
+                training_probability = active * teacher + (1.0 - active) * probability
+            indices = torch.multinomial(training_probability, 1, replacement=True)
+        elif members is None:
+            indices = probability.argmax(dim=-1, keepdim=True)
+        else:
+            indices = torch.multinomial(probability, draw_count, replacement=True)
+        residual = batch["retrieval_residual"]
+        mask = batch["retrieval_time_mask"]
+        batch_index = torch.arange(residual.shape[0], device=residual.device)[:, None]
+        selected_residual = residual[batch_index, indices]
+        selected_mask = mask[batch_index, indices]
+        if members is None:
+            selected_residual = selected_residual[:, 0]
+            selected_mask = selected_mask[:, 0]
+            indices = indices[:, 0]
+        return selected_residual, selected_mask, indices, probability
+
+    def event_selector_loss(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        """Supervise candidate timing/morphology; targets never become conditions."""
+
+        logits = self.event_memory_logits(batch) / self.event_selector_temperature
+        candidate_mask = batch["retrieval_time_mask"].to(logits.dtype)
+        target_mask = batch["event_window_mask"].to(logits.dtype)
+        active = batch["event_active"].to(logits.dtype)
+        overlap = (candidate_mask * target_mask[:, None, :]).sum(dim=-1)
+        overlap = overlap / target_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        candidate = batch["retrieval_residual"].to(logits.dtype)
+        truth = batch["residual_target"].to(logits.dtype)[:, None, :, :]
+        wind = self.denoiser.wind_station_mask.to(logits.dtype)[None, None, :, None]
+        support = candidate_mask[:, :, None, :] * wind
+        morphology_error = ((candidate - truth).square() * support).sum(dim=(2, 3))
+        morphology_error = morphology_error / support.sum(dim=(2, 3)).clamp(min=1.0)
+        error_scale = morphology_error.detach().median(dim=-1, keepdim=True).values.clamp(
+            min=1e-4
+        )
+        morphology_match = torch.exp(-morphology_error / error_scale)
+        # Soft targets preserve legitimate duration ambiguity while preferring
+        # the train-event morphology closest to the observed training event.
+        target = overlap.square() * morphology_match
+        target = target / target.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        valid = (overlap.sum(dim=-1) > 0).to(logits.dtype) * active
+        loss = -(target * torch.log_softmax(logits, dim=-1)).sum(dim=-1)
+        return (loss * valid).sum() / valid.sum().clamp(min=1.0)
 
     def configure_body_tail_training(self) -> tuple[str, ...]:
         """Freeze the body model and leave only tail adapters/gate trainable."""
@@ -3353,8 +3654,20 @@ class Station24DiffusionModel(nn.Module):
         retrieval_context: torch.Tensor | None = None
         mismatch_time_logits: torch.Tensor | None = None
         mismatch_time_gate: torch.Tensor | None = None
+        event_prototype: torch.Tensor | None = None
+        event_memory_time_mask: torch.Tensor | None = None
         epsilon_sample_weight: torch.Tensor | None = None
-        if self.use_retrieval_mismatch_expert:
+        if self.use_discrete_event_memory:
+            (
+                event_prototype,
+                event_memory_time_mask,
+                _,
+                _,
+            ) = self.select_event_memory(batch)
+            tail_route = 1.0
+            if include_auxiliary or body_tail_event_masking:
+                epsilon_sample_weight = self.body_tail_epsilon_weight(batch)
+        elif self.use_retrieval_mismatch_expert:
             retrieval_context, _ = self.encode_retrieval_memory(batch)
             mismatch_time_logits = self.mismatch_time_logits(batch, retrieval_context)
             mismatch_time_gate = torch.sigmoid(mismatch_time_logits)
@@ -3397,12 +3710,30 @@ class Station24DiffusionModel(nn.Module):
             include_auxiliary=include_auxiliary,
             forecast_condition_strength=forecast_condition_strength,
             tail_expert_route=tail_route,
+            tail_time_mask=event_memory_time_mask,
+            event_prototype=event_prototype,
             retrieval_context=retrieval_context,
             mismatch_expert_route=mismatch_route,
             mismatch_time_gate=mismatch_time_gate,
             epsilon_sample_weight=epsilon_sample_weight,
         )
-        if self.use_retrieval_mismatch_expert and include_auxiliary:
+        if self.use_discrete_event_memory and include_auxiliary:
+            diffusion_loss = diffusion_loss + (
+                self.event_selector_loss_weight * self.event_selector_loss(batch)
+            )
+            target = batch["event_active"].to(diffusion_loss.dtype)
+            replay_weight = batch.get("event_replay_weight")
+            if replay_weight is None or replay_weight.shape != target.shape:
+                raise ValueError("event memory requires event replay weights")
+            importance = replay_weight.to(diffusion_loss.dtype).reciprocal()
+            gate_error = F.binary_cross_entropy_with_logits(
+                self.tail_risk_logits(batch), target, reduction="none"
+            )
+            gate_loss = (gate_error * importance).sum() / importance.sum().clamp(
+                min=1.0
+            )
+            diffusion_loss = diffusion_loss + self.tail_gate_loss_weight * gate_loss
+        elif self.use_retrieval_mismatch_expert and include_auxiliary:
             target = batch["event_active"].to(diffusion_loss.dtype)
             replay_weight = batch.get("event_replay_weight")
             if replay_weight is None or replay_weight.shape != target.shape:
@@ -3491,10 +3822,54 @@ class Station24DiffusionModel(nn.Module):
         mismatch_probability = None
         mismatch_route = None
         mismatch_time_probability = None
+        event_prototype = None
+        event_memory_index = None
+        event_memory_probability = None
+        event_memory_type = None
+        event_memory_duration = None
+        event_memory_train_index = None
         if self.use_body_tail_experts:
             tail_probability = self.tail_risk_probability(batch)
             tail_attention = self.tail_condition_attention(batch)
-            if self.use_retrieval_mismatch_expert:
+            if self.use_discrete_event_memory:
+                tail_route = torch.bernoulli(
+                    tail_probability[:, None].expand(-1, int(n_samples))
+                )
+                (
+                    event_prototype,
+                    tail_time_mask,
+                    event_memory_index,
+                    event_memory_probability,
+                ) = self.select_event_memory(batch, members=int(n_samples))
+                tail_time_mask = tail_time_mask * tail_route[:, :, None]
+                batch_index = torch.arange(
+                    batch["forecast"].shape[0], device=batch["forecast"].device
+                )[:, None]
+                tail_time_start = batch["retrieval_target_start"][
+                    batch_index, event_memory_index
+                ]
+                event_memory_type = batch["retrieval_event_type"][
+                    batch_index, event_memory_index
+                ]
+                event_memory_duration = batch["retrieval_duration"][
+                    batch_index, event_memory_index
+                ]
+                event_memory_train_index = batch["retrieval_train_index"][
+                    batch_index, event_memory_index
+                ]
+                tail_time_start = torch.where(
+                    tail_route.bool(), tail_time_start, torch.full_like(tail_time_start, -1)
+                )
+                candidate_mask = batch["retrieval_time_mask"].to(
+                    event_memory_probability.dtype
+                )
+                tail_time_probability = torch.einsum(
+                    "bk,bkl->bl", event_memory_probability, candidate_mask
+                )
+                tail_time_probability = tail_time_probability / tail_time_probability.sum(
+                    dim=-1, keepdim=True
+                ).clamp(min=1e-8)
+            elif self.use_retrieval_mismatch_expert:
                 retrieval_context, retrieval_attention = self.encode_retrieval_memory(
                     batch
                 )
@@ -3520,7 +3895,7 @@ class Station24DiffusionModel(nn.Module):
                 tail_route = torch.bernoulli(
                     tail_probability[:, None].expand(-1, int(n_samples))
                 )
-            if self.use_tail_time_localizer:
+            if self.use_tail_time_localizer and not self.use_discrete_event_memory:
                 tail_time_probability = self.tail_time_probability(batch)
                 tail_time_start, tail_time_mask = self.sample_tail_time_masks(
                     tail_time_probability, tail_route
@@ -3541,6 +3916,7 @@ class Station24DiffusionModel(nn.Module):
             node_state=batch.get("node_state"),
             tail_expert_route=tail_route,
             tail_time_mask=tail_time_mask,
+            event_prototype=event_prototype,
             retrieval_context=retrieval_context,
             mismatch_expert_route=mismatch_route,
             mismatch_time_gate=mismatch_time_probability,
@@ -3608,6 +3984,23 @@ class Station24DiffusionModel(nn.Module):
                 device=samples.device,
                 dtype=samples.dtype,
             )
+        if event_memory_index is None:
+            event_memory_index = torch.full(
+                (batch_size, int(n_samples)),
+                -1,
+                device=samples.device,
+                dtype=torch.long,
+            )
+            event_memory_type = event_memory_index.clone()
+            event_memory_duration = torch.zeros_like(event_memory_index)
+            event_memory_train_index = event_memory_index.clone()
+        if event_memory_probability is None:
+            event_memory_probability = torch.zeros(
+                batch_size,
+                1,
+                device=samples.device,
+                dtype=samples.dtype,
+            )
         return samples, {
             "tail_probability": tail_probability,
             "tail_route": tail_route,
@@ -3618,4 +4011,9 @@ class Station24DiffusionModel(nn.Module):
             "mismatch_route": mismatch_route,
             "mismatch_time_probability": mismatch_time_probability,
             "retrieval_attention": retrieval_attention,
+            "event_memory_index": event_memory_index,
+            "event_memory_probability": event_memory_probability,
+            "event_memory_type": event_memory_type,
+            "event_memory_duration": event_memory_duration,
+            "event_memory_train_index": event_memory_train_index,
         }

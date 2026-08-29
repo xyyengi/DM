@@ -22,6 +22,7 @@ from station_dataset import (
 )
 from station_evaluation import evaluate_station_scenarios, save_evaluation
 from station_retrieval_memory import build_retrieval_arrays
+from station_discrete_event_memory import build_discrete_event_arrays
 
 
 def parse_args() -> argparse.Namespace:
@@ -353,6 +354,10 @@ def main() -> None:
         model.use_retrieval_mismatch_expert
     ):
         raise ValueError("checkpoint retrieval mismatch mode does not match config")
+    if bool(checkpoint.get("use_discrete_event_memory", False)) != bool(
+        model.use_discrete_event_memory
+    ):
+        raise ValueError("checkpoint discrete event-memory mode does not match config")
     state, checkpoint_state_key = select_checkpoint_state(
         checkpoint, args.checkpoint_state
     )
@@ -364,7 +369,16 @@ def main() -> None:
     result_variant = str(args.result_variant or trained_condition_variant)
 
     retrieval_arrays = None
-    if model.use_retrieval_mismatch_expert:
+    if model.use_discrete_event_memory:
+        retrieval_arrays = build_discrete_event_arrays(
+            data_path,
+            args.split,
+            int(config["model"].get("event_memory_top_k", 48)),
+            int(config["model"].get("retrieval_exclusion_days", 6)),
+            float(config["model"].get("event_memory_quantile", 0.75)),
+            int(config["model"].get("event_memory_target_stride_hours", 3)),
+        )
+    elif model.use_retrieval_mismatch_expert:
         retrieval_arrays = build_retrieval_arrays(
             data_path,
             args.split,
@@ -419,6 +433,11 @@ def main() -> None:
     mismatch_routes = []
     mismatch_time_probabilities = []
     retrieval_attentions = []
+    event_memory_indices = []
+    event_memory_types = []
+    event_memory_durations = []
+    event_memory_train_indices = []
+    event_memory_probabilities = []
     model.reset_parallel_spatial_gate_statistics()
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -442,12 +461,17 @@ def main() -> None:
         route_chunks = []
         time_start_chunks = []
         mismatch_route_chunks = []
+        event_memory_index_chunks = []
+        event_memory_type_chunks = []
+        event_memory_duration_chunks = []
+        event_memory_train_index_chunks = []
         issue_tail_probability = None
         issue_tail_attention = None
         issue_tail_time_probability = None
         issue_mismatch_probability = None
         issue_mismatch_time_probability = None
         issue_retrieval_attention = None
+        issue_event_memory_probability = None
         remaining = n_samples
         while remaining > 0:
             current = min(member_chunk_size, remaining)
@@ -484,8 +508,23 @@ def main() -> None:
                         issue_retrieval_attention = expert_audit[
                             "retrieval_attention"
                         ].cpu()
+                        issue_event_memory_probability = expert_audit[
+                            "event_memory_probability"
+                        ].cpu()
                     mismatch_route_chunks.append(
                         expert_audit["mismatch_route"].cpu()
+                    )
+                    event_memory_index_chunks.append(
+                        expert_audit["event_memory_index"].cpu()
+                    )
+                    event_memory_type_chunks.append(
+                        expert_audit["event_memory_type"].cpu()
+                    )
+                    event_memory_duration_chunks.append(
+                        expert_audit["event_memory_duration"].cpu()
+                    )
+                    event_memory_train_index_chunks.append(
+                        expert_audit["event_memory_train_index"].cpu()
                     )
                 else:
                     chunks.append(generated.cpu())
@@ -524,6 +563,24 @@ def main() -> None:
             tail_time_starts.append(
                 torch.cat(time_start_chunks, dim=1).numpy()
             )
+            if model.use_discrete_event_memory:
+                if issue_event_memory_probability is None:
+                    raise RuntimeError("discrete event memory audit is unavailable")
+                event_memory_indices.append(
+                    torch.cat(event_memory_index_chunks, dim=1).numpy()
+                )
+                event_memory_types.append(
+                    torch.cat(event_memory_type_chunks, dim=1).numpy()
+                )
+                event_memory_durations.append(
+                    torch.cat(event_memory_duration_chunks, dim=1).numpy()
+                )
+                event_memory_train_indices.append(
+                    torch.cat(event_memory_train_index_chunks, dim=1).numpy()
+                )
+                event_memory_probabilities.append(
+                    issue_event_memory_probability.numpy()
+                )
             if model.use_retrieval_mismatch_expert:
                 if (
                     issue_mismatch_probability is None
@@ -622,6 +679,31 @@ def main() -> None:
             (projected_array.shape[0], 1, projected_array.shape[2]), dtype=np.float32
         )
     )
+    event_memory_index_array = (
+        np.concatenate(event_memory_indices, axis=0)
+        if event_memory_indices
+        else np.full((projected_array.shape[0], n_samples), -1, dtype=np.int64)
+    )
+    event_memory_type_array = (
+        np.concatenate(event_memory_types, axis=0)
+        if event_memory_types
+        else np.full((projected_array.shape[0], n_samples), -1, dtype=np.int64)
+    )
+    event_memory_duration_array = (
+        np.concatenate(event_memory_durations, axis=0)
+        if event_memory_durations
+        else np.zeros((projected_array.shape[0], n_samples), dtype=np.int64)
+    )
+    event_memory_train_index_array = (
+        np.concatenate(event_memory_train_indices, axis=0)
+        if event_memory_train_indices
+        else np.full((projected_array.shape[0], n_samples), -1, dtype=np.int64)
+    )
+    event_memory_probability_array = (
+        np.concatenate(event_memory_probabilities, axis=0)
+        if event_memory_probabilities
+        else np.zeros((projected_array.shape[0], 1), dtype=np.float32)
+    )
     if projected_array.shape[0] != daylight_mask.shape[0]:
         raise ValueError("daylight mask issue count does not match generated scenarios")
     projected_array = np.where(
@@ -659,6 +741,17 @@ def main() -> None:
         mismatch_time_probability_array,
     )
     np.save(output_dir / "retrieval_attention.npy", retrieval_attention_array)
+    np.save(output_dir / "event_memory_selected_index.npy", event_memory_index_array)
+    np.save(output_dir / "event_memory_selected_type.npy", event_memory_type_array)
+    np.save(output_dir / "event_memory_selected_duration.npy", event_memory_duration_array)
+    np.save(
+        output_dir / "event_memory_selected_train_index.npy",
+        event_memory_train_index_array,
+    )
+    np.save(
+        output_dir / "event_memory_candidate_probability.npy",
+        event_memory_probability_array,
+    )
     if retrieval_arrays is not None:
         np.save(output_dir / "retrieval_train_index.npy", retrieval_arrays.train_index)
         np.save(output_dir / "retrieval_distance.npy", retrieval_arrays.distance)
@@ -762,11 +855,18 @@ def main() -> None:
         "use_retrieval_mismatch_expert": bool(
             model.use_retrieval_mismatch_expert
         ),
+        "use_discrete_event_memory": bool(model.use_discrete_event_memory),
         "retrieval_method": (
             retrieval_arrays.audit["method"] if retrieval_arrays is not None else None
         ),
         "retrieval_top_k": (
-            int(retrieval_arrays.audit["top_k"]) if retrieval_arrays is not None else 0
+            int(
+                retrieval_arrays.audit.get(
+                    "top_k", retrieval_arrays.audit.get("top_k_candidate_pool", 0)
+                )
+            )
+            if retrieval_arrays is not None
+            else 0
         ),
         "retrieval_future_actual_used": False,
         "mismatch_probability_mean": float(mismatch_probability_array.mean()),
@@ -819,7 +919,9 @@ def main() -> None:
             float(value) for value in tail_attention_array.mean(axis=0)
         ],
         "tail_routing_method": (
-            "three_way_body_deep_tail_retrieval_mismatch_categorical_routing"
+            "two_expert_body_plus_member_level_discrete_event_memory_routing"
+            if model.use_discrete_event_memory
+            else "three_way_body_deep_tail_retrieval_mismatch_categorical_routing"
             if model.use_retrieval_mismatch_expert
             else "causal_condition_gate_with_member_level_bernoulli_routing"
             if model.use_body_tail_experts

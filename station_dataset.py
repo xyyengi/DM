@@ -1090,6 +1090,76 @@ def fit_station_forecast_mismatch_replay(
     }
 
 
+def fit_station_unified_event_replay(
+    data_dir: str | Path,
+    condition_config: Mapping[str, object],
+) -> dict[str, object]:
+    """Unify sustained drops and missed 1/3/6 h ramps for one event expert."""
+
+    deep = fit_station_event_replay(data_dir, condition_config)
+    mismatch = fit_station_forecast_mismatch_replay(data_dir, condition_config)
+    if int(deep["event_window_hours"]) != int(mismatch["event_window_hours"]):
+        raise ValueError("unified replay requires matching deep/mismatch windows")
+    deep_active = np.asarray(deep["sample_event_active"], dtype=np.float32)
+    mismatch_active = np.asarray(mismatch["sample_event_active"], dtype=np.float32)
+    deep_tier = np.asarray(deep["sample_event_tier"], dtype=np.int64)
+    mismatch_tier = np.asarray(mismatch["sample_event_tier"], dtype=np.int64)
+    choose_mismatch = (mismatch_active > 0) & (
+        (deep_active == 0) | (mismatch_tier > deep_tier)
+    )
+    active = np.maximum(deep_active, mismatch_active)
+    starts = np.where(
+        choose_mismatch,
+        np.asarray(mismatch["sample_event_start"], dtype=np.int64),
+        np.asarray(deep["sample_event_start"], dtype=np.int64),
+    )
+    tiers = np.where(choose_mismatch, mismatch_tier, deep_tier)
+    weights = np.maximum(
+        np.asarray(deep["sample_replay_weights"], dtype=np.float64),
+        np.asarray(mismatch["sample_replay_weights"], dtype=np.float64),
+    )
+    deep_sync = np.asarray(deep["sample_sync_station_weight"], dtype=np.float32)
+    mismatch_sync = np.asarray(
+        mismatch["sample_sync_station_weight"], dtype=np.float32
+    )
+    sync = np.where(choose_mismatch[:, None], mismatch_sync, deep_sync)
+    count = len(active)
+    total_weight = float(weights.sum())
+    return {
+        "method": "train_unified_wind_event_replay_v1",
+        "fit_split": "train",
+        "used_for": [
+            "training_sampler",
+            "unified_event_expert",
+            "training_x0_event_loss",
+            "event_selector_supervision",
+        ],
+        "future_actual_used_as_condition": False,
+        "applied_to_validation_or_generation": False,
+        "ordinary_epsilon_loss_reweighted": False,
+        "event_definition": "union_of_sustained_forecast_overestimate_and_forecast_missed_1_3_6h_ramps",
+        "event_window_hours": int(deep["event_window_hours"]),
+        "sample_replay_weights": weights.tolist(),
+        "sample_event_active": active.tolist(),
+        "sample_event_start": starts.tolist(),
+        "sample_event_tier": tiers.tolist(),
+        "sample_sync_station_weight": sync.tolist(),
+        "wind_station_indices": deep["wind_station_indices"],
+        "wind_capacity_weights": deep["wind_capacity_weights"],
+        "independent_event_count": int(active.sum()),
+        "sustained_drop_representative_count": int(deep_active.sum()),
+        "forecast_mismatch_representative_count": int(mismatch_active.sum()),
+        "overlap_representative_count": int(
+            np.sum((deep_active > 0) & (mismatch_active > 0))
+        ),
+        "expected_event_draws_per_epoch": float(
+            weights[active > 0].sum() / total_weight * count
+        ),
+        "deep_replay": deep,
+        "mismatch_replay": mismatch,
+    }
+
+
 def validate_station_event_replay(
     specification: Mapping[str, object],
     sample_count: int | None = None,
@@ -1098,6 +1168,7 @@ def validate_station_event_replay(
     if specification.get("method") not in {
         "train_independent_wind_event_replay_x0_v1",
         "train_independent_forecast_missed_ramp_replay_v1",
+        "train_unified_wind_event_replay_v1",
     }:
         raise ValueError("unsupported event replay method")
     if specification.get("fit_split") != "train":
@@ -1314,6 +1385,20 @@ class StationForecastDataset(Dataset):
                         f"retrieval {name} query count {value.shape[0]} "
                         f"does not match {split}={expected_queries}"
                     )
+            for name in (
+                "time_mask",
+                "event_type",
+                "duration",
+                "target_start",
+                "source_start",
+            ):
+                if hasattr(retrieval_arrays, name):
+                    value = np.asarray(getattr(retrieval_arrays, name))
+                    if value.shape[0] != expected_queries:
+                        raise ValueError(
+                            f"retrieval {name} query count {value.shape[0]} "
+                            f"does not match {split}={expected_queries}"
+                        )
         self.use_state_encoder = bool(
             self.condition_config.get("use_state_encoder", False)
         )
@@ -1494,6 +1579,18 @@ class StationForecastDataset(Dataset):
             revision_mask=revision_mask,
         )
         target = residual / scale_tensor
+        retrieval_residual = (
+            np.asarray(self.retrieval_arrays.residual[index], dtype=np.float32).copy()
+            if self.retrieval_arrays is not None
+            else np.zeros((1, EXPECTED_STATIONS, EXPECTED_HOURS), dtype=np.float32)
+        )
+        # Historical values are stored in physical residual units.  The event
+        # expert denoises the same normalized target as the body model, so every
+        # candidate is expressed using the query issue's causal residual scale.
+        if self.retrieval_arrays is not None and hasattr(
+            self.retrieval_arrays, "time_mask"
+        ):
+            retrieval_residual /= scale_tensor[None, :, :]
         loss_weight, event_time_weight = build_station_event_loss_weights(
             actual,
             residual,
@@ -1557,12 +1654,7 @@ class StationForecastDataset(Dataset):
                 event_sync_station_weight
             ),
             "retrieval_residual": torch.from_numpy(
-                np.asarray(
-                    self.retrieval_arrays.residual[index]
-                    if self.retrieval_arrays is not None
-                    else np.zeros((1, EXPECTED_STATIONS, EXPECTED_HOURS)),
-                    dtype=np.float32,
-                ).copy()
+                retrieval_residual
             ),
             "retrieval_distance": torch.from_numpy(
                 np.asarray(
@@ -1585,6 +1677,51 @@ class StationForecastDataset(Dataset):
                     self.retrieval_arrays.train_index[index]
                     if self.retrieval_arrays is not None
                     else np.full(1, -1),
+                    dtype=np.int64,
+                ).copy()
+            ),
+            "retrieval_time_mask": torch.from_numpy(
+                np.asarray(
+                    self.retrieval_arrays.time_mask[index]
+                    if self.retrieval_arrays is not None
+                    and hasattr(self.retrieval_arrays, "time_mask")
+                    else np.zeros((1, EXPECTED_HOURS)),
+                    dtype=np.float32,
+                ).copy()
+            ),
+            "retrieval_event_type": torch.from_numpy(
+                np.asarray(
+                    self.retrieval_arrays.event_type[index]
+                    if self.retrieval_arrays is not None
+                    and hasattr(self.retrieval_arrays, "event_type")
+                    else np.full(1, -1),
+                    dtype=np.int64,
+                ).copy()
+            ),
+            "retrieval_duration": torch.from_numpy(
+                np.asarray(
+                    self.retrieval_arrays.duration[index]
+                    if self.retrieval_arrays is not None
+                    and hasattr(self.retrieval_arrays, "duration")
+                    else np.zeros(1),
+                    dtype=np.int64,
+                ).copy()
+            ),
+            "retrieval_target_start": torch.from_numpy(
+                np.asarray(
+                    self.retrieval_arrays.target_start[index]
+                    if self.retrieval_arrays is not None
+                    and hasattr(self.retrieval_arrays, "target_start")
+                    else np.zeros(1),
+                    dtype=np.int64,
+                ).copy()
+            ),
+            "retrieval_source_start": torch.from_numpy(
+                np.asarray(
+                    self.retrieval_arrays.source_start[index]
+                    if self.retrieval_arrays is not None
+                    and hasattr(self.retrieval_arrays, "source_start")
+                    else np.zeros(1),
                     dtype=np.int64,
                 ).copy()
             ),

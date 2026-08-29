@@ -24,6 +24,7 @@ from src.models.station_conditioned_diffusion import Station24DiffusionModel
 from station_graph_prior import prepare_training_graphs
 from station_dataset import (
     fit_station_forecast_mismatch_replay,
+    fit_station_unified_event_replay,
     fit_station_event_replay,
     fit_station_event_weighting,
     fit_station_residual_scale,
@@ -36,6 +37,7 @@ from station_dataset import (
     write_station_state_thresholds,
 )
 from station_retrieval_memory import build_retrieval_arrays
+from station_discrete_event_memory import build_discrete_event_arrays
 
 
 def parse_args() -> argparse.Namespace:
@@ -151,6 +153,37 @@ def build_body_tail_validation_events(
     These labels are used only to choose a checkpoint. They are never passed to
     generation or to the causal risk gate as inputs.
     """
+
+    if event_replay.get("method") == "train_unified_wind_event_replay_v1":
+        deep_active, deep_window, deep_severity = build_body_tail_validation_events(
+            batch, model, event_replay["deep_replay"]
+        )
+        mismatch_active, mismatch_window, mismatch_severity = (
+            build_body_tail_validation_events(
+                batch, model, event_replay["mismatch_replay"]
+            )
+        )
+        deep_scale = max(
+            float(event_replay["deep_replay"]["severity_thresholds"][0]), 1e-6
+        )
+        mismatch_scale = max(
+            float(event_replay["mismatch_replay"]["severity_thresholds"][0]),
+            1e-6,
+        )
+        choose_mismatch = (mismatch_active > 0) & (
+            (deep_active == 0)
+            | (mismatch_severity / mismatch_scale > deep_severity / deep_scale)
+        )
+        active = torch.maximum(deep_active, mismatch_active)
+        window = torch.where(
+            choose_mismatch[:, None], mismatch_window, deep_window
+        )
+        severity = torch.where(
+            choose_mismatch,
+            mismatch_severity / mismatch_scale,
+            deep_severity / deep_scale,
+        )
+        return active, window, severity
 
     if event_replay.get("method") == "train_independent_forecast_missed_ramp_replay_v1":
         window = int(event_replay["event_window_hours"])
@@ -448,6 +481,10 @@ def save_checkpoint(
         "train_retrieval_mismatch_only": bool(
             model.train_retrieval_mismatch_only
         ),
+        "use_discrete_event_memory": bool(model.use_discrete_event_memory),
+        "train_discrete_event_memory_only": bool(
+            model.train_discrete_event_memory_only
+        ),
         "tail_gate_loss_weight": float(model.tail_gate_loss_weight),
         "tail_common_gate_value": model.tail_common_gate_value,
         "body_tail_trainable_parameter_names": list(
@@ -458,6 +495,9 @@ def save_checkpoint(
         ),
         "retrieval_mismatch_trainable_parameter_names": list(
             model.retrieval_mismatch_trainable_parameter_names
+        ),
+        "discrete_event_trainable_parameter_names": list(
+            model.discrete_event_trainable_parameter_names
         ),
         "state_thresholds": (
             copy.deepcopy(dict(state_thresholds))
@@ -590,7 +630,11 @@ def main() -> None:
             raise ValueError(
                 "B1 event replay must not use the A1/A2 forecast correction head"
             )
-        if bool(config["model"].get("use_retrieval_mismatch_expert", False)):
+        if bool(config["model"].get("use_discrete_event_memory", False)):
+            event_replay = fit_station_unified_event_replay(
+                data_path, config["model"]
+            )
+        elif bool(config["model"].get("use_retrieval_mismatch_expert", False)):
             event_replay = fit_station_forecast_mismatch_replay(
                 data_path, config["model"]
             )
@@ -605,7 +649,26 @@ def main() -> None:
 
     train_retrieval = None
     val_retrieval = None
-    if bool(config["model"].get("use_retrieval_mismatch_expert", False)):
+    if bool(config["model"].get("use_discrete_event_memory", False)):
+        retrieval_k = int(config["model"].get("event_memory_top_k", 48))
+        exclusion_days = int(config["model"].get("retrieval_exclusion_days", 6))
+        event_quantile = float(config["model"].get("event_memory_quantile", 0.75))
+        stride = int(config["model"].get("event_memory_target_stride_hours", 3))
+        train_retrieval = build_discrete_event_arrays(
+            data_path, "train", retrieval_k, exclusion_days, event_quantile, stride
+        )
+        val_retrieval = build_discrete_event_arrays(
+            data_path, "val", retrieval_k, exclusion_days, event_quantile, stride
+        )
+        (run_dir / "discrete_event_memory_audit.json").write_text(
+            json.dumps(
+                {"train": train_retrieval.audit, "val": val_retrieval.audit},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    elif bool(config["model"].get("use_retrieval_mismatch_expert", False)):
         retrieval_k = int(config["model"].get("retrieval_top_k", 40))
         exclusion_days = int(config["model"].get("retrieval_exclusion_days", 6))
         train_retrieval = build_retrieval_arrays(
@@ -692,7 +755,43 @@ def main() -> None:
         initialization = torch.load(
             initialization_path, map_location="cpu", weights_only=False
         )
-        if model.train_retrieval_mismatch_only:
+        if model.train_discrete_event_memory_only:
+            if initialization.get("condition_variant") != (
+                "geo_history_actual_body_tail_moe"
+            ):
+                raise ValueError(
+                    "discrete event memory must initialize from the Raw "
+                    "geo_history_actual_body_tail_moe checkpoint"
+                )
+            source_state = initialization["model_state_dict"]
+            incompatible = model.load_state_dict(source_state, strict=False)
+            expected_missing = set(model.discrete_event_new_state_dict_keys)
+            if set(incompatible.missing_keys) != expected_missing:
+                raise ValueError(
+                    "unexpected discrete-event initialization gaps: "
+                    f"{sorted(incompatible.missing_keys)}"
+                )
+            if incompatible.unexpected_keys:
+                raise ValueError(
+                    "unexpected discrete-event initialization keys: "
+                    f"{sorted(incompatible.unexpected_keys)}"
+                )
+            trainable_names = model.configure_discrete_event_training()
+            initialization_manifest = {
+                "method": "frozen_raw_body_plus_unified_discrete_event_expert",
+                "checkpoint": str(initialization_path),
+                "checkpoint_state_source": "raw",
+                "source_condition_variant": str(initialization["condition_variant"]),
+                "source_epoch": int(initialization["epoch"]),
+                "body_frozen": True,
+                "third_mismatch_expert_used": False,
+                "topk_averaging": False,
+                "event_memory_top_k": int(
+                    config["model"].get("event_memory_top_k", 48)
+                ),
+                "trainable_parameter_names": list(trainable_names),
+            }
+        elif model.train_retrieval_mismatch_only:
             if initialization.get("condition_variant") != (
                 "geo_history_actual_body_tail_moe"
             ):
@@ -846,6 +945,8 @@ def main() -> None:
     ema_state = create_ema(model)
     if model.train_tail_time_localizer_only:
         ema_trainable_state_names = set(model.tail_time_state_dict_keys)
+    elif model.train_discrete_event_memory_only:
+        ema_trainable_state_names = set(model.discrete_event_state_dict_keys)
     elif model.use_body_tail_experts:
         ema_trainable_state_names = set(model.body_tail_state_dict_keys)
     else:
@@ -883,6 +984,8 @@ def main() -> None:
         f"tail_time_only={model.train_tail_time_localizer_only} "
         f"retrieval_mismatch={model.use_retrieval_mismatch_expert} "
         f"retrieval_mismatch_only={model.train_retrieval_mismatch_only} "
+        f"discrete_event_memory={model.use_discrete_event_memory} "
+        f"discrete_event_only={model.train_discrete_event_memory_only} "
         f"tail_gate_weight={model.tail_gate_loss_weight} "
         f"tail_common_gate={model.tail_common_gate_value} "
         f"common_gate={model.wind_common_gate_value} "
@@ -1117,6 +1220,10 @@ def main() -> None:
         "train_retrieval_mismatch_only": bool(
             model.train_retrieval_mismatch_only
         ),
+        "use_discrete_event_memory": bool(model.use_discrete_event_memory),
+        "train_discrete_event_memory_only": bool(
+            model.train_discrete_event_memory_only
+        ),
         "body_tail_trainable_parameter_names": list(
             model.body_tail_trainable_parameter_names
         ),
@@ -1125,6 +1232,9 @@ def main() -> None:
         ),
         "retrieval_mismatch_trainable_parameter_names": list(
             model.retrieval_mismatch_trainable_parameter_names
+        ),
+        "discrete_event_trainable_parameter_names": list(
+            model.discrete_event_trainable_parameter_names
         ),
         "residual_scaling_method": str(
             residual_scale.get("method", "per_station_std")
