@@ -127,6 +127,23 @@ def _event_candidates(
     if not records:
         raise ValueError("no train-only wind event prototypes survived selection")
     records.sort(key=lambda row: (row["duration"], row["event_type"], row["timestamp"]))
+    # Normalize event magnitude within morphology/duration so a quota can retain
+    # genuinely severe downside prototypes without comparing incomparable raw
+    # ramp and level scores.
+    for duration in EVENT_DURATIONS:
+        for type_index in range(len(EVENT_TYPES)):
+            group = [
+                row
+                for row in records
+                if int(row["duration"]) == duration
+                and int(row["event_type"]) == type_index
+            ]
+            if not group:
+                continue
+            order = sorted(group, key=lambda row: float(row["score"]))
+            denominator = max(len(order) - 1, 1)
+            for rank, row in enumerate(order):
+                row["severity_rank"] = float(rank / denominator)
     return records
 
 
@@ -137,6 +154,7 @@ def build_discrete_event_arrays(
     exclusion_days: int = 6,
     event_quantile: float = 0.75,
     target_stride_hours: int = 3,
+    severe_downside_fraction: float = 0.0,
 ) -> DiscreteEventArrays:
     """Return leakage-safe local event candidates for ``split``.
 
@@ -153,6 +171,8 @@ def build_discrete_event_arrays(
         raise ValueError("event_quantile must be in [0.5,1)")
     if target_stride_hours not in {1, 2, 3, 4, 6, 12}:
         raise ValueError("unsupported target_stride_hours")
+    if not 0.0 <= severe_downside_fraction <= 0.5:
+        raise ValueError("severe_downside_fraction must be in [0,0.5]")
     data_dir = Path(data_dir)
     stations = pd.read_csv(data_dir / "station_order.csv").sort_values(
         "channel_index"
@@ -275,6 +295,37 @@ def build_discrete_event_arrays(
         chosen: list[tuple[float, int, int]] = []
         seen_cells: set[tuple[int, int, int]] = set()
         seen_exact: set[tuple[int, int]] = set()
+        severe_quota = int(round(top_k * severe_downside_fraction))
+        if severe_quota:
+            downside = [
+                item
+                for item in pool
+                if int(records[item[1]]["event_type"]) in {0, 1}
+            ]
+            downside.sort(
+                key=lambda item: (
+                    -float(records[item[1]].get("severity_rank", 0.0)),
+                    float(item[0]),
+                )
+            )
+            severe_cells: set[tuple[int, int, int]] = set()
+            for item in downside:
+                _, record_index, target_start = item
+                row = records[record_index]
+                cell = (
+                    target_start // 24,
+                    int(row["event_type"]),
+                    int(row["duration"]),
+                )
+                exact = (record_index, target_start)
+                if cell in severe_cells or exact in seen_exact:
+                    continue
+                chosen.append(item)
+                severe_cells.add(cell)
+                seen_cells.add(cell)
+                seen_exact.add(exact)
+                if len(chosen) == severe_quota:
+                    break
         for item in pool:
             _, record_index, target_start = item
             row = records[record_index]
@@ -346,7 +397,7 @@ def build_discrete_event_arrays(
         target_start=target_start_array,
         source_start=source_start_array,
         audit={
-            "method": "train_only_multiscale_joint_wind_discrete_event_memory_v1",
+            "method": "train_only_stratified_joint_wind_discrete_event_memory_v2",
             "split": split,
             "query_count": int(query_count),
             "event_bank_count": int(len(records)),
@@ -356,6 +407,10 @@ def build_discrete_event_arrays(
             "event_quantile": float(event_quantile),
             "top_k_candidate_pool": int(top_k),
             "target_stride_hours": int(target_stride_hours),
+            "severe_downside_fraction": float(severe_downside_fraction),
+            "severe_downside_quota": int(
+                round(top_k * severe_downside_fraction)
+            ),
             "mean_effective_k": float(effective_k.mean()),
             "selection_contract": "one_discrete_prototype_per_generated_event_member",
             "topk_averaging": False,

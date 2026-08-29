@@ -595,6 +595,158 @@ class StationForecastCorrectionHead(nn.Module):
         return correction.reshape(batch, stations, length)
 
 
+class StationForecastTrustHead(nn.Module):
+    """Learn a causal station/hour mixture of forecast and historical analogs.
+
+    ``history_fraction`` is zero for complete forecast trust and one for complete
+    historical-center trust.  The head sees no future actual values: current
+    issuance forecasts, train-only retrieved history, previous-issuance
+    revision/error, station metadata, calendar, and lead time are its inputs.
+    """
+
+    def __init__(
+        self,
+        config: Mapping[str, object],
+        station_features: torch.Tensor,
+        groups: int,
+    ) -> None:
+        super().__init__()
+        self.station_count = int(config.get("station_count", 24))
+        self.recent_error_hours = int(config.get("recent_error_hours", 24))
+        hidden = int(config.get("forecast_trust_channels", 32))
+        if hidden <= 0:
+            raise ValueError("forecast_trust_channels must be positive")
+        initial = tuple(
+            float(value)
+            for value in config.get(
+                "forecast_trust_initial_history_fraction",
+                [0.15, 0.18, 0.22, 0.28, 0.35, 0.45, 0.55],
+            )
+        )
+        if len(initial) != 7 or any(not 0.0 < value < 1.0 for value in initial):
+            raise ValueError(
+                "forecast_trust_initial_history_fraction must contain seven values in (0,1)"
+            )
+        initial_tensor = torch.tensor(initial, dtype=torch.float32)
+        self.lead_day_logits = nn.Parameter(torch.logit(initial_tensor))
+
+        # forecast, historical center/dispersion, their difference, and
+        # forecast ramps at 1/3/6 hours; calendar+lead; revision+mask.
+        main_channels = 7 + 10 + 2
+        self.main_stem = nn.Sequential(
+            nn.Conv1d(main_channels, hidden, kernel_size=5, padding=2),
+            nn.GroupNorm(_group_count(hidden, groups), hidden),
+            nn.SiLU(),
+            nn.Conv1d(hidden, hidden, kernel_size=3, padding=2, dilation=2),
+            nn.GroupNorm(_group_count(hidden, groups), hidden),
+            nn.SiLU(),
+        )
+        self.station_projection = nn.Linear(
+            int(station_features.shape[1]), hidden
+        )
+        self.register_buffer(
+            "station_features", station_features.float(), persistent=False
+        )
+        self.recent_encoder = nn.Sequential(
+            nn.Conv1d(1, hidden, kernel_size=3, padding=1),
+            nn.GroupNorm(_group_count(hidden, groups), hidden),
+            nn.SiLU(),
+            nn.Conv1d(hidden, hidden, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
+        self.fusion = nn.Sequential(
+            nn.Conv1d(hidden * 3, hidden, kernel_size=3, padding=1),
+            nn.GroupNorm(_group_count(hidden, groups), hidden),
+            nn.SiLU(),
+            nn.Conv1d(hidden, hidden, kernel_size=3, padding=4, dilation=4),
+            nn.GroupNorm(_group_count(hidden, groups), hidden),
+            nn.SiLU(),
+        )
+        self.output = nn.Conv1d(hidden, 1, kernel_size=1)
+        # The first forward pass exactly follows the explicit lead-day prior;
+        # training then learns station/hour deviations instead of starting from
+        # a random and potentially destructive center.
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    @staticmethod
+    def _difference(value: torch.Tensor, lag: int) -> torch.Tensor:
+        output = torch.zeros_like(value)
+        output[..., lag:] = value[..., lag:] - value[..., :-lag]
+        return output
+
+    def forward(
+        self,
+        forecast: torch.Tensor,
+        historical_center: torch.Tensor,
+        historical_dispersion: torch.Tensor,
+        calendar: torch.Tensor,
+        lead: torch.Tensor,
+        forecast_revision: torch.Tensor,
+        revision_mask: torch.Tensor,
+        recent_error: torch.Tensor,
+        recent_error_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if forecast.ndim != 3:
+            raise ValueError("forecast trust expects forecast [B,S,L]")
+        batch, stations, length = forecast.shape
+        expected = (batch, stations, length)
+        for name, value in (
+            ("historical_center", historical_center),
+            ("historical_dispersion", historical_dispersion),
+            ("forecast_revision", forecast_revision),
+            ("revision_mask", revision_mask),
+        ):
+            if value.shape != expected:
+                raise ValueError(f"forecast trust {name} must be [B,S,L]")
+        if stations != self.station_count or length != 168:
+            raise ValueError("forecast trust expects configured stations and 168 hours")
+        if calendar.shape != (batch, 8, length) or lead.shape != (batch, 2, length):
+            raise ValueError("forecast trust calendar/lead shape mismatch")
+        if recent_error.shape != (batch, stations, self.recent_error_hours):
+            raise ValueError("forecast trust recent_error shape mismatch")
+        if recent_error_mask.shape != (batch, stations, 1):
+            raise ValueError("forecast trust recent_error_mask shape mismatch")
+
+        delta = historical_center - forecast
+        local = torch.stack(
+            [
+                forecast,
+                historical_center,
+                historical_dispersion,
+                delta,
+                self._difference(forecast, 1),
+                self._difference(forecast, 3),
+                self._difference(forecast, 6),
+            ],
+            dim=2,
+        ).reshape(batch * stations, 7, length)
+        temporal = torch.cat([calendar, lead], dim=1)
+        temporal = temporal[:, None].expand(-1, stations, -1, -1)
+        temporal = temporal.reshape(batch * stations, 10, length)
+        revision = torch.stack(
+            [forecast_revision * revision_mask, revision_mask], dim=2
+        ).reshape(batch * stations, 2, length)
+        main = self.main_stem(torch.cat([local, temporal, revision], dim=1))
+
+        station = self.station_projection(self.station_features)
+        station = station[None, :, :, None].expand(batch, -1, -1, length)
+        station = station.reshape(batch * stations, station.shape[2], length)
+        recent = self.recent_encoder(
+            recent_error.reshape(batch * stations, 1, self.recent_error_hours)
+        )
+        recent = 0.5 * (recent.mean(dim=-1) + recent[:, :, -1])
+        recent = recent * recent_error_mask.reshape(batch * stations, 1)
+        recent = recent[:, :, None].expand(-1, -1, length)
+        learned_logit = self.output(
+            self.fusion(torch.cat([main, station, recent], dim=1))
+        ).reshape(batch, stations, length)
+        day_logit = self.lead_day_logits.repeat_interleave(24)
+        history_fraction = torch.sigmoid(learned_logit + day_logit[None, None])
+        center = forecast + history_fraction * delta
+        return center, history_fraction
+
+
 class StationStateEncoder(nn.Module):
     """Lightweight multi-scale encoder for four causal state-v1 features."""
 
@@ -2986,6 +3138,36 @@ class Station24DiffusionModel(nn.Module):
         self.forecast_correction_huber_beta = float(
             self.config.get("forecast_correction_huber_beta", 0.05)
         )
+        self.use_forecast_trust_center = bool(
+            self.config.get("use_forecast_trust_center", False)
+        )
+        self.forecast_trust_center_loss_weight = float(
+            self.config.get("forecast_trust_center_loss_weight", 0.0)
+        )
+        self.forecast_trust_oracle_loss_weight = float(
+            self.config.get("forecast_trust_oracle_loss_weight", 0.0)
+        )
+        self.forecast_trust_smoothness_weight = float(
+            self.config.get("forecast_trust_smoothness_weight", 0.0)
+        )
+        if self.use_forecast_trust_center and self.forecast_correction_mode != "none":
+            raise ValueError(
+                "forecast trust center replaces the legacy additive correction head"
+            )
+        if self.use_forecast_trust_center and min(
+            self.forecast_trust_center_loss_weight,
+            self.forecast_trust_oracle_loss_weight,
+        ) <= 0:
+            raise ValueError("forecast trust center/oracle loss weights must be positive")
+        if not self.use_forecast_trust_center and any(
+            value != 0.0
+            for value in (
+                self.forecast_trust_center_loss_weight,
+                self.forecast_trust_oracle_loss_weight,
+                self.forecast_trust_smoothness_weight,
+            )
+        ):
+            raise ValueError("forecast trust losses must be zero when disabled")
         if self.forecast_correction_mode != "none":
             if self.forecast_correction_loss_weight <= 0:
                 raise ValueError(
@@ -3006,6 +3188,22 @@ class Station24DiffusionModel(nn.Module):
                     "forecast correction loss weight must be zero when disabled"
                 )
             self.forecast_correction_head = None
+        self.forecast_trust_head: StationForecastTrustHead | None = None
+        if self.use_forecast_trust_center:
+            self.forecast_trust_head = StationForecastTrustHead(
+                self.config,
+                station_features,
+                int(self.config.get("group_norm_groups", 8)),
+            )
+        self.event_prototype_anchor_strength = float(
+            self.config.get("event_prototype_anchor_strength", 0.0)
+        )
+        if self.event_prototype_anchor_strength < 0.0:
+            raise ValueError("event_prototype_anchor_strength must be non-negative")
+        if self.event_prototype_anchor_strength > 0.0 and not self.use_discrete_event_memory:
+            raise ValueError(
+                "event prototype anchor requires discrete event memory"
+            )
         self.denoiser = StationConditionalResUNet1D(
             self.config,
             station_features,
@@ -3261,6 +3459,20 @@ class Station24DiffusionModel(nn.Module):
             if name.startswith("event_memory_selector.")
         )
         return tuple(sorted(keys))
+
+    @property
+    def forecast_trust_new_state_dict_keys(self) -> tuple[str, ...]:
+        """Parameters absent from the Raw body-tail initialization checkpoint."""
+
+        if not self.use_forecast_trust_center:
+            return ()
+        return tuple(
+            sorted(
+                name
+                for name, _ in self.named_parameters()
+                if name.startswith("forecast_trust_head.")
+            )
+        )
 
     @property
     def discrete_event_state_dict_keys(self) -> tuple[str, ...]:
@@ -3625,6 +3837,37 @@ class Station24DiffusionModel(nn.Module):
             recent_error_mask=batch.get("recent_error_mask"),
         )
 
+    def predict_forecast_center(
+        self, batch: Mapping[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the causal body center and its historical mixing fraction."""
+
+        forecast = batch["forecast"]
+        if self.forecast_trust_head is None:
+            return forecast, torch.zeros_like(forecast)
+        required = (
+            "historical_center",
+            "historical_dispersion",
+            "forecast_revision",
+            "revision_mask",
+            "recent_error",
+            "recent_error_mask",
+        )
+        missing = [name for name in required if name not in batch]
+        if missing:
+            raise ValueError(f"forecast trust batch lacks {missing}")
+        return self.forecast_trust_head(
+            forecast,
+            batch["historical_center"],
+            batch["historical_dispersion"],
+            batch["calendar"],
+            batch["lead"],
+            batch["forecast_revision"],
+            batch["revision_mask"],
+            batch["recent_error"],
+            batch["recent_error_mask"],
+        )
+
     def forward(
         self,
         batch: Mapping[str, torch.Tensor],
@@ -3635,10 +3878,16 @@ class Station24DiffusionModel(nn.Module):
         body_tail_event_masking: bool = False,
     ) -> torch.Tensor:
         correction = self.predict_forecast_correction(batch)
+        condition_forecast, history_fraction = self.predict_forecast_center(batch)
         clean = batch["residual_target"]
-        condition_forecast = batch["forecast"]
+        scale = batch.get("residual_scale")
+        if self.use_forecast_trust_center:
+            if scale is None or scale.shape != condition_forecast.shape:
+                raise ValueError("forecast trust requires residual_scale [B,S,L]")
+            if "actual" not in batch or batch["actual"].shape != condition_forecast.shape:
+                raise ValueError("forecast trust requires actual training target [B,S,L]")
+            clean = (batch["actual"] - condition_forecast) / scale
         if self.forecast_correction_head is not None:
-            scale = batch.get("residual_scale")
             if scale is None or scale.shape != correction.shape:
                 raise ValueError(
                     "forecast correction requires residual_scale [B,S,L]"
@@ -3665,6 +3914,14 @@ class Station24DiffusionModel(nn.Module):
                 _,
             ) = self.select_event_memory(batch)
             tail_route = 1.0
+            if self.event_prototype_anchor_strength > 0.0:
+                active = batch["event_active"].to(clean.dtype)[:, None, None]
+                anchor = (
+                    event_prototype
+                    * event_memory_time_mask[:, None, :].to(clean.dtype)
+                    * active
+                )
+                clean = clean - self.event_prototype_anchor_strength * anchor
             if include_auxiliary or body_tail_event_masking:
                 epsilon_sample_weight = self.body_tail_epsilon_weight(batch)
         elif self.use_retrieval_mismatch_expert:
@@ -3790,6 +4047,40 @@ class Station24DiffusionModel(nn.Module):
                 min=1.0
             )
             diffusion_loss = diffusion_loss + self.tail_gate_loss_weight * gate_loss
+        if self.use_forecast_trust_center:
+            valid = batch["valid_mask"].to(diffusion_loss.dtype)
+            center_error = F.smooth_l1_loss(
+                condition_forecast,
+                batch["actual"],
+                reduction="none",
+                beta=float(self.config.get("forecast_trust_huber_beta", 0.05)),
+            )
+            center_loss = (center_error * valid).sum() / valid.sum().clamp(min=1.0)
+            delta = batch["historical_center"] - batch["forecast"]
+            needed = batch["actual"] - batch["forecast"]
+            oracle = (needed * delta) / (delta.square() + 1e-5)
+            oracle = oracle.clamp(0.0, 1.0).detach()
+            oracle_error = F.smooth_l1_loss(
+                history_fraction, oracle, reduction="none", beta=0.1
+            )
+            # A mixing coefficient is identifiable only where the two centers
+            # differ. Near-equal centers must not manufacture a false beta=0
+            # target and overwhelm informative mismatch hours.
+            oracle_weight = (delta.detach().abs() / 0.10).clamp(max=1.0) * valid
+            oracle_loss = (oracle_error * oracle_weight).sum() / oracle_weight.sum().clamp(
+                min=1.0
+            )
+            smoothness = (history_fraction[..., 1:] - history_fraction[..., :-1]).abs()
+            smooth_valid = valid[..., 1:] * valid[..., :-1]
+            smoothness_loss = (smoothness * smooth_valid).sum() / smooth_valid.sum().clamp(
+                min=1.0
+            )
+            diffusion_loss = (
+                diffusion_loss
+                + self.forecast_trust_center_loss_weight * center_loss
+                + self.forecast_trust_oracle_loss_weight * oracle_loss
+                + self.forecast_trust_smoothness_weight * smoothness_loss
+            )
         if self.forecast_correction_head is None:
             return diffusion_loss
         correction_error = F.smooth_l1_loss(
@@ -3812,6 +4103,7 @@ class Station24DiffusionModel(nn.Module):
         return_expert_audit: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         correction = self.predict_forecast_correction(batch)
+        forecast_center, history_fraction = self.predict_forecast_center(batch)
         tail_probability = None
         tail_route = None
         tail_time_probability = None
@@ -3903,7 +4195,7 @@ class Station24DiffusionModel(nn.Module):
         else:
             tail_attention = None
         samples = self.diffusion.sample(
-            batch["forecast"] + correction,
+            forecast_center + correction,
             batch["calendar"],
             batch["lead"],
             n_samples,
@@ -3921,6 +4213,15 @@ class Station24DiffusionModel(nn.Module):
             mismatch_expert_route=mismatch_route,
             mismatch_time_gate=mismatch_time_probability,
         )
+        if (
+            self.event_prototype_anchor_strength > 0.0
+            and event_prototype is not None
+            and tail_time_mask is not None
+        ):
+            samples = samples + self.event_prototype_anchor_strength * (
+                event_prototype
+                * tail_time_mask[:, :, None, :].to(event_prototype.dtype)
+            )
         if not return_expert_audit:
             return samples
         batch_size = batch["forecast"].shape[0]
@@ -4016,4 +4317,6 @@ class Station24DiffusionModel(nn.Module):
             "event_memory_type": event_memory_type,
             "event_memory_duration": event_memory_duration,
             "event_memory_train_index": event_memory_train_index,
+            "forecast_center": forecast_center,
+            "forecast_history_fraction": history_fraction,
         }

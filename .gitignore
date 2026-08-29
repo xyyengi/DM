@@ -32,3 +32,5 @@ __pycache__/
 /tests/test_joint_calibration.py
 /tools/analyze_solar_crs_joint_calibration.py
 /tools/evaluate_v5tf_extreme_events.py
+# Local PaperSpine/report rewriting artifacts are not model source files.
+paper_rewriting_output/

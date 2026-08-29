@@ -38,6 +38,7 @@ from station_dataset import (
 )
 from station_retrieval_memory import build_retrieval_arrays
 from station_discrete_event_memory import build_discrete_event_arrays
+from station_forecast_trust import build_forecast_trust_arrays
 
 
 def parse_args() -> argparse.Namespace:
@@ -461,6 +462,16 @@ def save_checkpoint(
         "forecast_condition_dropout_statistics": (
             model.forecast_condition_dropout_statistics
         ),
+        "use_forecast_trust_center": bool(model.use_forecast_trust_center),
+        "forecast_trust_center_loss_weight": float(
+            model.forecast_trust_center_loss_weight
+        ),
+        "forecast_trust_oracle_loss_weight": float(
+            model.forecast_trust_oracle_loss_weight
+        ),
+        "event_prototype_anchor_strength": float(
+            model.event_prototype_anchor_strength
+        ),
         "forecast_correction_mode": model.forecast_correction_mode,
         "forecast_correction_loss_weight": float(
             model.forecast_correction_loss_weight
@@ -649,16 +660,33 @@ def main() -> None:
 
     train_retrieval = None
     val_retrieval = None
+    train_forecast_trust = None
+    val_forecast_trust = None
     if bool(config["model"].get("use_discrete_event_memory", False)):
         retrieval_k = int(config["model"].get("event_memory_top_k", 48))
         exclusion_days = int(config["model"].get("retrieval_exclusion_days", 6))
         event_quantile = float(config["model"].get("event_memory_quantile", 0.75))
         stride = int(config["model"].get("event_memory_target_stride_hours", 3))
+        severe_fraction = float(
+            config["model"].get("event_memory_severe_downside_fraction", 0.0)
+        )
         train_retrieval = build_discrete_event_arrays(
-            data_path, "train", retrieval_k, exclusion_days, event_quantile, stride
+            data_path,
+            "train",
+            retrieval_k,
+            exclusion_days,
+            event_quantile,
+            stride,
+            severe_fraction,
         )
         val_retrieval = build_discrete_event_arrays(
-            data_path, "val", retrieval_k, exclusion_days, event_quantile, stride
+            data_path,
+            "val",
+            retrieval_k,
+            exclusion_days,
+            event_quantile,
+            stride,
+            severe_fraction,
         )
         (run_dir / "discrete_event_memory_audit.json").write_text(
             json.dumps(
@@ -685,6 +713,50 @@ def main() -> None:
             ),
             encoding="utf-8",
         )
+    if bool(config["model"].get("use_forecast_trust_center", False)):
+        trust_k = int(config["model"].get("forecast_trust_top_k", 24))
+        trust_exclusion = int(
+            config["model"].get("forecast_trust_exclusion_days", 6)
+        )
+        trust_temperature = float(
+            config["model"].get("forecast_trust_retrieval_temperature", 0.75)
+        )
+        train_forecast_trust = build_forecast_trust_arrays(
+            data_path, "train", trust_k, trust_exclusion, trust_temperature
+        )
+        val_forecast_trust = build_forecast_trust_arrays(
+            data_path, "val", trust_k, trust_exclusion, trust_temperature
+        )
+        if bool(
+            config["model"].get(
+                "forecast_trust_initialize_from_train_cross_retrieval", True
+            )
+        ):
+            fitted_prior = train_forecast_trust.audit.get(
+                "train_cross_retrieval_least_squares_history_fraction_by_lead_day"
+            )
+            if not isinstance(fitted_prior, list) or len(fitted_prior) != 7:
+                raise ValueError("train cross-retrieval trust prior was not fitted")
+            config["model"]["forecast_trust_initial_history_fraction"] = [
+                float(value) for value in fitted_prior
+            ]
+            # Persist the actual train-only fitted prior used to construct the
+            # model, replacing the provisional values from the source config.
+            (run_dir / "config_used.yaml").write_text(
+                yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
+                encoding="utf-8",
+            )
+        (run_dir / "forecast_trust_retrieval_audit.json").write_text(
+            json.dumps(
+                {
+                    "train": train_forecast_trust.audit,
+                    "val": val_forecast_trust.audit,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     train_loader, train_dataset = get_station_dataloader(
         data_path,
         "train",
@@ -703,6 +775,7 @@ def main() -> None:
         event_weighting=event_weighting,
         event_replay=event_replay,
         retrieval_arrays=train_retrieval,
+        forecast_trust_arrays=train_forecast_trust,
     )
     val_loader, val_dataset = get_station_dataloader(
         data_path,
@@ -722,6 +795,7 @@ def main() -> None:
         event_weighting=event_weighting,
         event_replay=event_replay,
         retrieval_arrays=val_retrieval,
+        forecast_trust_arrays=val_forecast_trust,
     )
     (run_dir / "condition_feature_audit.json").write_text(
         json.dumps(
@@ -755,7 +829,46 @@ def main() -> None:
         initialization = torch.load(
             initialization_path, map_location="cpu", weights_only=False
         )
-        if model.train_discrete_event_memory_only:
+        if model.use_forecast_trust_center:
+            if initialization.get("condition_variant") != (
+                "geo_history_actual_body_tail_moe"
+            ):
+                raise ValueError(
+                    "forecast-trust dual-center training must initialize from "
+                    "the Raw geo_history_actual_body_tail_moe checkpoint"
+                )
+            source_state = initialization["model_state_dict"]
+            incompatible = model.load_state_dict(source_state, strict=False)
+            expected_missing = set(model.forecast_trust_new_state_dict_keys)
+            expected_missing.update(model.discrete_event_new_state_dict_keys)
+            if set(incompatible.missing_keys) != expected_missing:
+                raise ValueError(
+                    "unexpected forecast-trust initialization gaps: "
+                    f"{sorted(incompatible.missing_keys)}"
+                )
+            if incompatible.unexpected_keys:
+                raise ValueError(
+                    "unexpected forecast-trust initialization keys: "
+                    f"{sorted(incompatible.unexpected_keys)}"
+                )
+            # This is an end-to-end structural candidate: the Raw body is a
+            # stable starting point, not a frozen component.
+            trainable_names = tuple(
+                sorted(name for name, value in model.named_parameters() if value.requires_grad)
+            )
+            initialization_manifest = {
+                "method": "raw_initialized_end_to_end_forecast_trust_plus_event_memory",
+                "checkpoint": str(initialization_path),
+                "checkpoint_state_source": "raw",
+                "source_condition_variant": str(initialization["condition_variant"]),
+                "source_epoch": int(initialization["epoch"]),
+                "body_frozen": False,
+                "two_experts_only": True,
+                "dynamic_forecast_history_center": True,
+                "direct_event_x0_anchor": float(model.event_prototype_anchor_strength),
+                "trainable_parameter_names": list(trainable_names),
+            }
+        elif model.train_discrete_event_memory_only:
             if initialization.get("condition_variant") != (
                 "geo_history_actual_body_tail_moe"
             ):
@@ -943,7 +1056,11 @@ def main() -> None:
     # Validate the schedule before the expensive training loop starts.
     ema_decay_for_step(ema_decay, 1, ema_warmup)
     ema_state = create_ema(model)
-    if model.train_tail_time_localizer_only:
+    if model.use_forecast_trust_center:
+        # The structural candidate updates body, trust head, and unified event
+        # branch end to end, so EMA must track the complete state.
+        ema_trainable_state_names = None
+    elif model.train_tail_time_localizer_only:
         ema_trainable_state_names = set(model.tail_time_state_dict_keys)
     elif model.train_discrete_event_memory_only:
         ema_trainable_state_names = set(model.discrete_event_state_dict_keys)
@@ -1200,6 +1317,16 @@ def main() -> None:
         ),
         "forecast_condition_dropout_statistics": (
             model.forecast_condition_dropout_statistics
+        ),
+        "use_forecast_trust_center": bool(model.use_forecast_trust_center),
+        "forecast_trust_center_loss_weight": float(
+            model.forecast_trust_center_loss_weight
+        ),
+        "forecast_trust_oracle_loss_weight": float(
+            model.forecast_trust_oracle_loss_weight
+        ),
+        "event_prototype_anchor_strength": float(
+            model.event_prototype_anchor_strength
         ),
         "spatial_gate_values": model.spatial_gate_values,
         "parallel_spatial_gate_statistics": (

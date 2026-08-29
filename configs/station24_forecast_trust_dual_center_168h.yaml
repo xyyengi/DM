@@ -1,0 +1,182 @@
+experiment:
+  name: "station24_forecast_trust_dual_center_168h"
+  family: "station24_forecast_trust_body_event"
+  variant: "geo_history_actual_forecast_trust_dual_center_event"
+  description: "End-to-end dynamic forecast/history body center plus one stratified discrete wind-event expert"
+
+data:
+  data_path: "./diffusion_input_station"
+  station_count: 24
+  sequence_length: 168
+  residual_definition: "actual_minus_dynamic_forecast_history_center"
+
+target:
+  type: "dynamic_center_residual"
+  residual_scaling:
+    method: "wind_factorized_condition_std"
+    fit_split: "train"
+    center: false
+    epsilon: 1.0e-4
+    forecast_level_quantiles: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    forecast_ramp_quantiles: [0.0, 0.25, 0.5, 0.75, 1.0]
+    forecast_revision_quantiles: [0.0, 0.25, 0.5, 0.75, 1.0]
+    ramp_lag: 3
+    factor_iterations: 6
+    factor_clip: [0.5, 2.0]
+
+model:
+  architecture: "station24_resunet"
+  spatial_mode: "fixed_graph"
+  spatial_mix_levels: ["bottleneck"]
+  spatial_gate_init: -1.0
+  parallel_spatial_fusion_levels: ["encoder_0"]
+  parallel_spatial_gate_init: -1.0
+  parallel_spatial_adjacency_mode: "fixed"
+  use_dual_fixed_graph: true
+  secondary_adjacency_path: null
+  secondary_adjacency_role: "train_unique_actual_power"
+  secondary_adjacency_fit_split: "train"
+  dual_graph_primary_logit_init: 2.0
+  dual_graph_secondary_logit_init: 0.0
+  station_count: 24
+  sequence_length: 168
+  base_channels: 32
+  num_layers: 3
+  channel_multipliers: [1, 2, 4]
+  group_norm_groups: 8
+  dropout: 0.10
+  timestep_embedding_dim: 128
+  num_steps: 500
+  beta_start: 0.0001
+  beta_end: 0.04
+  schedule: "linear"
+  reverse_variance_type: "posterior"
+  use_forecast_ramps: false
+  forecast_ramp_lags: [3, 6]
+  use_forecast_revision: false
+  use_recent_error: true
+  recent_error_hours: 24
+  condition_gate_init: -1.0
+  use_state_encoder: true
+  state_feature_dim: 4
+  state_feature_names:
+    - "low_output_severity"
+    - "high_output_severity"
+    - "ramp_up_severity"
+    - "ramp_down_severity"
+  state_channels: [8, 16, 32]
+  state_ramp_lags: [3, 6]
+  state_low_quantile: 0.20
+  state_high_quantile: 0.90
+  state_ramp_quantile: 0.90
+  state_clip: 3.0
+  state_global_gate_init: -1.0
+  state_film_gate_init: -1.0
+
+  # Structural body change: forecast no longer has a fixed coefficient of one.
+  # A causal station/hour gate mixes the current issuance with a train-only
+  # historical analog center; its prior deliberately increases across lead days.
+  use_forecast_correction: false
+  forecast_correction_loss_weight: 0.0
+  use_forecast_trust_center: true
+  forecast_trust_channels: 32
+  forecast_trust_top_k: 8
+  forecast_trust_exclusion_days: 6
+  forecast_trust_retrieval_temperature: 0.10
+  forecast_trust_initialize_from_train_cross_retrieval: true
+  # Provisional only; train_station24 replaces this with seven train-only
+  # cross-retrieval least-squares coefficients before model construction.
+  forecast_trust_initial_history_fraction: [0.15, 0.15, 0.16, 0.16, 0.16, 0.16, 0.17]
+  forecast_trust_center_loss_weight: 0.20
+  forecast_trust_oracle_loss_weight: 0.10
+  forecast_trust_smoothness_weight: 0.01
+  forecast_trust_huber_beta: 0.05
+
+  # Exactly two experts: one common body and one unified wind-event expert.
+  use_body_tail_experts: true
+  tail_expert_channels: 16
+  tail_epsilon_context_hours: 6
+  tail_common_gate_init: -1.0
+  tail_gate_channels: 16
+  tail_gate_prior_probability: 0.076
+  tail_gate_loss_weight: 0.10
+  use_retrieval_mismatch_expert: false
+  train_retrieval_mismatch_only: false
+
+  use_discrete_event_memory: true
+  train_discrete_event_memory_only: false
+  event_memory_top_k: 48
+  event_memory_quantile: 0.75
+  event_memory_target_stride_hours: 3
+  event_memory_severe_downside_fraction: 0.25
+  retrieval_exclusion_days: 6
+  event_selector_channels: 32
+  event_selector_prior_strength: 0.35
+  event_selector_temperature: 0.75
+  event_selector_loss_weight: 0.10
+  # Selected joint event trajectories contribute directly to standardized x0;
+  # they are not reduced to an averaged retrieval embedding.
+  event_prototype_anchor_strength: 0.60
+
+  use_extreme_event_weighting: false
+  use_event_replay_x0: true
+  event_replay_window_hours: 12
+  event_replay_merge_gap_hours: 12
+  event_replay_quantiles: [0.80, 0.90]
+  event_replay_weights: [2.0, 4.0]
+  mismatch_ramp_lags: [1, 3, 6]
+  mismatch_event_window_hours: 12
+  mismatch_merge_gap_hours: 12
+  mismatch_replay_quantiles: [0.80, 0.90]
+  mismatch_replay_weights: [2.0, 4.0]
+  mismatch_forecast_magnitude_fraction: 0.50
+  ramp_auxiliary_loss_weight: 0.0
+  ramp_auxiliary_lags: [1, 3, 6]
+  ramp_auxiliary_lag_weights: [0.5, 0.3, 0.2]
+  event_x0_magnitude_loss_weight: 0.05
+  event_x0_timing_loss_weight: 0.005
+  event_x0_sync_loss_weight: 0.025
+  event_x0_window_hours: 12
+  event_x0_error_scale: 0.10
+  event_x0_timing_temperature: 0.05
+
+train:
+  batch_size: 16
+  gradient_accumulation_steps: 1
+  effective_batch_size: 16
+  lr: 8.0e-5
+  epochs: 250
+  weight_decay: 1.0e-4
+  patience: 30
+  validation_every: 5
+  min_delta: 1.0e-5
+  gradient_clip_norm: 1.0
+  ema_decay: 0.999
+  ema_warmup:
+    enabled: true
+    inv_gamma: 1.0
+    power: 0.75
+    min_decay: 0.0
+    update_after_step: 0
+  mixed_precision: true
+  save_every: 50
+  seed: 2027
+  validation_seed: 314159
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 2
+
+evaluation:
+  split: "val"
+  n_samples: 500
+  generation_seed: 424242
+  issue_batch_size: 2
+  member_chunk_size: 500
+  auto_tune_member_chunk: true
+  member_chunk_candidates: [500, 384, 256, 192, 128, 96, 64]
+  max_generation_memory_fraction: 0.82
+  generation_probe_steps: 8
+  energy_score_member_limit: 80
+  quantiles: [0.80, 0.90, 0.95, 0.99]
+  physical_projection: "clip_0_1_and_station_astronomical_solar_night"
+  test_locked: true

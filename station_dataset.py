@@ -1349,6 +1349,7 @@ class StationForecastDataset(Dataset):
         event_weighting: Mapping[str, object] | None = None,
         event_replay: Mapping[str, object] | None = None,
         retrieval_arrays: object | None = None,
+        forecast_trust_arrays: object | None = None,
     ) -> None:
         if split not in {"train", "val", "test"}:
             raise ValueError(f"unsupported split={split!r}")
@@ -1399,6 +1400,15 @@ class StationForecastDataset(Dataset):
                             f"retrieval {name} query count {value.shape[0]} "
                             f"does not match {split}={expected_queries}"
                         )
+        self.forecast_trust_arrays = forecast_trust_arrays
+        if forecast_trust_arrays is not None:
+            expected = (len(self.forecast), EXPECTED_HOURS, EXPECTED_STATIONS)
+            for name in ("center", "dispersion"):
+                value = np.asarray(getattr(forecast_trust_arrays, name))
+                if value.shape != expected:
+                    raise ValueError(
+                        f"forecast trust {name} expected {expected}, got {value.shape}"
+                    )
         self.use_state_encoder = bool(
             self.condition_config.get("use_state_encoder", False)
         )
@@ -1476,6 +1486,12 @@ class StationForecastDataset(Dataset):
             "historical_retrieval_enabled": retrieval_arrays is not None,
             "historical_retrieval": (
                 dict(retrieval_arrays.audit) if retrieval_arrays is not None else None
+            ),
+            "forecast_trust_enabled": forecast_trust_arrays is not None,
+            "forecast_trust": (
+                dict(forecast_trust_arrays.audit)
+                if forecast_trust_arrays is not None
+                else None
             ),
         }
         self._validate_shapes()
@@ -1579,6 +1595,20 @@ class StationForecastDataset(Dataset):
             revision_mask=revision_mask,
         )
         target = residual / scale_tensor
+        historical_center = (
+            np.asarray(
+                self.forecast_trust_arrays.center[index], dtype=np.float32
+            ).T.copy()
+            if self.forecast_trust_arrays is not None
+            else forecast.copy()
+        )
+        historical_dispersion = (
+            np.asarray(
+                self.forecast_trust_arrays.dispersion[index], dtype=np.float32
+            ).T.copy()
+            if self.forecast_trust_arrays is not None
+            else np.zeros_like(forecast)
+        )
         retrieval_residual = (
             np.asarray(self.retrieval_arrays.residual[index], dtype=np.float32).copy()
             if self.retrieval_arrays is not None
@@ -1629,6 +1659,8 @@ class StationForecastDataset(Dataset):
             "residual": torch.from_numpy(residual),
             "residual_target": torch.from_numpy(target),
             "residual_scale": torch.from_numpy(scale_tensor),
+            "historical_center": torch.from_numpy(historical_center),
+            "historical_dispersion": torch.from_numpy(historical_dispersion),
             "calendar": torch.from_numpy(
                 np.asarray(self.time_mark[index], dtype=np.float32).T.copy()
             ),
@@ -1814,6 +1846,7 @@ def get_station_dataloader(
     event_weighting: Mapping[str, object] | None = None,
     event_replay: Mapping[str, object] | None = None,
     retrieval_arrays: object | None = None,
+    forecast_trust_arrays: object | None = None,
 ) -> tuple[DataLoader, StationForecastDataset]:
     dataset = StationForecastDataset(
         data_dir,
@@ -1824,6 +1857,7 @@ def get_station_dataloader(
         event_weighting=event_weighting,
         event_replay=event_replay,
         retrieval_arrays=retrieval_arrays,
+        forecast_trust_arrays=forecast_trust_arrays,
     )
     generator = torch.Generator()
     split_offset = {"train": 0, "val": 10_000, "test": 20_000}[split]

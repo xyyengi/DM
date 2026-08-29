@@ -23,6 +23,7 @@ from station_dataset import (
 from station_evaluation import evaluate_station_scenarios, save_evaluation
 from station_retrieval_memory import build_retrieval_arrays
 from station_discrete_event_memory import build_discrete_event_arrays
+from station_forecast_trust import build_forecast_trust_arrays
 
 
 def parse_args() -> argparse.Namespace:
@@ -358,6 +359,10 @@ def main() -> None:
         model.use_discrete_event_memory
     ):
         raise ValueError("checkpoint discrete event-memory mode does not match config")
+    if bool(checkpoint.get("use_forecast_trust_center", False)) != bool(
+        model.use_forecast_trust_center
+    ):
+        raise ValueError("checkpoint forecast-trust center mode does not match config")
     state, checkpoint_state_key = select_checkpoint_state(
         checkpoint, args.checkpoint_state
     )
@@ -377,6 +382,11 @@ def main() -> None:
             int(config["model"].get("retrieval_exclusion_days", 6)),
             float(config["model"].get("event_memory_quantile", 0.75)),
             int(config["model"].get("event_memory_target_stride_hours", 3)),
+            float(
+                config["model"].get(
+                    "event_memory_severe_downside_fraction", 0.0
+                )
+            ),
         )
     elif model.use_retrieval_mismatch_expert:
         retrieval_arrays = build_retrieval_arrays(
@@ -384,6 +394,19 @@ def main() -> None:
             args.split,
             int(config["model"].get("retrieval_top_k", 40)),
             int(config["model"].get("retrieval_exclusion_days", 6)),
+        )
+    forecast_trust_arrays = None
+    if model.use_forecast_trust_center:
+        forecast_trust_arrays = build_forecast_trust_arrays(
+            data_path,
+            args.split,
+            top_k=int(config["model"].get("forecast_trust_top_k", 24)),
+            exclusion_days=int(
+                config["model"].get("forecast_trust_exclusion_days", 6)
+            ),
+            temperature=float(
+                config["model"].get("forecast_trust_retrieval_temperature", 0.75)
+            ),
         )
     loader, dataset = get_station_dataloader(
         data_path,
@@ -397,6 +420,7 @@ def main() -> None:
         event_weighting=checkpoint.get("event_weighting"),
         event_replay=checkpoint.get("event_replay"),
         retrieval_arrays=retrieval_arrays,
+        forecast_trust_arrays=forecast_trust_arrays,
     )
     tuning_audit: dict[str, object] = {
         "enabled": False,
@@ -420,6 +444,8 @@ def main() -> None:
     generated_stochastic_standardized = []
     generated_residual = []
     forecast_corrections = []
+    forecast_centers = []
+    forecast_history_fractions = []
     raw_actual_scenarios = []
     projected_actual_scenarios = []
     actual_values = []
@@ -457,6 +483,9 @@ def main() -> None:
         batch = move_batch(raw_batch, device)
         with torch.inference_mode():
             correction = model.predict_forecast_correction(batch).cpu().numpy()
+            forecast_center, history_fraction = model.predict_forecast_center(batch)
+            forecast_center = forecast_center.cpu().numpy()
+            history_fraction = history_fraction.cpu().numpy()
         chunks = []
         route_chunks = []
         time_start_chunks = []
@@ -538,7 +567,7 @@ def main() -> None:
         standardized = residual / scale_tensor[:, None, :, :]
         forecast = raw_batch["forecast"].numpy()  # [B,S,T]
         actual = raw_batch["actual"].numpy()
-        raw_scenarios = forecast[:, None, :, :] + residual
+        raw_scenarios = forecast_center[:, None, :, :] + residual
         projected = np.clip(raw_scenarios, 0.0, 1.0)
 
         generated_standardized.append(standardized.transpose(0, 1, 3, 2))
@@ -547,6 +576,8 @@ def main() -> None:
         )
         generated_residual.append(residual.transpose(0, 1, 3, 2))
         forecast_corrections.append(correction.transpose(0, 2, 1))
+        forecast_centers.append(forecast_center.transpose(0, 2, 1))
+        forecast_history_fractions.append(history_fraction.transpose(0, 2, 1))
         raw_actual_scenarios.append(raw_scenarios.transpose(0, 1, 3, 2))
         projected_actual_scenarios.append(projected.transpose(0, 1, 3, 2))
         actual_values.append(actual.transpose(0, 2, 1))
@@ -613,6 +644,8 @@ def main() -> None:
     )
     residual_array = np.concatenate(generated_residual, axis=0)
     correction_array = np.concatenate(forecast_corrections, axis=0)
+    forecast_center_array = np.concatenate(forecast_centers, axis=0)
+    history_fraction_array = np.concatenate(forecast_history_fractions, axis=0)
     raw_array = np.concatenate(raw_actual_scenarios, axis=0)
     projected_array = np.concatenate(projected_actual_scenarios, axis=0)
     actual_array = np.concatenate(actual_values, axis=0)
@@ -717,9 +750,13 @@ def main() -> None:
     )
     np.save(output_dir / "generated_residual_normalized.npy", residual_array)
     np.save(output_dir / "forecast_correction_normalized.npy", correction_array)
+    np.save(output_dir / "forecast_center_normalized.npy", forecast_center_array)
+    np.save(
+        output_dir / "forecast_history_fraction.npy", history_fraction_array
+    )
     np.save(
         output_dir / "corrected_forecast_center_normalized.npy",
-        forecast_array + correction_array,
+        forecast_center_array + correction_array,
     )
     np.save(output_dir / "actual_scenarios_raw_normalized.npy", raw_array)
     np.save(output_dir / "actual_scenarios_normalized.npy", projected_array)
@@ -755,6 +792,19 @@ def main() -> None:
     if retrieval_arrays is not None:
         np.save(output_dir / "retrieval_train_index.npy", retrieval_arrays.train_index)
         np.save(output_dir / "retrieval_distance.npy", retrieval_arrays.distance)
+    if forecast_trust_arrays is not None:
+        np.save(
+            output_dir / "forecast_trust_neighbor_index.npy",
+            forecast_trust_arrays.neighbor_index,
+        )
+        np.save(
+            output_dir / "forecast_trust_neighbor_distance.npy",
+            forecast_trust_arrays.distance,
+        )
+        np.save(
+            output_dir / "forecast_trust_neighbor_weight.npy",
+            forecast_trust_arrays.weight,
+        )
     for level, moments in model.parallel_spatial_adjacency_moments.items():
         safe_level = level.replace("/", "_")
         np.save(
@@ -791,7 +841,9 @@ def main() -> None:
         "checkpoint_validation_mse": float(checkpoint["val_loss"]),
         "checkpoint_validation_objective": float(checkpoint["val_loss"]),
         "checkpoint_validation_objective_type": (
-            "retrieval_mismatch_epsilon_plus_route_and_hourly_bce"
+            "dynamic_center_residual_diffusion_plus_unified_event_objectives"
+            if model.use_forecast_trust_center
+            else "retrieval_mismatch_epsilon_plus_route_and_hourly_bce"
             if model.train_retrieval_mismatch_only
             else "tail_event_time_soft_cross_entropy"
             if model.train_tail_time_localizer_only
@@ -847,6 +899,25 @@ def main() -> None:
         ),
         "forecast_correction_max_abs_normalized": float(
             np.max(np.abs(correction_array))
+        ),
+        "use_forecast_trust_center": bool(model.use_forecast_trust_center),
+        "forecast_trust_history_fraction_mean": float(
+            history_fraction_array.mean()
+        ),
+        "forecast_trust_history_fraction_by_lead_day": [
+            float(history_fraction_array[:, day * 24 : (day + 1) * 24].mean())
+            for day in range(7)
+        ],
+        "forecast_trust_center_mae_normalized": float(
+            np.mean(np.abs(forecast_center_array - actual_array))
+        ),
+        "forecast_trust_retrieval_audit": (
+            forecast_trust_arrays.audit
+            if forecast_trust_arrays is not None
+            else None
+        ),
+        "event_prototype_anchor_strength": float(
+            model.event_prototype_anchor_strength
         ),
         "state_gate_values": model.state_gate_values,
         "wind_common_gate_value": model.wind_common_gate_value,
