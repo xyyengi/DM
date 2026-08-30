@@ -60,6 +60,12 @@ launch_background() {
 }
 
 if [[ "${STATION24_SAMPLER_ES_L1_INTERNAL_WORKER:-0}" != "1" ]]; then
+  [[ "${CONDA_DEFAULT_ENV:-}" == "dm_env" ]] || {
+    echo "ERROR: activate dm_env before launching:" >&2
+    echo "  source /root/miniconda3/etc/profile.d/conda.sh" >&2
+    echo "  conda activate dm_env" >&2
+    exit 1
+  }
   launch_background
   exit 0
 fi
@@ -69,6 +75,8 @@ cd "${REPO_ROOT}"
 command -v git >/dev/null || die "git is unavailable"
 command -v nvidia-smi >/dev/null || die "nvidia-smi is unavailable"
 command -v "${PYTHON_BIN}" >/dev/null || die "${PYTHON_BIN} is unavailable"
+[[ "${CONDA_DEFAULT_ENV:-}" == "dm_env" ]] \
+  || die "dm_env is not active inside the background worker"
 [[ "$(git branch --show-current)" == "${EXPECTED_BRANCH}" ]] \
   || die "expected branch ${EXPECTED_BRANCH}, got $(git branch --show-current)"
 git diff --quiet || die "tracked working-tree changes are present; commit/pull first"

@@ -367,7 +367,7 @@ class Station24ModelTests(unittest.TestCase):
                 "tail_expert_channels": 4,
                 "tail_epsilon_context_hours": 2,
                 "tail_gate_channels": 4,
-                "tail_gate_prior_probability": 0.99,
+                "tail_gate_prior_probability": 0.999999,
                 "tail_gate_loss_weight": 0.10,
             }
         )
@@ -469,7 +469,10 @@ class Station24ModelTests(unittest.TestCase):
                 "tail_expert_channels": 4,
                 "tail_epsilon_context_hours": 2,
                 "tail_gate_channels": 4,
-                "tail_gate_prior_probability": 0.08,
+                # Make the hard-route draw deterministic for this gradient
+                # isolation test; the formal experiment retains its fitted
+                # causal risk probabilities.
+                "tail_gate_prior_probability": 0.99,
                 "tail_gate_loss_weight": 0.10,
                 "train_sampler_energy_score_only": True,
                 "sampler_energy_score_weight": 0.5,

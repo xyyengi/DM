@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+[[ "${CONDA_DEFAULT_ENV:-}" == "dm_env" ]] || {
+  echo "ERROR: activate dm_env before resuming:" >&2
+  echo "  source /root/miniconda3/etc/profile.d/conda.sh" >&2
+  echo "  conda activate dm_env" >&2
+  exit 1
+}
+
 [[ $# -ge 1 ]] || {
   echo "usage: bash $0 <sampler_es_l1_pipeline_root> [source_raw_result]" >&2
   exit 2
