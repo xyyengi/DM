@@ -5,7 +5,7 @@ experiment:
   description: "Frozen Raw body-tail model fine-tuned with true final-member Energy Score"
 
 data:
-  data_path: "./diffusion_input_station"
+  data_path: "diffusion_input_station"
   station_count: 24
   sequence_length: 168
   residual_definition: "actual_minus_current_forecast"
@@ -33,7 +33,7 @@ model:
   parallel_spatial_gate_init: -1.0
   parallel_spatial_adjacency_mode: "fixed"
   use_dual_fixed_graph: true
-  secondary_adjacency_path: null
+  secondary_adjacency_path: "graphs/secondary_adjacency.npy"
   secondary_adjacency_role: "train_unique_actual_power"
   secondary_adjacency_fit_split: "train"
   dual_graph_primary_logit_init: 2.0
