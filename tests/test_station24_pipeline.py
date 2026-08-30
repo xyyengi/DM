@@ -367,7 +367,7 @@ class Station24ModelTests(unittest.TestCase):
                 "tail_expert_channels": 4,
                 "tail_epsilon_context_hours": 2,
                 "tail_gate_channels": 4,
-                "tail_gate_prior_probability": 0.08,
+                "tail_gate_prior_probability": 0.99,
                 "tail_gate_loss_weight": 0.10,
             }
         )
@@ -454,6 +454,61 @@ class Station24ModelTests(unittest.TestCase):
                 audit["tail_condition_attention"].sum(dim=1),
                 torch.ones(1),
                 atol=1e-6,
+            )
+        )
+
+    def test_sampler_energy_score_uses_final_members_and_only_tail_gradients(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        capacities = torch.linspace(10.0, 100.0, 24)
+        config = self.config("fixed_graph")
+        config.update(
+            {
+                "use_body_tail_experts": True,
+                "tail_expert_channels": 4,
+                "tail_epsilon_context_hours": 2,
+                "tail_gate_channels": 4,
+                "tail_gate_prior_probability": 0.08,
+                "tail_gate_loss_weight": 0.10,
+                "train_sampler_energy_score_only": True,
+                "sampler_energy_score_weight": 0.5,
+                "sampler_energy_score_members": 3,
+                "sampler_energy_score_steps": 2,
+                "sampler_energy_score_backprop_steps": 1,
+                "sampler_energy_score_max_issues_per_batch": 1,
+            }
+        )
+        model = Station24DiffusionModel(
+            config, features, adjacency, capacities
+        )
+        trainable = model.configure_body_tail_training()
+        self.assertEqual(set(trainable), set(model.body_tail_trainable_parameter_names))
+
+        batch = self.batch()
+        batch["actual"] = batch["forecast"] + batch["residual_target"]
+        torch.manual_seed(0)
+        result = model.sampler_energy_score_loss(batch)
+        self.assertEqual(result["score"].ndim, 0)
+        self.assertTrue(torch.isfinite(result["score"]))
+        self.assertGreaterEqual(float(result["truth_attraction"]), 0.0)
+        self.assertGreaterEqual(float(result["member_repulsion"]), 0.0)
+        self.assertGreater(float(result["tail_route_rate"]), 0.0)
+        self.assertEqual(float(result["issue_count"]), 1.0)
+        result["score"].backward()
+        tail_names = set(model.body_tail_trainable_parameter_names)
+        self.assertTrue(
+            any(
+                parameter.grad is not None and torch.any(parameter.grad != 0)
+                for name, parameter in model.named_parameters()
+                if name in tail_names
+            )
+        )
+        self.assertTrue(
+            all(
+                parameter.grad is None
+                for name, parameter in model.named_parameters()
+                if name not in tail_names
             )
         )
 

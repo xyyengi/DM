@@ -8,6 +8,7 @@ a lightweight station-and-time-dependent parallel branch.
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from typing import Mapping, Sequence
 
 import torch
@@ -3048,6 +3049,136 @@ class StationGaussianDiffusion(nn.Module):
             )
         return noisy.reshape(batch, n_samples, stations, length)
 
+    def differentiable_ddim_sample(
+        self,
+        forecast: torch.Tensor,
+        calendar: torch.Tensor,
+        lead: torch.Tensor,
+        n_samples: int,
+        sampling_steps: int,
+        backprop_steps: int,
+        forecast_ramps: torch.Tensor | None = None,
+        forecast_revision: torch.Tensor | None = None,
+        revision_mask: torch.Tensor | None = None,
+        recent_error: torch.Tensor | None = None,
+        recent_error_mask: torch.Tensor | None = None,
+        node_state: torch.Tensor | None = None,
+        tail_expert_route: torch.Tensor | None = None,
+        initial_noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return deterministic DDIM members with truncated sampler gradients.
+
+        Early reverse steps are intentionally detached. Only the final
+        ``backprop_steps`` transitions retain an autograd graph. Unlike
+        one-step x0 reconstructions, every returned member starts from an
+        independent terminal noise draw under the same condition.
+        """
+
+        batch, stations, length = forecast.shape
+        members = int(n_samples)
+        steps = int(sampling_steps)
+        gradient_steps = int(backprop_steps)
+        if members < 2:
+            raise ValueError("differentiable Energy Score requires at least 2 members")
+        if not 2 <= steps <= self.num_steps:
+            raise ValueError("DDIM sampling_steps must be in [2,num_steps]")
+        if not 1 <= gradient_steps <= steps:
+            raise ValueError("DDIM backprop_steps must be in [1,sampling_steps]")
+
+        repeated_forecast = forecast.repeat_interleave(members, dim=0)
+        repeated_calendar = calendar.repeat_interleave(members, dim=0)
+        repeated_lead = lead.repeat_interleave(members, dim=0)
+        optional_conditions = {
+            "forecast_ramps": forecast_ramps,
+            "forecast_revision": forecast_revision,
+            "revision_mask": revision_mask,
+            "recent_error": recent_error,
+            "recent_error_mask": recent_error_mask,
+            "node_state": node_state,
+        }
+        optional_conditions = {
+            name: (
+                value.repeat_interleave(members, dim=0)
+                if value is not None
+                else None
+            )
+            for name, value in optional_conditions.items()
+        }
+        if tail_expert_route is None:
+            route = None
+        else:
+            route = tail_expert_route.to(
+                device=forecast.device, dtype=forecast.dtype
+            )
+            if route.shape == (batch, members):
+                route = route.reshape(batch * members)
+            elif route.shape != (batch * members,):
+                raise ValueError(
+                    "tail_expert_route must be [B,K] or [B*K] for DDIM"
+                )
+
+        expected_noise_shape = (batch * members, stations, length)
+        if initial_noise is None:
+            noisy = torch.randn(
+                expected_noise_shape,
+                device=forecast.device,
+                dtype=forecast.dtype,
+            )
+        else:
+            if initial_noise.shape == (batch, members, stations, length):
+                initial_noise = initial_noise.reshape(expected_noise_shape)
+            if initial_noise.shape != expected_noise_shape:
+                raise ValueError("initial_noise has an invalid DDIM shape")
+            noisy = initial_noise.to(device=forecast.device, dtype=forecast.dtype)
+
+        schedule = torch.linspace(
+            0,
+            self.num_steps - 1,
+            steps=steps,
+            device=forecast.device,
+        ).round().long().unique(sorted=True).flip(0)
+        if schedule.numel() != steps:
+            raise RuntimeError("DDIM timestep schedule contains duplicates")
+        first_gradient_index = steps - gradient_steps
+        for index, step in enumerate(schedule.tolist()):
+            track_gradient = index >= first_gradient_index
+            context = nullcontext() if track_gradient else torch.no_grad()
+            with context:
+                timestep = torch.full(
+                    (batch * members,),
+                    int(step),
+                    device=forecast.device,
+                    dtype=torch.long,
+                )
+                predicted_noise = self.denoiser(
+                    noisy,
+                    timestep,
+                    repeated_forecast,
+                    repeated_calendar,
+                    repeated_lead,
+                    forecast_condition_strength=1.0,
+                    tail_expert_route=route,
+                    **optional_conditions,
+                )
+                alpha_now = self.alpha_hat[int(step)].to(noisy.dtype)
+                if index + 1 < steps:
+                    previous_step = int(schedule[index + 1])
+                    alpha_previous = self.alpha_hat[previous_step].to(noisy.dtype)
+                else:
+                    alpha_previous = torch.ones(
+                        (), device=noisy.device, dtype=noisy.dtype
+                    )
+                predicted_clean = (
+                    noisy - torch.sqrt(1.0 - alpha_now) * predicted_noise
+                ) / torch.sqrt(alpha_now).clamp(min=1e-6)
+                noisy = (
+                    torch.sqrt(alpha_previous) * predicted_clean
+                    + torch.sqrt(1.0 - alpha_previous) * predicted_noise
+                )
+            if not track_gradient:
+                noisy = noisy.detach()
+        return noisy.reshape(batch, members, stations, length)
+
 
 class Station24DiffusionModel(nn.Module):
     """High-level wrapper used by the station-specific trainer and generator."""
@@ -3082,6 +3213,54 @@ class Station24DiffusionModel(nn.Module):
         self.train_discrete_event_memory_only = bool(
             self.config.get("train_discrete_event_memory_only", False)
         )
+        self.train_sampler_energy_score_only = bool(
+            self.config.get("train_sampler_energy_score_only", False)
+        )
+        self.sampler_energy_score_weight = float(
+            self.config.get("sampler_energy_score_weight", 0.0)
+        )
+        self.sampler_energy_score_members = int(
+            self.config.get("sampler_energy_score_members", 4)
+        )
+        self.sampler_energy_score_steps = int(
+            self.config.get("sampler_energy_score_steps", 8)
+        )
+        self.sampler_energy_score_backprop_steps = int(
+            self.config.get("sampler_energy_score_backprop_steps", 2)
+        )
+        self.sampler_energy_score_max_issues = int(
+            self.config.get("sampler_energy_score_max_issues_per_batch", 1)
+        )
+        self.sampler_energy_score_route_temperature = float(
+            self.config.get("sampler_energy_score_route_temperature", 0.5)
+        )
+        if self.train_sampler_energy_score_only:
+            if not self.use_body_tail_experts:
+                raise ValueError(
+                    "sampler Energy Score fine-tuning requires body-tail experts"
+                )
+            if self.sampler_energy_score_weight <= 0.0:
+                raise ValueError("sampler Energy Score weight must be positive")
+            if self.sampler_energy_score_members < 2:
+                raise ValueError("sampler Energy Score requires at least 2 members")
+            if not 2 <= self.sampler_energy_score_steps <= int(
+                self.config.get("num_steps", 500)
+            ):
+                raise ValueError("invalid sampler Energy Score DDIM step count")
+            if not 1 <= self.sampler_energy_score_backprop_steps <= (
+                self.sampler_energy_score_steps
+            ):
+                raise ValueError("invalid sampler Energy Score backprop step count")
+            if self.sampler_energy_score_max_issues <= 0:
+                raise ValueError("sampler Energy Score issue cap must be positive")
+            if self.sampler_energy_score_route_temperature <= 0.0:
+                raise ValueError(
+                    "sampler Energy Score route temperature must be positive"
+                )
+        elif self.sampler_energy_score_weight != 0.0:
+            raise ValueError(
+                "sampler Energy Score weight must be zero when fine-tuning is disabled"
+            )
         if self.use_discrete_event_memory and self.use_retrieval_mismatch_expert:
             raise ValueError(
                 "discrete event memory replaces, rather than adds, the mismatch expert"
@@ -3629,6 +3808,163 @@ class Station24DiffusionModel(nn.Module):
         if actual != allowed:
             raise RuntimeError("body-tail parameter isolation failed")
         return tuple(sorted(actual))
+
+    def sampler_energy_score_loss(
+        self,
+        batch: Mapping[str, torch.Tensor],
+        *,
+        generator: torch.Generator | None = None,
+        max_issues: int | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Fair Energy Score on true same-condition final DDIM members.
+
+        The score is evaluated in station per-unit space on a natural (not
+        event-replayed) issuance stream. Each member receives an independent
+        hard Bernoulli route from the existing causal tail gate. A straight-
+        through Binary Concrete relaxation supplies gate gradients while the
+        forward pass remains consistent with discrete inference routing.
+        """
+
+        if not self.train_sampler_energy_score_only:
+            raise RuntimeError("sampler Energy Score fine-tuning is disabled")
+        batch_size = batch["forecast"].shape[0]
+        active_indices = torch.arange(batch_size, device=batch["forecast"].device)
+        issue_limit = (
+            self.sampler_energy_score_max_issues
+            if max_issues is None
+            else int(max_issues)
+        )
+        if issue_limit > 0:
+            active_indices = active_indices[:issue_limit]
+        if active_indices.numel() == 0:
+            zero = sum(
+                parameter.sum() * 0.0
+                for parameter in self.parameters()
+                if parameter.requires_grad
+            )
+            return {
+                "score": zero,
+                "truth_attraction": zero.detach(),
+                "member_repulsion": zero.detach(),
+                "tail_route_rate": zero.detach(),
+                "issue_count": torch.zeros((), device=batch["forecast"].device),
+            }
+
+        selected = {
+            name: (
+                value.index_select(0, active_indices)
+                if value.ndim > 0 and value.shape[0] == batch_size
+                else value
+            )
+            for name, value in batch.items()
+        }
+        correction = self.predict_forecast_correction(selected)
+        forecast_center, _ = self.predict_forecast_center(selected)
+        condition_center = forecast_center + correction
+        selected_count = int(active_indices.numel())
+        members = self.sampler_energy_score_members
+        initial_noise = torch.randn(
+            selected_count,
+            members,
+            self.denoiser.station_count,
+            self.denoiser.sequence_length,
+            device=condition_center.device,
+            dtype=condition_center.dtype,
+            generator=generator,
+        )
+        gate_logits = self.tail_risk_logits(selected)[:, None].expand(
+            selected_count, members
+        )
+        uniform = torch.rand(
+            selected_count,
+            members,
+            device=condition_center.device,
+            dtype=condition_center.dtype,
+            generator=generator,
+        ).clamp(min=1e-6, max=1.0 - 1e-6)
+        logistic_noise = torch.log(uniform) - torch.log1p(-uniform)
+        soft_route = torch.sigmoid(
+            (gate_logits + logistic_noise)
+            / self.sampler_energy_score_route_temperature
+        )
+        hard_route = (soft_route >= 0.5).to(soft_route.dtype)
+        tail_route = hard_route + soft_route - soft_route.detach()
+        # Score the inference distribution, not a dropout-perturbed training
+        # surrogate. eval() changes module behavior but does not disable grads.
+        denoiser_was_training = self.denoiser.training
+        self.denoiser.eval()
+        try:
+            standardized = self.diffusion.differentiable_ddim_sample(
+                condition_center,
+                selected["calendar"],
+                selected["lead"],
+                members,
+                self.sampler_energy_score_steps,
+                self.sampler_energy_score_backprop_steps,
+                forecast_ramps=selected.get("forecast_ramps"),
+                forecast_revision=selected.get("forecast_revision"),
+                revision_mask=selected.get("revision_mask"),
+                recent_error=selected.get("recent_error"),
+                recent_error_mask=selected.get("recent_error_mask"),
+                node_state=selected.get("node_state"),
+                tail_expert_route=tail_route,
+                initial_noise=initial_noise,
+            )
+        finally:
+            self.denoiser.train(denoiser_was_training)
+        residual_scale = selected.get("residual_scale")
+        if residual_scale is None or residual_scale.shape != condition_center.shape:
+            raise ValueError("sampler Energy Score requires residual_scale [B,S,L]")
+        generated_actual = (
+            condition_center[:, None]
+            + standardized * residual_scale[:, None]
+        )
+        target_actual = selected.get("actual")
+        if target_actual is None or target_actual.shape != condition_center.shape:
+            raise ValueError("sampler Energy Score requires actual [B,S,L]")
+
+        # Station inputs are already normalized power in [0,1]. Keeping this
+        # per-unit representation gives every wind farm equal score weight and
+        # matches the project's joint Energy Score evaluation convention.
+        generated_pu = generated_actual
+        target_pu = target_actual[:, None].to(generated_actual.dtype)
+        wind_mask = self.denoiser.wind_station_mask.to(generated_actual.dtype)
+        valid = selected["valid_mask"].to(generated_actual.dtype)
+        support = valid * wind_mask[None, :, None]
+        support_count = support.sum(dim=(1, 2)).clamp(min=1.0)
+
+        # RMS normalization removes the arbitrary sqrt(13*168) dimension
+        # factor without changing the fair Energy Score optimum.
+        truth_squared = (
+            (generated_pu - target_pu).float().square()
+            * support[:, None].float()
+        ).sum(dim=(2, 3)) / support_count[:, None].float()
+        truth_distance = torch.sqrt(truth_squared.clamp(min=1e-12))
+        pair_squared = (
+            (
+                generated_pu[:, :, None].float()
+                - generated_pu[:, None, :].float()
+            ).square()
+            * support[:, None, None].float()
+        ).sum(dim=(3, 4)) / support_count[:, None, None].float()
+        pair_distance = torch.sqrt(pair_squared.clamp(min=1e-12))
+        off_diagonal = 1.0 - torch.eye(
+            members, device=pair_distance.device, dtype=pair_distance.dtype
+        )
+        attraction = truth_distance.mean(dim=1)
+        repulsion = (
+            pair_distance * off_diagonal[None]
+        ).sum(dim=(1, 2)) / float(2 * members * (members - 1))
+        score = attraction - repulsion
+        return {
+            "score": score.mean(),
+            "truth_attraction": attraction.mean().detach(),
+            "member_repulsion": repulsion.mean().detach(),
+            "tail_route_rate": hard_route.mean().detach(),
+            "issue_count": torch.tensor(
+                float(selected_count), device=score.device, dtype=score.dtype
+            ),
+        }
 
     def configure_tail_time_training(self) -> tuple[str, ...]:
         """Freeze inherited Raw body/tail/gate and train only time localization."""

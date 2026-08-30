@@ -277,6 +277,11 @@ def validate(
     location_mass_sum = 0.0
     location_offset_sum = 0.0
     mismatch_time_error_sum = 0.0
+    sampler_es_sum = 0.0
+    sampler_attraction_sum = 0.0
+    sampler_repulsion_sum = 0.0
+    sampler_route_sum = 0.0
+    sampler_issue_count = 0.0
     for raw_batch in loader:
         batch = move_batch(raw_batch, device)
         batch_size = batch["forecast"].shape[0]
@@ -363,6 +368,24 @@ def validate(
             )
             gate_samples += batch_size
             tail_event_count += int(active.sum())
+            if model.train_sampler_energy_score_only:
+                score_parts = model.sampler_energy_score_loss(
+                    batch,
+                    generator=generator,
+                    max_issues=0,
+                )
+                score_count = float(score_parts["issue_count"])
+                sampler_es_sum += float(score_parts["score"]) * score_count
+                sampler_attraction_sum += (
+                    float(score_parts["truth_attraction"]) * score_count
+                )
+                sampler_repulsion_sum += (
+                    float(score_parts["member_repulsion"]) * score_count
+                )
+                sampler_route_sum += (
+                    float(score_parts["tail_route_rate"]) * score_count
+                )
+                sampler_issue_count += score_count
         else:
             loss = model(
                 batch,
@@ -405,11 +428,34 @@ def validate(
                 "val_mismatch_event_count": float(tail_event_count),
             }
         objective = tail_epsilon + model.tail_gate_loss_weight * gate_bce
-        return objective, {
+        details = {
             "val_tail_epsilon_loss": tail_epsilon,
             "val_tail_gate_bce": gate_bce,
             "val_tail_event_count": float(tail_event_count),
         }
+        if model.train_sampler_energy_score_only:
+            if sampler_issue_count <= 0:
+                raise ValueError(
+                    "validation split contains no sampler Energy Score events"
+                )
+            sampler_es = sampler_es_sum / sampler_issue_count
+            objective += model.sampler_energy_score_weight * sampler_es
+            details.update(
+                {
+                    "val_sampler_energy_score": sampler_es,
+                    "val_sampler_truth_attraction": (
+                        sampler_attraction_sum / sampler_issue_count
+                    ),
+                    "val_sampler_member_repulsion": (
+                        sampler_repulsion_sum / sampler_issue_count
+                    ),
+                    "val_sampler_tail_route_rate": (
+                        sampler_route_sum / sampler_issue_count
+                    ),
+                    "val_sampler_issue_count": sampler_issue_count,
+                }
+            )
+        return objective, details
     return total_loss / max(total_weight, 1.0), {}
 
 
@@ -495,6 +541,22 @@ def save_checkpoint(
         "use_discrete_event_memory": bool(model.use_discrete_event_memory),
         "train_discrete_event_memory_only": bool(
             model.train_discrete_event_memory_only
+        ),
+        "train_sampler_energy_score_only": bool(
+            model.train_sampler_energy_score_only
+        ),
+        "sampler_energy_score_weight": float(
+            model.sampler_energy_score_weight
+        ),
+        "sampler_energy_score_members": int(
+            model.sampler_energy_score_members
+        ),
+        "sampler_energy_score_steps": int(model.sampler_energy_score_steps),
+        "sampler_energy_score_backprop_steps": int(
+            model.sampler_energy_score_backprop_steps
+        ),
+        "sampler_energy_score_route_temperature": float(
+            model.sampler_energy_score_route_temperature
         ),
         "tail_gate_loss_weight": float(model.tail_gate_loss_weight),
         "tail_common_gate_value": model.tail_common_gate_value,
@@ -797,11 +859,40 @@ def main() -> None:
         retrieval_arrays=val_retrieval,
         forecast_trust_arrays=val_forecast_trust,
     )
+    sampler_score_loader = None
+    sampler_score_dataset = None
+    if bool(config["model"].get("train_sampler_energy_score_only", False)):
+        # Proper-score members must follow the natural issuance distribution.
+        # The separate epsilon loader may continue event replay, but its
+        # outcome-dependent sampler is deliberately not reused for ES.
+        sampler_score_loader, sampler_score_dataset = get_station_dataloader(
+            data_path,
+            "train",
+            residual_scale,
+            batch_size=int(train_config["batch_size"]),
+            seed=seed + 271828,
+            num_workers=int(train_config.get("sampler_score_num_workers", 2)),
+            persistent_workers=bool(
+                train_config.get("sampler_score_num_workers", 2) > 0
+            ),
+            prefetch_factor=int(train_config.get("prefetch_factor", 2)),
+            condition_config=config["model"],
+            state_thresholds=state_thresholds,
+            event_weighting=None,
+            event_replay=None,
+            retrieval_arrays=train_retrieval,
+            forecast_trust_arrays=train_forecast_trust,
+        )
     (run_dir / "condition_feature_audit.json").write_text(
         json.dumps(
             {
                 "train": train_dataset.condition_audit,
                 "val": val_dataset.condition_audit,
+                "sampler_score_train": (
+                    sampler_score_dataset.condition_audit
+                    if sampler_score_dataset is not None
+                    else None
+                ),
             },
             ensure_ascii=False,
             indent=2,
@@ -829,7 +920,38 @@ def main() -> None:
         initialization = torch.load(
             initialization_path, map_location="cpu", weights_only=False
         )
-        if model.use_forecast_trust_center:
+        if model.train_sampler_energy_score_only:
+            if initialization.get("condition_variant") != (
+                "geo_history_actual_body_tail_moe"
+            ):
+                raise ValueError(
+                    "sampler Energy Score fine-tuning must initialize from "
+                    "the Raw geo_history_actual_body_tail_moe checkpoint"
+                )
+            source_state = initialization["model_state_dict"]
+            model.load_state_dict(source_state, strict=True)
+            trainable_names = model.configure_body_tail_training()
+            initialization_manifest = {
+                "method": "frozen_raw_body_tail_sampler_energy_score_finetune",
+                "checkpoint": str(initialization_path),
+                "checkpoint_state_source": "raw",
+                "checkpoint_state_key": "model_state_dict",
+                "source_condition_variant": str(
+                    initialization["condition_variant"]
+                ),
+                "source_epoch": int(initialization["epoch"]),
+                "source_validation_objective": float(initialization["val_loss"]),
+                "body_frozen": True,
+                "existing_tail_reused": True,
+                "third_expert_used": False,
+                "final_sampler_members": model.sampler_energy_score_members,
+                "ddim_steps": model.sampler_energy_score_steps,
+                "backprop_steps": model.sampler_energy_score_backprop_steps,
+                "natural_issuance_score_loader": True,
+                "straight_through_binary_route": True,
+                "trainable_parameter_names": list(trainable_names),
+            }
+        elif model.use_forecast_trust_center:
             if initialization.get("condition_variant") != (
                 "geo_history_actual_body_tail_moe"
             ):
@@ -1023,7 +1145,14 @@ def main() -> None:
             model.diffusion.event_x0_sync_loss_weight,
         ]
     )
-    if (event_replay is None) != (configured_event_x0_weight <= 0.0):
+    if model.train_sampler_energy_score_only:
+        if event_replay is None:
+            raise ValueError("sampler Energy Score requires train event replay labels")
+        if configured_event_x0_weight != 0.0:
+            raise ValueError(
+                "L1 isolates sampler Energy Score and must disable legacy x0 losses"
+            )
+    elif (event_replay is None) != (configured_event_x0_weight <= 0.0):
         raise ValueError(
             "event replay and positive event x0 loss weights must be enabled together"
         )
@@ -1076,6 +1205,11 @@ def main() -> None:
     min_delta = float(train_config.get("min_delta", 1e-5))
     save_every = int(train_config.get("save_every", 50))
     validation_seed = int(train_config.get("validation_seed", 314159))
+    sampler_es_every = int(
+        train_config.get("sampler_energy_score_every_n_batches", 1)
+    )
+    if sampler_es_every <= 0:
+        raise ValueError("sampler_energy_score_every_n_batches must be positive")
 
     print(
         f"MODEL architecture={model.architecture} spatial_mode={model.spatial_mode} "
@@ -1103,6 +1237,12 @@ def main() -> None:
         f"retrieval_mismatch_only={model.train_retrieval_mismatch_only} "
         f"discrete_event_memory={model.use_discrete_event_memory} "
         f"discrete_event_only={model.train_discrete_event_memory_only} "
+        f"sampler_es_only={model.train_sampler_energy_score_only} "
+        f"sampler_es_weight={model.sampler_energy_score_weight} "
+        f"sampler_es_members={model.sampler_energy_score_members} "
+        f"sampler_es_steps={model.sampler_energy_score_steps} "
+        f"sampler_es_backprop_steps={model.sampler_energy_score_backprop_steps} "
+        f"sampler_es_route_temperature={model.sampler_energy_score_route_temperature} "
         f"tail_gate_weight={model.tail_gate_loss_weight} "
         f"tail_common_gate={model.tail_common_gate_value} "
         f"common_gate={model.wind_common_gate_value} "
@@ -1139,17 +1279,46 @@ def main() -> None:
         total_loss = 0.0
         total_samples = 0
         event_draws = 0
+        sampler_es_sum = 0.0
+        sampler_attraction_sum = 0.0
+        sampler_repulsion_sum = 0.0
+        sampler_route_sum = 0.0
+        sampler_issue_count = 0.0
+        sampler_es_batches = 0
+        sampler_score_iterator = (
+            iter(sampler_score_loader) if sampler_score_loader is not None else None
+        )
         for batch_index, raw_batch in enumerate(train_loader, start=1):
             batch = move_batch(raw_batch, device)
             batch_size = batch["forecast"].shape[0]
             if event_replay is not None:
                 event_draws += int(batch["event_active"].sum().detach().cpu())
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
-                loss = (
+                base_loss = (
                     model.tail_time_localization_loss(batch)
                     if model.train_tail_time_localizer_only
                     else model(batch)
                 )
+                loss = base_loss
+                score_parts = None
+                if (
+                    model.train_sampler_energy_score_only
+                    and (batch_index - 1) % sampler_es_every == 0
+                ):
+                    if sampler_score_iterator is None:
+                        raise RuntimeError("natural sampler score loader is unavailable")
+                    try:
+                        raw_score_batch = next(sampler_score_iterator)
+                    except StopIteration:
+                        sampler_score_iterator = iter(sampler_score_loader)
+                        raw_score_batch = next(sampler_score_iterator)
+                    score_batch = move_batch(raw_score_batch, device)
+                    score_parts = model.sampler_energy_score_loss(score_batch)
+                    loss = loss + (
+                        model.sampler_energy_score_weight
+                        * sampler_es_every
+                        * score_parts["score"]
+                    )
                 scaled_loss = loss / accumulation
             scaler.scale(scaled_loss).backward()
             should_step = (
@@ -1178,6 +1347,20 @@ def main() -> None:
             )
             total_loss += float(loss.detach()) * batch_weight
             total_samples += batch_weight
+            if score_parts is not None:
+                score_count = float(score_parts["issue_count"])
+                sampler_es_sum += float(score_parts["score"].detach()) * score_count
+                sampler_attraction_sum += (
+                    float(score_parts["truth_attraction"]) * score_count
+                )
+                sampler_repulsion_sum += (
+                    float(score_parts["member_repulsion"]) * score_count
+                )
+                sampler_route_sum += (
+                    float(score_parts["tail_route_rate"]) * score_count
+                )
+                sampler_issue_count += score_count
+                sampler_es_batches += int(score_count > 0)
         train_loss = total_loss / max(total_samples, 1)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -1192,6 +1375,25 @@ def main() -> None:
             "optimizer_updates": float(optimizer_updates),
             "ema_decay": float(current_ema_decay),
         }
+        if model.train_sampler_energy_score_only:
+            row.update(
+                {
+                    "train_sampler_energy_score": (
+                        sampler_es_sum / max(sampler_issue_count, 1.0)
+                    ),
+                    "train_sampler_truth_attraction": (
+                        sampler_attraction_sum / max(sampler_issue_count, 1.0)
+                    ),
+                    "train_sampler_member_repulsion": (
+                        sampler_repulsion_sum / max(sampler_issue_count, 1.0)
+                    ),
+                    "train_sampler_tail_route_rate": (
+                        sampler_route_sum / max(sampler_issue_count, 1.0)
+                    ),
+                    "train_sampler_issue_count": sampler_issue_count,
+                    "train_sampler_score_batches": float(sampler_es_batches),
+                }
+            )
 
         should_validate = epoch == 1 or epoch % validation_every == 0 or epoch == epochs
         if should_validate:
@@ -1239,6 +1441,8 @@ def main() -> None:
                 f"train_s={train_seconds:.2f} samples_s={train_samples_per_second:.2f} "
                 f"condition_gates={model.condition_gate_values}"
                 f" state_gates={model.state_gate_values}"
+                f" sampler_es={row.get('train_sampler_energy_score')}"
+                f" val_sampler_es={row.get('val_sampler_energy_score')}"
             )
             if best_epoch and epoch - best_epoch >= patience:
                 history.append(row)
@@ -1248,7 +1452,8 @@ def main() -> None:
             print(
                 f"epoch={epoch:04d} train={train_loss:.7f} "
                 f"event_draws={event_draws} train_s={train_seconds:.2f} "
-                f"samples_s={train_samples_per_second:.2f}"
+                f"samples_s={train_samples_per_second:.2f} "
+                f"sampler_es={row.get('train_sampler_energy_score')}"
             )
         history.append(row)
 
@@ -1290,12 +1495,20 @@ def main() -> None:
         ylabel=(
             "Tail event-time NLL"
             if model.train_tail_time_localizer_only
-            else "Fixed-noise epsilon MSE"
+            else (
+                "Tail anchor + final-member Energy Score"
+                if model.train_sampler_energy_score_only
+                else "Fixed-noise epsilon MSE"
+            )
         ),
         title=(
             "Station24 tail time localization"
             if model.train_tail_time_localizer_only
-            else "Station24 diffusion training"
+            else (
+                "Station24 sampler Energy Score L1"
+                if model.train_sampler_energy_score_only
+                else "Station24 diffusion training"
+            )
         ),
     )
     final_record = {
@@ -1351,6 +1564,23 @@ def main() -> None:
         "train_discrete_event_memory_only": bool(
             model.train_discrete_event_memory_only
         ),
+        "train_sampler_energy_score_only": bool(
+            model.train_sampler_energy_score_only
+        ),
+        "sampler_energy_score_weight": float(
+            model.sampler_energy_score_weight
+        ),
+        "sampler_energy_score_members": int(
+            model.sampler_energy_score_members
+        ),
+        "sampler_energy_score_steps": int(model.sampler_energy_score_steps),
+        "sampler_energy_score_backprop_steps": int(
+            model.sampler_energy_score_backprop_steps
+        ),
+        "sampler_energy_score_route_temperature": float(
+            model.sampler_energy_score_route_temperature
+        ),
+        "sampler_energy_score_every_n_batches": sampler_es_every,
         "body_tail_trainable_parameter_names": list(
             model.body_tail_trainable_parameter_names
         ),
@@ -1412,7 +1642,10 @@ def main() -> None:
         ),
         "parameter_count": parameter_count,
         "best_epoch": best_epoch,
-        "best_fixed_noise_validation_mse": best_val,
+        "best_validation_objective": best_val,
+        "best_fixed_noise_validation_mse": (
+            None if model.train_sampler_energy_score_only else best_val
+        ),
         "training_seed": seed,
         "validation_seed": validation_seed,
         "ema": {
