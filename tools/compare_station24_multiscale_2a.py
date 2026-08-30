@@ -153,7 +153,15 @@ def build_summary(results: dict[str, dict]) -> pd.DataFrame:
             "variant": variant,
             "label": LABELS[variant],
             "parameter_count": int(run["parameter_count"]),
-            "validation_epsilon_mse": float(run["checkpoint_validation_mse"]),
+            "validation_objective": float(
+                run.get(
+                    "checkpoint_validation_objective",
+                    run["checkpoint_validation_mse"],
+                )
+            ),
+            "validation_objective_type": str(
+                run.get("checkpoint_validation_objective_type", "legacy_unknown")
+            ),
             "wind_station_crps": nested(metrics, "station_average", "wind", "crps"),
             "solar_daylight_crps": nested(
                 metrics, "station_average", "solar_daylight", "crps"
@@ -350,7 +358,8 @@ def main() -> None:
     columns = [
         "label",
         "parameter_count",
-        "validation_epsilon_mse",
+        "validation_objective",
+        "validation_objective_type",
         "wind_station_crps",
         "wind_station_coverage_90",
         "wind_aggregate_mw_crps",

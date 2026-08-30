@@ -280,8 +280,11 @@ def validate(
     sampler_es_sum = 0.0
     sampler_attraction_sum = 0.0
     sampler_repulsion_sum = 0.0
+    sampler_variogram_sum = 0.0
     sampler_route_sum = 0.0
     sampler_issue_count = 0.0
+    body_anchor_sum = 0.0
+    body_anchor_count = 0
     for raw_batch in loader:
         batch = move_batch(raw_batch, device)
         batch_size = batch["forecast"].shape[0]
@@ -382,10 +385,24 @@ def validate(
                 sampler_repulsion_sum += (
                     float(score_parts["member_repulsion"]) * score_count
                 )
+                sampler_variogram_sum += (
+                    float(score_parts.get("temporal_variogram", 0.0))
+                    * score_count
+                )
                 sampler_route_sum += (
                     float(score_parts["tail_route_rate"]) * score_count
                 )
                 sampler_issue_count += score_count
+                if model.sampler_event_localized:
+                    body_anchor = model(
+                        batch,
+                        timestep=timestep,
+                        noise=noise,
+                        include_auxiliary=False,
+                        body_tail_route_override=0.0,
+                    )
+                    body_anchor_sum += float(body_anchor) * batch_size
+                    body_anchor_count += batch_size
         else:
             loss = model(
                 batch,
@@ -440,6 +457,12 @@ def validate(
                 )
             sampler_es = sampler_es_sum / sampler_issue_count
             objective += model.sampler_energy_score_weight * sampler_es
+            if model.sampler_event_localized:
+                if body_anchor_count <= 0:
+                    raise ValueError("localized validation lacks body anchor samples")
+                objective += model.sampler_body_anchor_weight * (
+                    body_anchor_sum / body_anchor_count
+                )
             details.update(
                 {
                     "val_sampler_energy_score": sampler_es,
@@ -449,10 +472,16 @@ def validate(
                     "val_sampler_member_repulsion": (
                         sampler_repulsion_sum / sampler_issue_count
                     ),
+                    "val_sampler_temporal_variogram": (
+                        sampler_variogram_sum / sampler_issue_count
+                    ),
                     "val_sampler_tail_route_rate": (
                         sampler_route_sum / sampler_issue_count
                     ),
                     "val_sampler_issue_count": sampler_issue_count,
+                    "val_sampler_body_anchor": (
+                        body_anchor_sum / max(body_anchor_count, 1)
+                    ),
                 }
             )
         return objective, details
@@ -558,10 +587,30 @@ def save_checkpoint(
         "sampler_energy_score_route_temperature": float(
             model.sampler_energy_score_route_temperature
         ),
+        "sampler_event_localized": bool(model.sampler_event_localized),
+        "sampler_body_members": int(model.sampler_body_members),
+        "sampler_tail_members": int(model.sampler_tail_members),
+        "sampler_event_context_hours": list(model.sampler_event_context_hours),
+        "sampler_temporal_variogram_weight": float(
+            model.sampler_temporal_variogram_weight
+        ),
+        "sampler_temporal_variogram_lags": list(
+            model.sampler_temporal_variogram_lags
+        ),
+        "sampler_body_anchor_weight": float(model.sampler_body_anchor_weight),
+        "sampler_temporal_body_finetune": bool(
+            model.sampler_temporal_body_finetune
+        ),
+        "sampler_temporal_body_lr_scale": float(
+            model.sampler_temporal_body_lr_scale
+        ),
         "tail_gate_loss_weight": float(model.tail_gate_loss_weight),
         "tail_common_gate_value": model.tail_common_gate_value,
         "body_tail_trainable_parameter_names": list(
             model.body_tail_trainable_parameter_names
+        ),
+        "temporal_body_trainable_parameter_names": list(
+            model.temporal_body_trainable_parameter_names
         ),
         "tail_time_trainable_parameter_names": list(
             model.tail_time_trainable_parameter_names
@@ -930,9 +979,17 @@ def main() -> None:
                 )
             source_state = initialization["model_state_dict"]
             model.load_state_dict(source_state, strict=True)
-            trainable_names = model.configure_body_tail_training()
+            trainable_names = (
+                model.configure_aggressive_event_score_training()
+                if model.sampler_event_localized
+                else model.configure_body_tail_training()
+            )
             initialization_manifest = {
-                "method": "frozen_raw_body_tail_sampler_energy_score_finetune",
+                "method": (
+                    "raw_body_tail_local_event_score_temporal_finetune"
+                    if model.sampler_event_localized
+                    else "frozen_raw_body_tail_sampler_energy_score_finetune"
+                ),
                 "checkpoint": str(initialization_path),
                 "checkpoint_state_source": "raw",
                 "checkpoint_state_key": "model_state_dict",
@@ -941,14 +998,23 @@ def main() -> None:
                 ),
                 "source_epoch": int(initialization["epoch"]),
                 "source_validation_objective": float(initialization["val_loss"]),
-                "body_frozen": True,
+                "body_frozen": not model.sampler_event_localized,
+                "spatial_and_state_frozen": bool(model.sampler_event_localized),
                 "existing_tail_reused": True,
                 "third_expert_used": False,
                 "final_sampler_members": model.sampler_energy_score_members,
                 "ddim_steps": model.sampler_energy_score_steps,
                 "backprop_steps": model.sampler_energy_score_backprop_steps,
-                "natural_issuance_score_loader": True,
-                "straight_through_binary_route": True,
+                "natural_issuance_score_loader": not model.sampler_event_localized,
+                "natural_body_anchor_loader": bool(model.sampler_event_localized),
+                "stratified_body_tail_routes": bool(model.sampler_event_localized),
+                "body_member_quota": int(model.sampler_body_members),
+                "tail_member_quota": int(model.sampler_tail_members),
+                "event_context_hours": list(model.sampler_event_context_hours),
+                "temporal_variogram_lags": list(
+                    model.sampler_temporal_variogram_lags
+                ),
+                "straight_through_binary_route": not model.sampler_event_localized,
                 "trainable_parameter_names": list(trainable_names),
             }
         elif model.use_forecast_trust_center:
@@ -1171,11 +1237,42 @@ def main() -> None:
     trainable_parameters = [
         parameter for parameter in model.parameters() if parameter.requires_grad
     ]
-    optimizer = torch.optim.AdamW(
-        trainable_parameters,
-        lr=float(train_config["lr"]),
-        weight_decay=float(train_config["weight_decay"]),
-    )
+    if model.sampler_event_localized:
+        tail_names = set(model.body_tail_trainable_parameter_names)
+        tail_parameters = [
+            parameter
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad and name in tail_names
+        ]
+        temporal_parameters = [
+            parameter
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad and name not in tail_names
+        ]
+        if not tail_parameters or not temporal_parameters:
+            raise RuntimeError(
+                "localized candidate requires non-empty tail and temporal groups"
+            )
+        optimizer = torch.optim.AdamW(
+            [
+                {
+                    "params": tail_parameters,
+                    "lr": float(train_config["lr"]),
+                },
+                {
+                    "params": temporal_parameters,
+                    "lr": float(train_config["lr"])
+                    * model.sampler_temporal_body_lr_scale,
+                },
+            ],
+            weight_decay=float(train_config["weight_decay"]),
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            trainable_parameters,
+            lr=float(train_config["lr"]),
+            weight_decay=float(train_config["weight_decay"]),
+        )
     amp_enabled = bool(train_config.get("mixed_precision", True)) and device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled)
     ema_decay = float(train_config.get("ema_decay", 0.999))
@@ -1193,6 +1290,9 @@ def main() -> None:
         ema_trainable_state_names = set(model.tail_time_state_dict_keys)
     elif model.train_discrete_event_memory_only:
         ema_trainable_state_names = set(model.discrete_event_state_dict_keys)
+    elif model.sampler_event_localized:
+        # Raw is the formal state, but keep EMA internally coherent for audits.
+        ema_trainable_state_names = None
     elif model.use_body_tail_experts:
         ema_trainable_state_names = set(model.body_tail_state_dict_keys)
     else:
@@ -1243,6 +1343,12 @@ def main() -> None:
         f"sampler_es_steps={model.sampler_energy_score_steps} "
         f"sampler_es_backprop_steps={model.sampler_energy_score_backprop_steps} "
         f"sampler_es_route_temperature={model.sampler_energy_score_route_temperature} "
+        f"sampler_event_localized={model.sampler_event_localized} "
+        f"sampler_route_quota=({model.sampler_body_members},"
+        f"{model.sampler_tail_members}) "
+        f"sampler_time_vs_weight={model.sampler_temporal_variogram_weight} "
+        f"sampler_body_anchor={model.sampler_body_anchor_weight} "
+        f"sampler_temporal_body_lr_scale={model.sampler_temporal_body_lr_scale} "
         f"tail_gate_weight={model.tail_gate_loss_weight} "
         f"tail_common_gate={model.tail_common_gate_value} "
         f"common_gate={model.wind_common_gate_value} "
@@ -1282,9 +1388,12 @@ def main() -> None:
         sampler_es_sum = 0.0
         sampler_attraction_sum = 0.0
         sampler_repulsion_sum = 0.0
+        sampler_variogram_sum = 0.0
         sampler_route_sum = 0.0
         sampler_issue_count = 0.0
         sampler_es_batches = 0
+        sampler_body_anchor_sum = 0.0
+        sampler_body_anchor_count = 0.0
         sampler_score_iterator = (
             iter(sampler_score_loader) if sampler_score_loader is not None else None
         )
@@ -1312,13 +1421,31 @@ def main() -> None:
                     except StopIteration:
                         sampler_score_iterator = iter(sampler_score_loader)
                         raw_score_batch = next(sampler_score_iterator)
-                    score_batch = move_batch(raw_score_batch, device)
+                    natural_score_batch = move_batch(raw_score_batch, device)
+                    score_batch = (
+                        batch
+                        if model.sampler_event_localized
+                        else natural_score_batch
+                    )
                     score_parts = model.sampler_energy_score_loss(score_batch)
                     loss = loss + (
                         model.sampler_energy_score_weight
                         * sampler_es_every
                         * score_parts["score"]
                     )
+                    if model.sampler_event_localized:
+                        body_anchor = model(
+                            natural_score_batch,
+                            include_auxiliary=False,
+                            body_tail_route_override=0.0,
+                        )
+                        loss = loss + (
+                            model.sampler_body_anchor_weight
+                            * sampler_es_every
+                            * body_anchor
+                        )
+                    else:
+                        body_anchor = None
                 scaled_loss = loss / accumulation
             scaler.scale(scaled_loss).backward()
             should_step = (
@@ -1356,11 +1483,19 @@ def main() -> None:
                 sampler_repulsion_sum += (
                     float(score_parts["member_repulsion"]) * score_count
                 )
+                sampler_variogram_sum += (
+                    float(score_parts.get("temporal_variogram", 0.0))
+                    * score_count
+                )
                 sampler_route_sum += (
                     float(score_parts["tail_route_rate"]) * score_count
                 )
                 sampler_issue_count += score_count
                 sampler_es_batches += int(score_count > 0)
+                if body_anchor is not None:
+                    natural_count = float(natural_score_batch["forecast"].shape[0])
+                    sampler_body_anchor_sum += float(body_anchor.detach()) * natural_count
+                    sampler_body_anchor_count += natural_count
         train_loss = total_loss / max(total_samples, 1)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -1387,8 +1522,15 @@ def main() -> None:
                     "train_sampler_member_repulsion": (
                         sampler_repulsion_sum / max(sampler_issue_count, 1.0)
                     ),
+                    "train_sampler_temporal_variogram": (
+                        sampler_variogram_sum / max(sampler_issue_count, 1.0)
+                    ),
                     "train_sampler_tail_route_rate": (
                         sampler_route_sum / max(sampler_issue_count, 1.0)
+                    ),
+                    "train_sampler_body_anchor": (
+                        sampler_body_anchor_sum
+                        / max(sampler_body_anchor_count, 1.0)
                     ),
                     "train_sampler_issue_count": sampler_issue_count,
                     "train_sampler_score_batches": float(sampler_es_batches),
@@ -1580,9 +1722,29 @@ def main() -> None:
         "sampler_energy_score_route_temperature": float(
             model.sampler_energy_score_route_temperature
         ),
+        "sampler_event_localized": bool(model.sampler_event_localized),
+        "sampler_body_members": int(model.sampler_body_members),
+        "sampler_tail_members": int(model.sampler_tail_members),
+        "sampler_event_context_hours": list(model.sampler_event_context_hours),
+        "sampler_temporal_variogram_weight": float(
+            model.sampler_temporal_variogram_weight
+        ),
+        "sampler_temporal_variogram_lags": list(
+            model.sampler_temporal_variogram_lags
+        ),
+        "sampler_body_anchor_weight": float(model.sampler_body_anchor_weight),
+        "sampler_temporal_body_finetune": bool(
+            model.sampler_temporal_body_finetune
+        ),
+        "sampler_temporal_body_lr_scale": float(
+            model.sampler_temporal_body_lr_scale
+        ),
         "sampler_energy_score_every_n_batches": sampler_es_every,
         "body_tail_trainable_parameter_names": list(
             model.body_tail_trainable_parameter_names
+        ),
+        "temporal_body_trainable_parameter_names": list(
+            model.temporal_body_trainable_parameter_names
         ),
         "tail_time_trainable_parameter_names": list(
             model.tail_time_trainable_parameter_names

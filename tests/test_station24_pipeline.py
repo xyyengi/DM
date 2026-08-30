@@ -515,6 +515,88 @@ class Station24ModelTests(unittest.TestCase):
             )
         )
 
+    def test_event_score_upper_bound_stratifies_routes_and_updates_temporal_body(self):
+        from src.models.station_conditioned_diffusion import Station24DiffusionModel
+
+        features, adjacency = synthetic_static()
+        capacities = torch.linspace(10.0, 100.0, 24)
+        config = self.config("fixed_graph")
+        config.update(
+            {
+                "use_body_tail_experts": True,
+                "tail_expert_channels": 4,
+                "tail_epsilon_context_hours": 2,
+                "tail_gate_channels": 4,
+                "tail_gate_prior_probability": 0.08,
+                "tail_gate_loss_weight": 0.10,
+                "train_sampler_energy_score_only": True,
+                "sampler_energy_score_weight": 1.0,
+                "sampler_energy_score_members": 4,
+                "sampler_energy_score_steps": 2,
+                "sampler_energy_score_backprop_steps": 1,
+                "sampler_energy_score_max_issues_per_batch": 1,
+                "sampler_event_localized": True,
+                "sampler_body_members": 2,
+                "sampler_tail_members": 2,
+                "sampler_event_context_hours": [0, 2],
+                "sampler_temporal_variogram_weight": 1.0,
+                "sampler_temporal_variogram_lags": [1, 3],
+                "sampler_body_anchor_weight": 0.5,
+                "sampler_temporal_body_finetune": True,
+                "sampler_temporal_body_lr_scale": 0.2,
+            }
+        )
+        model = Station24DiffusionModel(config, features, adjacency, capacities)
+        trainable = set(model.configure_aggressive_event_score_training())
+        tail_names = set(model.body_tail_trainable_parameter_names)
+        temporal_names = set(model.temporal_body_trainable_parameter_names)
+        self.assertEqual(trainable, tail_names | temporal_names)
+        self.assertTrue(tail_names)
+        self.assertTrue(temporal_names)
+
+        batch = self.batch()
+        batch["actual"] = batch["forecast"] + batch["residual_target"]
+        batch["event_active"] = torch.tensor([1.0, 0.0])
+        batch["event_window_mask"] = torch.zeros(2, 16)
+        batch["event_window_mask"][0, 5:11] = 1.0
+        result = model.sampler_energy_score_loss(batch)
+        self.assertTrue(torch.isfinite(result["score"]))
+        self.assertEqual(float(result["issue_count"]), 1.0)
+        self.assertEqual(float(result["body_member_count"]), 2.0)
+        self.assertEqual(float(result["tail_member_count"]), 2.0)
+        self.assertAlmostEqual(float(result["tail_route_rate"]), 0.5, places=6)
+        self.assertGreaterEqual(float(result["temporal_variogram"]), 0.0)
+        result["score"].backward()
+        self.assertTrue(
+            any(
+                parameter.grad is not None and torch.any(parameter.grad != 0)
+                for name, parameter in model.named_parameters()
+                if name in tail_names
+            )
+        )
+        self.assertTrue(
+            any(
+                parameter.grad is not None and torch.any(parameter.grad != 0)
+                for name, parameter in model.named_parameters()
+                if name in temporal_names
+            )
+        )
+        self.assertTrue(
+            all(
+                parameter.grad is None
+                for name, parameter in model.named_parameters()
+                if name not in trainable
+            )
+        )
+
+        model.zero_grad(set_to_none=True)
+        anchor = model(
+            self.batch(),
+            include_auxiliary=False,
+            body_tail_route_override=0.0,
+        )
+        self.assertTrue(torch.isfinite(anchor))
+
     def test_tail_time_localizer_reuses_raw_tail_and_localizes_each_member(self):
         from src.models.station_conditioned_diffusion import Station24DiffusionModel
 

@@ -843,6 +843,10 @@ def main() -> None:
         "checkpoint_validation_objective_type": (
             "dynamic_center_residual_diffusion_plus_unified_event_objectives"
             if model.use_forecast_trust_center
+            else "localized_tail_energy_plus_temporal_variogram_plus_body_anchor"
+            if model.sampler_event_localized
+            else "tail_event_epsilon_plus_gate_bce_plus_sampler_energy_score"
+            if model.train_sampler_energy_score_only
             else "retrieval_mismatch_epsilon_plus_route_and_hourly_bce"
             if model.train_retrieval_mismatch_only
             else "tail_event_time_soft_cross_entropy"

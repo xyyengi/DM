@@ -3234,6 +3234,39 @@ class Station24DiffusionModel(nn.Module):
         self.sampler_energy_score_route_temperature = float(
             self.config.get("sampler_energy_score_route_temperature", 0.5)
         )
+        self.sampler_event_localized = bool(
+            self.config.get("sampler_event_localized", False)
+        )
+        self.sampler_body_members = int(
+            self.config.get("sampler_body_members", 0)
+        )
+        self.sampler_tail_members = int(
+            self.config.get("sampler_tail_members", 0)
+        )
+        self.sampler_event_context_hours = tuple(
+            int(value)
+            for value in self.config.get(
+                "sampler_event_context_hours", [0, 3, 6, 12]
+            )
+        )
+        self.sampler_temporal_variogram_weight = float(
+            self.config.get("sampler_temporal_variogram_weight", 0.0)
+        )
+        self.sampler_temporal_variogram_lags = tuple(
+            int(value)
+            for value in self.config.get(
+                "sampler_temporal_variogram_lags", [1, 3, 6]
+            )
+        )
+        self.sampler_body_anchor_weight = float(
+            self.config.get("sampler_body_anchor_weight", 0.0)
+        )
+        self.sampler_temporal_body_finetune = bool(
+            self.config.get("sampler_temporal_body_finetune", False)
+        )
+        self.sampler_temporal_body_lr_scale = float(
+            self.config.get("sampler_temporal_body_lr_scale", 0.2)
+        )
         if self.train_sampler_energy_score_only:
             if not self.use_body_tail_experts:
                 raise ValueError(
@@ -3257,6 +3290,41 @@ class Station24DiffusionModel(nn.Module):
                 raise ValueError(
                     "sampler Energy Score route temperature must be positive"
                 )
+            if self.sampler_event_localized:
+                if self.sampler_body_members <= 0 or self.sampler_tail_members <= 1:
+                    raise ValueError(
+                        "localized sampler scoring requires body_members>0 and "
+                        "tail_members>1"
+                    )
+                if (
+                    self.sampler_body_members + self.sampler_tail_members
+                    != self.sampler_energy_score_members
+                ):
+                    raise ValueError(
+                        "localized body/tail member quotas must sum to total members"
+                    )
+                if not self.sampler_event_context_hours or min(
+                    self.sampler_event_context_hours
+                ) < 0:
+                    raise ValueError("event context hours must be non-negative")
+                if not self.sampler_temporal_variogram_lags or min(
+                    self.sampler_temporal_variogram_lags
+                ) <= 0:
+                    raise ValueError("temporal Variogram lags must be positive")
+                if self.sampler_temporal_variogram_weight <= 0.0:
+                    raise ValueError(
+                        "localized sampler scoring requires temporal Variogram weight"
+                    )
+                if self.sampler_body_anchor_weight <= 0.0:
+                    raise ValueError(
+                        "localized sampler scoring requires a natural body anchor"
+                    )
+                if not self.sampler_temporal_body_finetune:
+                    raise ValueError(
+                        "localized upper-bound candidate must fine-tune temporal body"
+                    )
+                if not 0.0 < self.sampler_temporal_body_lr_scale <= 1.0:
+                    raise ValueError("temporal body lr scale must be in (0,1]")
         elif self.sampler_energy_score_weight != 0.0:
             raise ValueError(
                 "sampler Energy Score weight must be zero when fine-tuning is disabled"
@@ -3809,6 +3877,50 @@ class Station24DiffusionModel(nn.Module):
             raise RuntimeError("body-tail parameter isolation failed")
         return tuple(sorted(actual))
 
+    @property
+    def temporal_body_trainable_parameter_names(self) -> tuple[str, ...]:
+        """Temporal/condition path allowed to move in the upper-bound candidate.
+
+        Spatial graph operators, state encoders, station embeddings and diffusion
+        schedule remain frozen.  The selected modules are exactly the conditional
+        temporal Res-UNet path that can move an event along the 168-hour axis.
+        """
+
+        prefixes = (
+            "denoiser.condition_encoder.",
+            "denoiser.state_stem.",
+            "denoiser.encoder_blocks.",
+            "denoiser.downsamples.",
+            "denoiser.bottleneck.",
+            "denoiser.upsamples.",
+            "denoiser.decoder_blocks.",
+            "denoiser.output_norm.",
+            "denoiser.output.",
+        )
+        return tuple(
+            sorted(
+                name
+                for name, _ in self.named_parameters()
+                if name.startswith(prefixes)
+            )
+        )
+
+    def configure_aggressive_event_score_training(self) -> tuple[str, ...]:
+        """Train existing tail plus the temporal body; keep spatial/state frozen."""
+
+        if not self.sampler_event_localized or not self.sampler_temporal_body_finetune:
+            raise RuntimeError("aggressive event-score training is disabled")
+        allowed = set(self.body_tail_trainable_parameter_names)
+        allowed.update(self.temporal_body_trainable_parameter_names)
+        if not allowed:
+            raise RuntimeError("aggressive event-score candidate has no parameters")
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad_(name in allowed)
+        actual = {name for name, value in self.named_parameters() if value.requires_grad}
+        if actual != allowed:
+            raise RuntimeError("aggressive event-score parameter isolation failed")
+        return tuple(sorted(actual))
+
     def sampler_energy_score_loss(
         self,
         batch: Mapping[str, torch.Tensor],
@@ -3829,6 +3941,23 @@ class Station24DiffusionModel(nn.Module):
             raise RuntimeError("sampler Energy Score fine-tuning is disabled")
         batch_size = batch["forecast"].shape[0]
         active_indices = torch.arange(batch_size, device=batch["forecast"].device)
+        if self.sampler_event_localized:
+            event_active = batch.get("event_active")
+            event_window = batch.get("event_window_mask")
+            if (
+                event_active is None
+                or event_active.shape != (batch_size,)
+                or event_window is None
+                or event_window.shape
+                != (batch_size, self.denoiser.sequence_length)
+            ):
+                raise ValueError(
+                    "localized sampler scoring requires event_active [B] and "
+                    "event_window_mask [B,L]"
+                )
+            active_indices = torch.nonzero(
+                event_active > 0.5, as_tuple=False
+            )[:, 0]
         issue_limit = (
             self.sampler_energy_score_max_issues
             if max_issues is None
@@ -3846,7 +3975,14 @@ class Station24DiffusionModel(nn.Module):
                 "score": zero,
                 "truth_attraction": zero.detach(),
                 "member_repulsion": zero.detach(),
+                "temporal_variogram": zero.detach(),
                 "tail_route_rate": zero.detach(),
+                "body_member_count": torch.tensor(
+                    float(self.sampler_body_members), device=zero.device
+                ),
+                "tail_member_count": torch.tensor(
+                    float(self.sampler_tail_members), device=zero.device
+                ),
                 "issue_count": torch.zeros((), device=batch["forecast"].device),
             }
 
@@ -3872,23 +4008,47 @@ class Station24DiffusionModel(nn.Module):
             dtype=condition_center.dtype,
             generator=generator,
         )
-        gate_logits = self.tail_risk_logits(selected)[:, None].expand(
-            selected_count, members
-        )
-        uniform = torch.rand(
-            selected_count,
-            members,
-            device=condition_center.device,
-            dtype=condition_center.dtype,
-            generator=generator,
-        ).clamp(min=1e-6, max=1.0 - 1e-6)
-        logistic_noise = torch.log(uniform) - torch.log1p(-uniform)
-        soft_route = torch.sigmoid(
-            (gate_logits + logistic_noise)
-            / self.sampler_energy_score_route_temperature
-        )
-        hard_route = (soft_route >= 0.5).to(soft_route.dtype)
-        tail_route = hard_route + soft_route - soft_route.detach()
+        if self.sampler_event_localized:
+            # Deliberately stratified training distribution: every rare event
+            # supplies both body hypotheses and enough tail hypotheses for the
+            # pairwise proper score. Formal generation remains causal Bernoulli
+            # routing; only the training estimator is stratified.
+            hard_route = torch.cat(
+                [
+                    torch.zeros(
+                        selected_count,
+                        self.sampler_body_members,
+                        device=condition_center.device,
+                        dtype=condition_center.dtype,
+                    ),
+                    torch.ones(
+                        selected_count,
+                        self.sampler_tail_members,
+                        device=condition_center.device,
+                        dtype=condition_center.dtype,
+                    ),
+                ],
+                dim=1,
+            )
+            tail_route = hard_route
+        else:
+            gate_logits = self.tail_risk_logits(selected)[:, None].expand(
+                selected_count, members
+            )
+            uniform = torch.rand(
+                selected_count,
+                members,
+                device=condition_center.device,
+                dtype=condition_center.dtype,
+                generator=generator,
+            ).clamp(min=1e-6, max=1.0 - 1e-6)
+            logistic_noise = torch.log(uniform) - torch.log1p(-uniform)
+            soft_route = torch.sigmoid(
+                (gate_logits + logistic_noise)
+                / self.sampler_energy_score_route_temperature
+            )
+            hard_route = (soft_route >= 0.5).to(soft_route.dtype)
+            tail_route = hard_route + soft_route - soft_route.detach()
         # Score the inference distribution, not a dropout-perturbed training
         # surrogate. eval() changes module behavior but does not disable grads.
         denoiser_was_training = self.denoiser.training
@@ -3930,6 +4090,125 @@ class Station24DiffusionModel(nn.Module):
         target_pu = target_actual[:, None].to(generated_actual.dtype)
         wind_mask = self.denoiser.wind_station_mask.to(generated_actual.dtype)
         valid = selected["valid_mask"].to(generated_actual.dtype)
+
+        if self.sampler_event_localized:
+            event_window = selected["event_window_mask"].to(generated_actual.dtype)
+            tail_generated = generated_pu[:, self.sampler_body_members :]
+            tail_count = self.sampler_tail_members
+            context_scores: list[torch.Tensor] = []
+            context_attractions: list[torch.Tensor] = []
+            context_repulsions: list[torch.Tensor] = []
+            largest_context = torch.zeros_like(event_window)
+            for context_hours in self.sampler_event_context_hours:
+                if context_hours == 0:
+                    event_context = event_window
+                else:
+                    event_context = F.max_pool1d(
+                        event_window[:, None],
+                        kernel_size=2 * context_hours + 1,
+                        stride=1,
+                        padding=context_hours,
+                    )[:, 0]
+                largest_context = torch.maximum(largest_context, event_context)
+                local_support = (
+                    valid
+                    * wind_mask[None, :, None]
+                    * event_context[:, None, :]
+                )
+                local_count = local_support.sum(dim=(1, 2)).clamp(min=1.0)
+                truth_squared = (
+                    (tail_generated - target_pu).float().square()
+                    * local_support[:, None].float()
+                ).sum(dim=(2, 3)) / local_count[:, None].float()
+                truth_distance = torch.sqrt(truth_squared.clamp(min=1e-12))
+                pair_squared = (
+                    (
+                        tail_generated[:, :, None].float()
+                        - tail_generated[:, None, :].float()
+                    ).square()
+                    * local_support[:, None, None].float()
+                ).sum(dim=(3, 4)) / local_count[:, None, None].float()
+                pair_distance = torch.sqrt(pair_squared.clamp(min=1e-12))
+                off_diagonal = 1.0 - torch.eye(
+                    tail_count,
+                    device=pair_distance.device,
+                    dtype=pair_distance.dtype,
+                )
+                attraction_local = truth_distance.mean(dim=1)
+                repulsion_local = (
+                    pair_distance * off_diagonal[None]
+                ).sum(dim=(1, 2)) / float(2 * tail_count * (tail_count - 1))
+                context_scores.append(attraction_local - repulsion_local)
+                context_attractions.append(attraction_local)
+                context_repulsions.append(repulsion_local)
+
+            local_es = torch.stack(context_scores, dim=0).mean(dim=0)
+            attraction = torch.stack(context_attractions, dim=0).mean(dim=0)
+            repulsion = torch.stack(context_repulsions, dim=0).mean(dim=0)
+
+            # Temporal Variogram on fleet-aggregate increments.  Body and tail
+            # hypotheses are both scored so the conditional temporal path can
+            # move a wrongly anchored event while the tail learns its amplitude.
+            wind_weight = self.denoiser.wind_capacity_weight.to(
+                generated_actual.dtype
+            )
+            generated_aggregate = torch.einsum(
+                "s,bksl->bkl", wind_weight, generated_actual
+            )
+            target_aggregate = torch.einsum(
+                "s,bsl->bl", wind_weight, target_actual
+            )
+            complete = valid[:, self.denoiser.wind_station_mask.bool()].amin(dim=1)
+            group_scores: list[torch.Tensor] = []
+            for group in (
+                generated_aggregate[:, : self.sampler_body_members],
+                generated_aggregate[:, self.sampler_body_members :],
+            ):
+                lag_scores: list[torch.Tensor] = []
+                for lag in self.sampler_temporal_variogram_lags:
+                    generated_increment = group[:, :, lag:] - group[:, :, :-lag]
+                    target_increment = (
+                        target_aggregate[:, lag:] - target_aggregate[:, :-lag]
+                    )
+                    predicted_moment = generated_increment.abs().mean(dim=1)
+                    observed_moment = target_increment.abs()
+                    pair_support = (
+                        largest_context[:, lag:]
+                        * largest_context[:, :-lag]
+                        * complete[:, lag:]
+                        * complete[:, :-lag]
+                    )
+                    lag_score = (
+                        (predicted_moment - observed_moment).square()
+                        * pair_support
+                    ).sum(dim=1) / pair_support.sum(dim=1).clamp(min=1.0)
+                    lag_scores.append(lag_score)
+                group_scores.append(torch.stack(lag_scores, dim=0).mean(dim=0))
+            temporal_variogram = torch.stack(group_scores, dim=0).mean(dim=0)
+            score = local_es + (
+                self.sampler_temporal_variogram_weight * temporal_variogram
+            )
+            return {
+                "score": score.mean(),
+                "truth_attraction": attraction.mean().detach(),
+                "member_repulsion": repulsion.mean().detach(),
+                "temporal_variogram": temporal_variogram.mean().detach(),
+                "tail_route_rate": hard_route.mean().detach(),
+                "body_member_count": torch.tensor(
+                    float(self.sampler_body_members),
+                    device=score.device,
+                    dtype=score.dtype,
+                ),
+                "tail_member_count": torch.tensor(
+                    float(self.sampler_tail_members),
+                    device=score.device,
+                    dtype=score.dtype,
+                ),
+                "issue_count": torch.tensor(
+                    float(selected_count), device=score.device, dtype=score.dtype
+                ),
+            }
+
         support = valid * wind_mask[None, :, None]
         support_count = support.sum(dim=(1, 2)).clamp(min=1.0)
 
@@ -4212,6 +4491,7 @@ class Station24DiffusionModel(nn.Module):
         include_auxiliary: bool = True,
         forecast_condition_strength: torch.Tensor | float | None = None,
         body_tail_event_masking: bool = False,
+        body_tail_route_override: float | None = None,
     ) -> torch.Tensor:
         correction = self.predict_forecast_correction(batch)
         condition_forecast, history_fraction = self.predict_forecast_center(batch)
@@ -4274,7 +4554,11 @@ class Station24DiffusionModel(nn.Module):
             # Training isolates tail gradients to replayed physical events.  The
             # fixed-noise validation pass evaluates the complete tail denoiser on
             # natural validation data, preventing an unconstrained event adapter.
-            tail_route = 1.0
+            tail_route = (
+                1.0
+                if body_tail_route_override is None
+                else float(body_tail_route_override)
+            )
             if include_auxiliary or body_tail_event_masking:
                 epsilon_sample_weight = self.body_tail_epsilon_weight(batch)
         diffusion_loss = self.diffusion.training_loss(

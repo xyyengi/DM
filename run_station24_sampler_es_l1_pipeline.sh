@@ -2,7 +2,22 @@
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "$0")" && pwd)
-EXPECTED_BRANCH=${EXPECTED_BRANCH:-experiment/24site-sampler-proper-score-tail-ft}
+PIPELINE_MODE=${PIPELINE_MODE:-l1}
+if [[ "${PIPELINE_MODE}" == "upper_bound" ]]; then
+  EXPECTED_BRANCH=${EXPECTED_BRANCH:-experiment/24site-event-score-upper-bound}
+  PIPELINE_TAG=event_score_upper_bound
+  CONFIG=configs/station24_body_tail_event_score_upper_bound_168h.yaml
+  VARIANT=geo_history_actual_body_tail_event_score_upper_bound
+  CANDIDATE_LABEL="Event-score upper bound"
+  TEST_KEY=event_score_upper_bound
+else
+  EXPECTED_BRANCH=${EXPECTED_BRANCH:-experiment/24site-sampler-proper-score-tail-ft}
+  PIPELINE_TAG=sampler_es_l1
+  CONFIG=configs/station24_body_tail_sampler_es_l1_168h.yaml
+  VARIANT=geo_history_actual_body_tail_sampler_es_l1
+  CANDIDATE_LABEL="Sampler Energy Score L1"
+  TEST_KEY=sampler_energy_score
+fi
 PYTHON_BIN=${PYTHON_BIN:-python}
 DATA=${DATA:-diffusion_input_station}
 OUTPUT_ROOT=${OUTPUT_ROOT:-outputs_shandong/station24}
@@ -33,12 +48,13 @@ launch_background() {
   mkdir -p "${LOG_ROOT}"
   local stamp log_file pid_file status_file
   stamp=$(date +%Y%m%d_%H%M%S)
-  log_file="${LOG_ROOT}/station24_sampler_es_l1_${stamp}.log"
-  pid_file="${LOG_ROOT}/station24_sampler_es_l1_${stamp}.pid"
-  status_file="${LOG_ROOT}/station24_sampler_es_l1_${stamp}.status"
+  log_file="${LOG_ROOT}/station24_${PIPELINE_TAG}_${stamp}.log"
+  pid_file="${LOG_ROOT}/station24_${PIPELINE_TAG}_${stamp}.pid"
+  status_file="${LOG_ROOT}/station24_${PIPELINE_TAG}_${stamp}.status"
   nohup setsid env \
     PYTHONUNBUFFERED=1 CUBLAS_WORKSPACE_CONFIG=:4096:8 OMP_NUM_THREADS=4 \
     STATION24_SAMPLER_ES_L1_INTERNAL_WORKER=1 JOB_STAMP="${stamp}" \
+    PIPELINE_MODE="${PIPELINE_MODE}" \
     LOG_FILE="${log_file}" PID_FILE="${pid_file}" STATUS_FILE="${status_file}" \
     EXPECTED_BRANCH="${EXPECTED_BRANCH}" PYTHON_BIN="${PYTHON_BIN}" \
     DATA="${DATA}" OUTPUT_ROOT="${OUTPUT_ROOT}" LOG_ROOT="${LOG_ROOT}" \
@@ -51,7 +67,7 @@ launch_background() {
   printf '%s\n' "${pid}" > "${pid_file}"
   printf 'state=running\npid=%s\nstarted_at=%s\n' \
     "${pid}" "$(date --iso-8601=seconds)" > "${status_file}"
-  echo "Started Station24 sampler Energy Score L1"
+  echo "Started Station24 score pipeline mode=${PIPELINE_MODE}"
   echo "PID: ${pid}"
   echo "Log: ${log_file}"
   echo "Status: ${status_file}"
@@ -93,8 +109,7 @@ for required in \
   [[ -f "${DATA}/${required}" ]] || die "missing data artifact ${DATA}/${required}"
 done
 
-CONFIG=configs/station24_body_tail_sampler_es_l1_168h.yaml
-[[ -f "${CONFIG}" ]] || die "missing L1 configuration ${CONFIG}"
+[[ -f "${CONFIG}" ]] || die "missing pipeline configuration ${CONFIG}"
 
 "${PYTHON_BIN}" - <<'PY'
 import torch
@@ -105,9 +120,9 @@ if not torch.cuda.is_available():
 print(f"gpu={torch.cuda.get_device_name(0)}")
 PY
 
-echo "SAMPLER_ES_L1_UNIT_TEST_START"
+echo "SAMPLER_SCORE_UNIT_TEST_START mode=${PIPELINE_MODE}"
 "${PYTHON_BIN}" -m unittest discover -s tests \
-  -p 'test_station24_pipeline.py' -k sampler_energy_score
+  -p 'test_station24_pipeline.py' -k "${TEST_KEY}"
 
 if [[ -z "${SOURCE_RAW_RESULT}" ]]; then
   while IFS= read -r -d '' candidate; do
@@ -149,9 +164,9 @@ SECONDARY_GRAPH="${SOURCE_RUN}/graphs/secondary_adjacency.npy"
 [[ -f "${SOURCE_CHECKPOINT}" ]] || die "missing source checkpoint ${SOURCE_CHECKPOINT}"
 [[ -f "${SECONDARY_GRAPH}" ]] || die "missing source secondary graph ${SECONDARY_GRAPH}"
 
-echo "SAMPLER_ES_L1_PREFLIGHT_START"
+echo "SAMPLER_SCORE_PREFLIGHT_START mode=${PIPELINE_MODE}"
 "${PYTHON_BIN}" - "${SOURCE_RUN}/config_used.yaml" "${CONFIG}" \
-  "${SOURCE_CHECKPOINT}" <<'PY'
+  "${SOURCE_CHECKPOINT}" "${PIPELINE_MODE}" <<'PY'
 import copy
 import sys
 import torch
@@ -159,8 +174,9 @@ import yaml
 
 source = yaml.safe_load(open(sys.argv[1], encoding="utf-8"))
 candidate = yaml.safe_load(open(sys.argv[2], encoding="utf-8"))
+mode = sys.argv[4]
 if source["target"] != candidate["target"] or source["data"] != candidate["data"]:
-    raise SystemExit("L1 changed the data or residual target")
+    raise SystemExit("candidate changed the data or residual target")
 allowed = {
     "train_sampler_energy_score_only", "sampler_energy_score_weight",
     "sampler_energy_score_members", "sampler_energy_score_steps",
@@ -170,36 +186,45 @@ allowed = {
     "event_x0_magnitude_loss_weight", "event_x0_timing_loss_weight",
     "event_x0_sync_loss_weight",
 }
+if mode == "upper_bound":
+    allowed.update({
+        "sampler_event_localized", "sampler_body_members",
+        "sampler_tail_members", "sampler_event_context_hours",
+        "sampler_temporal_variogram_weight",
+        "sampler_temporal_variogram_lags", "sampler_body_anchor_weight",
+        "sampler_temporal_body_finetune",
+        "sampler_temporal_body_lr_scale",
+    })
 source_model = copy.deepcopy(source["model"])
 candidate_model = copy.deepcopy(candidate["model"])
 for key in allowed:
     source_model.pop(key, None)
     candidate_model.pop(key, None)
 if source_model != candidate_model:
-    raise SystemExit("L1 changed model fields outside its proper-score settings")
+    raise SystemExit("candidate changed model fields outside score settings")
 checkpoint = torch.load(sys.argv[3], map_location="cpu", weights_only=False)
 if checkpoint.get("condition_variant") != "geo_history_actual_body_tail_moe":
     raise SystemExit("source checkpoint variant mismatch")
 if "model_state_dict" not in checkpoint:
     raise SystemExit("source checkpoint lacks Raw parameters")
-print("SAMPLER_ES_L1_PREFLIGHT_PASSED body_source=raw third_expert=false")
+print(f"SAMPLER_SCORE_PREFLIGHT_PASSED mode={mode} body_source=raw third_expert=false")
 PY
 
-PIPELINE_ROOT="${OUTPUT_ROOT}/sampler_es_l1_${JOB_STAMP}"
+PIPELINE_ROOT="${OUTPUT_ROOT}/${PIPELINE_TAG}_${JOB_STAMP}"
 TRAIN_ROOT="${PIPELINE_ROOT}/training"
 RESULT_ROOT="${PIPELINE_ROOT}/validation_results"
-RESULT="${RESULT_ROOT}/geo_history_actual_body_tail_sampler_es_l1_val_n${NSAMPLES}_seed${GEN_SEED}"
-COMPARISON="${PIPELINE_ROOT}/comparisons/raw_body_tail_vs_sampler_es_l1"
-TIMING="${PIPELINE_ROOT}/wind_event_timing/raw_body_tail_vs_sampler_es_l1"
-ATTRIBUTION="${PIPELINE_ROOT}/forecast_event_attribution/raw_body_tail_vs_sampler_es_l1"
-TAIL="${PIPELINE_ROOT}/extreme_wind_tail/raw_body_tail_vs_sampler_es_l1"
-AUDIT="${PIPELINE_ROOT}/sampler_es_l1_audit"
+RESULT="${RESULT_ROOT}/${VARIANT}_val_n${NSAMPLES}_seed${GEN_SEED}"
+COMPARISON="${PIPELINE_ROOT}/comparisons/raw_body_tail_vs_${PIPELINE_TAG}"
+TIMING="${PIPELINE_ROOT}/wind_event_timing/raw_body_tail_vs_${PIPELINE_TAG}"
+ATTRIBUTION="${PIPELINE_ROOT}/forecast_event_attribution/raw_body_tail_vs_${PIPELINE_TAG}"
+TAIL="${PIPELINE_ROOT}/extreme_wind_tail/raw_body_tail_vs_${PIPELINE_TAG}"
+AUDIT="${PIPELINE_ROOT}/${PIPELINE_TAG}_audit"
 mkdir -p "${TRAIN_ROOT}" "${RESULT_ROOT}" \
   "$(dirname "${COMPARISON}")" "$(dirname "${TIMING}")" \
   "$(dirname "${ATTRIBUTION}")" "$(dirname "${TAIL}")"
 
-EXP_NAME="station24_sampler_es_l1_${JOB_STAMP}"
-echo "TRAIN_START variant=geo_history_actual_body_tail_sampler_es_l1"
+EXP_NAME="station24_${PIPELINE_TAG}_${JOB_STAMP}"
+echo "TRAIN_START variant=${VARIANT}"
 "${PYTHON_BIN}" train_station24.py \
   --config "${CONFIG}" --data-path "${DATA}" \
   --secondary-adjacency "${SECONDARY_GRAPH}" \
@@ -208,10 +233,10 @@ echo "TRAIN_START variant=geo_history_actual_body_tail_sampler_es_l1"
 shopt -s nullglob
 matches=("${TRAIN_ROOT}"/*_"${EXP_NAME}"_seed"${SEED}")
 shopt -u nullglob
-[[ ${#matches[@]} -eq 1 ]] || die "expected one L1 run, found ${#matches[@]}"
+[[ ${#matches[@]} -eq 1 ]] || die "expected one candidate run, found ${#matches[@]}"
 RUN=${matches[0]}
 
-echo "GENERATION_START variant=geo_history_actual_body_tail_sampler_es_l1 members=${NSAMPLES} state=raw"
+echo "GENERATION_START variant=${VARIANT} members=${NSAMPLES} state=raw"
 "${PYTHON_BIN}" generate_station24.py \
   --run-dir "${RUN}" --data-path "${DATA}" \
   --output-dir "${RESULT}" --split val \
@@ -219,34 +244,42 @@ echo "GENERATION_START variant=geo_history_actual_body_tail_sampler_es_l1 member
   --issue-batch-size "${ISSUE_BATCH}" --member-chunk-size "${MEMBER_CHUNK}" \
   --energy-score-member-limit "${ENERGY_MEMBERS}" \
   --checkpoint-state raw \
-  --result-variant geo_history_actual_body_tail_sampler_es_l1
+  --result-variant "${VARIANT}"
 
-echo "SAMPLER_ES_L1_AUDIT_START"
-"${PYTHON_BIN}" tools/audit_station24_sampler_es_l1.py \
-  --source-run "${SOURCE_RUN}" --candidate-run "${RUN}" \
-  --source-result "${SOURCE_RAW_RESULT}" --candidate-result "${RESULT}" \
-  --output-dir "${AUDIT}"
+if [[ "${PIPELINE_MODE}" == "upper_bound" ]]; then
+  echo "EVENT_SCORE_UPPER_BOUND_AUDIT_START"
+  "${PYTHON_BIN}" tools/audit_station24_event_score_upper_bound.py \
+    --source-run "${SOURCE_RUN}" --candidate-run "${RUN}" \
+    --source-result "${SOURCE_RAW_RESULT}" --candidate-result "${RESULT}" \
+    --output-dir "${AUDIT}"
+else
+  echo "SAMPLER_ES_L1_AUDIT_START"
+  "${PYTHON_BIN}" tools/audit_station24_sampler_es_l1.py \
+    --source-run "${SOURCE_RUN}" --candidate-run "${RUN}" \
+    --source-result "${SOURCE_RAW_RESULT}" --candidate-result "${RESULT}" \
+    --output-dir "${AUDIT}"
+fi
 
 echo "COMPARISON_START"
 "${PYTHON_BIN}" tools/compare_station24_multiscale_2a.py \
   "${SOURCE_RAW_RESULT}" "${RESULT}" --data-path "${DATA}" \
   --output-dir "${COMPARISON}" \
   --baseline-variant geo_history_actual_body_tail_moe_raw \
-  --candidate-variant geo_history_actual_body_tail_sampler_es_l1 \
-  --baseline-label "Raw body-tail" --candidate-label "Sampler Energy Score L1" \
+  --candidate-variant "${VARIANT}" \
+  --baseline-label "Raw body-tail" --candidate-label "${CANDIDATE_LABEL}" \
   --baseline-spatial-levels bottleneck --candidate-spatial-levels bottleneck \
   --baseline-parallel-levels encoder_0 --candidate-parallel-levels encoder_0 \
   --baseline-parallel-adjacency fixed --candidate-parallel-adjacency fixed \
-  --title "Raw body-tail versus final-member Energy Score L1" \
-  --figure-prefix raw_body_tail_vs_sampler_es_l1
+  --title "Raw body-tail versus ${CANDIDATE_LABEL}" \
+  --figure-prefix "raw_body_tail_vs_${PIPELINE_TAG}"
 
 echo "WIND_EVENT_TIMING_START"
 "${PYTHON_BIN}" tools/diagnose_station24_wind_event_timing.py \
   "${SOURCE_RAW_RESULT}" "${RESULT}" --data-path "${DATA}" \
   --output-dir "${TIMING}" \
   --baseline-variant geo_history_actual_body_tail_moe_raw \
-  --candidate-variant geo_history_actual_body_tail_sampler_es_l1 \
-  --baseline-label "Raw body-tail" --candidate-label "Sampler Energy Score L1"
+  --candidate-variant "${VARIANT}" \
+  --baseline-label "Raw body-tail" --candidate-label "${CANDIDATE_LABEL}"
 
 echo "FORECAST_EVENT_ATTRIBUTION_START"
 "${PYTHON_BIN}" tools/diagnose_station24_forecast_event_attribution.py \
@@ -258,10 +291,10 @@ echo "SUSTAINED_TAIL_AUDIT_START"
 "${PYTHON_BIN}" tools/plot_station24_extreme_tail.py \
   --baseline "${SOURCE_RAW_RESULT}" --candidate "${RESULT}" \
   --data-path "${DATA}" --output-dir "${TAIL}" --top-issues 5 \
-  --baseline-label "Raw body-tail" --candidate-label "Sampler Energy Score L1"
+  --baseline-label "Raw body-tail" --candidate-label "${CANDIDATE_LABEL}"
 
 RESULT_FILE="${LOG_FILE%.log}.results.env"
-ARCHIVE="${OUTPUT_ROOT}/station24_sampler_es_l1_${JOB_STAMP}.tar.gz"
+ARCHIVE="${OUTPUT_ROOT}/station24_${PIPELINE_TAG}_${JOB_STAMP}.tar.gz"
 tar -czf "${ARCHIVE}" -C "$(dirname "${PIPELINE_ROOT}")" \
   "$(basename "${PIPELINE_ROOT}")"
 {
@@ -272,6 +305,6 @@ tar -czf "${ARCHIVE}" -C "$(dirname "${PIPELINE_ROOT}")" \
   echo "RESULT=${RESULT}"
   echo "COMPARISON=${COMPARISON}"
   echo "ARCHIVE=${ARCHIVE}"
-  echo "SAMPLER_ES_L1_PIPELINE_COMPLETED"
+  echo "STATION24_SCORE_PIPELINE_COMPLETED mode=${PIPELINE_MODE}"
 } > "${RESULT_FILE}"
 cat "${RESULT_FILE}"
