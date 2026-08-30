@@ -568,6 +568,9 @@ def save_checkpoint(
             model.train_retrieval_mismatch_only
         ),
         "use_discrete_event_memory": bool(model.use_discrete_event_memory),
+        "use_event_transport_transformer": bool(
+            model.use_event_transport_transformer
+        ),
         "train_discrete_event_memory_only": bool(
             model.train_discrete_event_memory_only
         ),
@@ -781,6 +784,12 @@ def main() -> None:
         severe_fraction = float(
             config["model"].get("event_memory_severe_downside_fraction", 0.0)
         )
+        event_durations = tuple(
+            int(value)
+            for value in config["model"].get(
+                "event_memory_durations", [6, 12, 24]
+            )
+        )
         train_retrieval = build_discrete_event_arrays(
             data_path,
             "train",
@@ -789,6 +798,7 @@ def main() -> None:
             event_quantile,
             stride,
             severe_fraction,
+            event_durations,
         )
         val_retrieval = build_discrete_event_arrays(
             data_path,
@@ -798,6 +808,7 @@ def main() -> None:
             event_quantile,
             stride,
             severe_fraction,
+            event_durations,
         )
         (run_dir / "discrete_event_memory_audit.json").write_text(
             json.dumps(
@@ -1079,7 +1090,11 @@ def main() -> None:
                 )
             trainable_names = model.configure_discrete_event_training()
             initialization_manifest = {
-                "method": "frozen_raw_body_plus_unified_discrete_event_expert",
+                "method": (
+                    "frozen_raw_body_plus_transformer_localized_discrete_event_expert"
+                    if model.use_event_transport_transformer
+                    else "frozen_raw_body_plus_unified_discrete_event_expert"
+                ),
                 "checkpoint": str(initialization_path),
                 "checkpoint_state_source": "raw",
                 "source_condition_variant": str(initialization["condition_variant"]),
@@ -1087,6 +1102,9 @@ def main() -> None:
                 "body_frozen": True,
                 "third_mismatch_expert_used": False,
                 "topk_averaging": False,
+                "event_transport_transformer": bool(
+                    model.use_event_transport_transformer
+                ),
                 "event_memory_top_k": int(
                     config["model"].get("event_memory_top_k", 48)
                 ),
@@ -1703,6 +1721,9 @@ def main() -> None:
             model.train_retrieval_mismatch_only
         ),
         "use_discrete_event_memory": bool(model.use_discrete_event_memory),
+        "use_event_transport_transformer": bool(
+            model.use_event_transport_transformer
+        ),
         "train_discrete_event_memory_only": bool(
             model.train_discrete_event_memory_only
         ),

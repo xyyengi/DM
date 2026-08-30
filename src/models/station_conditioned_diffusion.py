@@ -66,6 +66,277 @@ class DiffusionTimestepEmbedding(nn.Module):
         return self.mlp(_sinusoidal_embedding(timestep, self.embedding_dim))
 
 
+class EventTransportTransformerSelector(nn.Module):
+    """Match one discrete train event to one future lead-time location.
+
+    This module is deliberately *not* a replacement for the ResUNet.  It only
+    scores the existing joint event/time candidates.  A short temporal
+    Transformer encodes the 168 causal condition tokens and cross-attention
+    compares every complete event prototype with that sequence.  Selection
+    remains categorical, so attention can never average event trajectories.
+    """
+
+    condition_features = 24
+    candidate_features = 10
+
+    def __init__(
+        self,
+        sequence_length: int,
+        d_model: int = 64,
+        heads: int = 4,
+        layers: int = 2,
+        feedforward: int = 128,
+        dropout: float = 0.10,
+    ) -> None:
+        super().__init__()
+        if d_model < 16 or d_model % heads:
+            raise ValueError("event Transformer d_model must be >=16 and divisible by heads")
+        if layers not in {1, 2, 3}:
+            raise ValueError("event Transformer layers must be 1, 2, or 3")
+        if feedforward < d_model:
+            raise ValueError("event Transformer feedforward width must be >= d_model")
+        self.sequence_length = int(sequence_length)
+        self.d_model = int(d_model)
+        self.condition_projection = nn.Linear(self.condition_features, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=heads,
+            dim_feedforward=feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.temporal_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=layers, norm=nn.LayerNorm(d_model)
+        )
+        shape_channels = max(d_model // 2, 8)
+        self.event_shape_encoder = nn.Sequential(
+            nn.Conv1d(2, shape_channels, kernel_size=5, padding=2),
+            nn.SiLU(),
+            nn.Conv1d(shape_channels, d_model, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
+        self.event_scalar_projection = nn.Sequential(
+            nn.Linear(self.candidate_features, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.event_type_embedding = nn.Embedding(4, d_model)
+        self.cross_attention = nn.MultiheadAttention(
+            d_model, heads, dropout=dropout, batch_first=True
+        )
+        self.score = nn.Sequential(
+            nn.LayerNorm(4 * d_model),
+            nn.Linear(4 * d_model, feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(feedforward, 1),
+        )
+
+    @staticmethod
+    def _pad_channels(values: torch.Tensor, channels: int) -> torch.Tensor:
+        if values.shape[1] >= channels:
+            return values[:, :channels]
+        return F.pad(values, (0, 0, 0, channels - values.shape[1]))
+
+    def condition_tokens(
+        self,
+        batch: Mapping[str, torch.Tensor],
+        wind_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        forecast = batch["forecast"]
+        dtype = forecast.dtype
+        aggregate = torch.einsum("s,bsl->bl", wind_weight.to(dtype), forecast)
+        ramps = batch.get("forecast_ramps")
+        if ramps is None:
+            ramp_features = torch.zeros(
+                forecast.shape[0], 3, forecast.shape[-1],
+                device=forecast.device, dtype=dtype,
+            )
+        else:
+            ramp_features = torch.einsum(
+                "s,bsrl->brl", wind_weight.to(dtype), ramps.to(dtype)
+            )
+            ramp_features = self._pad_channels(ramp_features, 3)
+        revision = batch.get("forecast_revision", torch.zeros_like(forecast)).to(dtype)
+        revision_mask = batch.get("revision_mask", torch.zeros_like(forecast)).to(dtype)
+        revision_mean = torch.einsum("s,bsl->bl", wind_weight.to(dtype), revision)
+        revision_abs = torch.einsum(
+            "s,bsl->bl", wind_weight.to(dtype), revision.abs()
+        )
+        revision_available = torch.einsum(
+            "s,bsl->bl", wind_weight.to(dtype), revision_mask
+        )
+        state = batch.get("node_state")
+        if state is None:
+            state_features = torch.zeros(
+                forecast.shape[0], 4, forecast.shape[-1],
+                device=forecast.device, dtype=dtype,
+            )
+        else:
+            state_features = torch.einsum(
+                "s,bscl->bcl", wind_weight.to(dtype), state.to(dtype)
+            )
+            state_features = self._pad_channels(state_features, 4)
+        calendar = self._pad_channels(batch["calendar"].to(dtype), 8)
+        lead = self._pad_channels(batch["lead"].to(dtype), 2)
+        recent = batch.get("recent_error")
+        recent_mask = batch.get("recent_error_mask")
+        if recent is None:
+            recent_summary = torch.zeros(
+                forecast.shape[0], 3, forecast.shape[-1],
+                device=forecast.device, dtype=dtype,
+            )
+        else:
+            recent_aggregate = torch.einsum(
+                "s,bsh->bh", wind_weight.to(dtype), recent.to(dtype)
+            )
+            available = (
+                torch.einsum(
+                    "s,bsq->bq", wind_weight.to(dtype), recent_mask.to(dtype)
+                )[:, :1]
+                if recent_mask is not None
+                else torch.ones(
+                    forecast.shape[0], 1, device=forecast.device, dtype=dtype
+                )
+            )
+            summary = torch.stack(
+                [
+                    recent_aggregate.mean(dim=-1),
+                    recent_aggregate[:, -1],
+                    recent_aggregate.std(dim=-1, unbiased=False),
+                ],
+                dim=1,
+            )
+            summary[:, :2] = summary[:, :2] * available
+            summary[:, 2:3] = summary[:, 2:3] * available
+            recent_summary = summary[:, :, None].expand(-1, -1, forecast.shape[-1])
+        features = torch.cat(
+            [
+                aggregate[:, None],
+                torch.tanh(ramp_features),
+                torch.tanh(revision_mean[:, None]),
+                torch.tanh(revision_abs[:, None]),
+                revision_available[:, None],
+                state_features,
+                calendar,
+                lead,
+                torch.tanh(recent_summary),
+            ],
+            dim=1,
+        )
+        if features.shape[1] != self.condition_features:
+            raise RuntimeError(
+                f"event Transformer expected {self.condition_features} condition "
+                f"features, got {features.shape[1]}"
+            )
+        position = _sinusoidal_embedding(
+            torch.arange(
+                forecast.shape[-1], device=forecast.device, dtype=torch.float32
+            ),
+            self.d_model,
+        )
+        projected = self.condition_projection(features.transpose(1, 2))
+        return self.temporal_encoder(projected + position[None].to(projected.dtype))
+
+    def forward(
+        self,
+        batch: Mapping[str, torch.Tensor],
+        wind_weight: torch.Tensor,
+        wind_station_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        residual = batch["retrieval_residual"]
+        mask = batch["retrieval_time_mask"].to(residual.dtype)
+        if residual.ndim != 4 or mask.shape != residual.shape[:2] + (
+            residual.shape[-1],
+        ):
+            raise ValueError("event candidates must be [B,K,S,L] with masks [B,K,L]")
+        batch_size, candidates, _, length = residual.shape
+        condition = self.condition_tokens(batch, wind_weight)
+        prototype = torch.einsum(
+            "s,bksl->bkl", wind_weight.to(residual.dtype), residual
+        )
+        mass = mask.sum(dim=-1).clamp(min=1.0)
+        masked = prototype * mask
+        mean = masked.sum(dim=-1) / mass
+        minimum = torch.where(
+            mask > 0, prototype, torch.full_like(prototype, float("inf"))
+        ).amin(dim=-1)
+        maximum = torch.where(
+            mask > 0, prototype, torch.full_like(prototype, float("-inf"))
+        ).amax(dim=-1)
+        absolute = prototype.abs().mul(mask).sum(dim=-1) / mass
+        variance = ((prototype - mean[:, :, None]).square() * mask).sum(dim=-1) / mass
+        wind = wind_station_mask.to(residual.dtype)
+        wind_count = wind.sum().clamp(min=1.0)
+        station_level = (residual * mask[:, :, None]).sum(dim=-1) / mass[:, :, None]
+        station_mean = (station_level * wind[None, None]).sum(dim=-1) / wind_count
+        station_spread = torch.sqrt(
+            (
+                (station_level - station_mean[:, :, None]).square()
+                * wind[None, None]
+            ).sum(dim=-1)
+            / wind_count
+            + 1e-6
+        )
+        prior = batch["retrieval_prior_weight"].to(residual.dtype)
+        distance = batch["retrieval_distance"].to(residual.dtype)
+        start = batch["retrieval_target_start"].to(residual.dtype)
+        duration = batch["retrieval_duration"].to(residual.dtype)
+        scalar = torch.stack(
+            [
+                torch.log(prior.clamp(min=1e-8)),
+                distance,
+                start / float(max(length - 1, 1)),
+                duration / float(length),
+                mean,
+                minimum,
+                maximum,
+                absolute,
+                torch.sqrt(variance + 1e-6),
+                station_spread,
+            ],
+            dim=-1,
+        )
+        shape_input = torch.stack([prototype, mask], dim=2).reshape(
+            batch_size * candidates, 2, length
+        )
+        shape_hidden = self.event_shape_encoder(shape_input).reshape(
+            batch_size, candidates, self.d_model, length
+        )
+        shape_embedding = (
+            shape_hidden * mask[:, :, None]
+        ).sum(dim=-1) / mass[:, :, None]
+        event_type = batch["retrieval_event_type"].long().clamp(0, 3)
+        start_position = _sinusoidal_embedding(
+            batch["retrieval_target_start"].long().clamp(0, length - 1),
+            self.d_model,
+        ).to(residual.dtype)
+        event = (
+            shape_embedding
+            + self.event_scalar_projection(scalar)
+            + self.event_type_embedding(event_type)
+            + start_position
+        )
+        local_condition = (
+            condition[:, None] * mask[:, :, :, None]
+        ).sum(dim=2) / mass[:, :, None]
+        query = event.reshape(batch_size * candidates, 1, self.d_model)
+        memory = condition[:, None].expand(-1, candidates, -1, -1).reshape(
+            batch_size * candidates, length, self.d_model
+        )
+        attended, attention = self.cross_attention(
+            query, memory, memory, need_weights=True, average_attn_weights=True
+        )
+        attended = attended[:, 0].reshape(batch_size, candidates, self.d_model)
+        attention = attention[:, 0].reshape(batch_size, candidates, length)
+        score_input = torch.cat(
+            [event, local_condition, attended, event * local_condition], dim=-1
+        )
+        return self.score(score_input).squeeze(-1), attention
+
+
 class HistoricalRetrievalEncoder(nn.Module):
     """Turn a Top-K set of train residual trajectories into hourly memory.
 
@@ -3510,26 +3781,50 @@ class Station24DiffusionModel(nn.Module):
         self.event_selector_temperature = float(
             self.config.get("event_selector_temperature", 0.75)
         )
+        self.use_event_transport_transformer = bool(
+            self.config.get("use_event_transport_transformer", False)
+        )
         if self.use_discrete_event_memory:
             if self.event_selector_loss_weight <= 0:
                 raise ValueError("event_selector_loss_weight must be positive")
             if self.event_selector_temperature <= 0:
                 raise ValueError("event_selector_temperature must be positive")
-            selector_channels = int(
-                self.config.get("event_selector_channels", 32)
-            )
-            self.event_memory_selector: nn.Module | None = nn.Sequential(
-                nn.Linear(13, selector_channels),
-                nn.SiLU(),
-                nn.Linear(selector_channels, selector_channels),
-                nn.SiLU(),
-                nn.Linear(selector_channels, 1),
-            )
-            # Start from forecast-only retrieval priors. Supervision then learns
-            # which discrete morphology/time candidates deserve probability.
-            nn.init.zeros_(self.event_memory_selector[-1].weight)
-            nn.init.zeros_(self.event_memory_selector[-1].bias)
+            if self.use_event_transport_transformer:
+                self.event_memory_selector: nn.Module | None = (
+                    EventTransportTransformerSelector(
+                        sequence_length=int(self.config.get("sequence_length", 168)),
+                        d_model=int(
+                            self.config.get("event_transformer_d_model", 64)
+                        ),
+                        heads=int(self.config.get("event_transformer_heads", 4)),
+                        layers=int(self.config.get("event_transformer_layers", 2)),
+                        feedforward=int(
+                            self.config.get("event_transformer_feedforward", 128)
+                        ),
+                        dropout=float(
+                            self.config.get("event_transformer_dropout", 0.10)
+                        ),
+                    )
+                )
+            else:
+                selector_channels = int(
+                    self.config.get("event_selector_channels", 32)
+                )
+                self.event_memory_selector = nn.Sequential(
+                    nn.Linear(13, selector_channels),
+                    nn.SiLU(),
+                    nn.Linear(selector_channels, selector_channels),
+                    nn.SiLU(),
+                    nn.Linear(selector_channels, 1),
+                )
+                # Legacy selector starts from forecast-only retrieval priors.
+                nn.init.zeros_(self.event_memory_selector[-1].weight)
+                nn.init.zeros_(self.event_memory_selector[-1].bias)
         else:
+            if self.use_event_transport_transformer:
+                raise ValueError(
+                    "event transport Transformer requires discrete event memory"
+                )
             self.event_memory_selector = None
 
     @property
@@ -3749,6 +4044,16 @@ class Station24DiffusionModel(nn.Module):
 
         if self.event_memory_selector is None:
             raise RuntimeError("discrete event memory selector is disabled")
+        if self.use_event_transport_transformer:
+            learned, _ = self.event_memory_selector(
+                batch,
+                self.denoiser.wind_capacity_weight,
+                self.denoiser.wind_station_mask,
+            )
+            prior = batch["retrieval_prior_weight"].to(learned.dtype)
+            return learned + self.event_selector_prior_strength * torch.log(
+                prior.clamp(min=1e-8)
+            )
         residual = batch["retrieval_residual"]
         mask = batch["retrieval_time_mask"].to(residual.dtype)
         distance = batch["retrieval_distance"].to(residual.dtype)
@@ -3804,8 +4109,13 @@ class Station24DiffusionModel(nn.Module):
         self,
         batch: Mapping[str, torch.Tensor],
         members: int | None = None,
+        raw_logits: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits = self.event_memory_logits(batch) / self.event_selector_temperature
+        logits = (
+            self.event_memory_logits(batch)
+            if raw_logits is None
+            else raw_logits
+        ) / self.event_selector_temperature
         probability = torch.softmax(logits, dim=-1)
         draw_count = 1 if members is None else int(members)
         if self.training and members is None:
@@ -3815,7 +4125,10 @@ class Station24DiffusionModel(nn.Module):
             if event_window is not None and event_active is not None:
                 candidate_mask = batch["retrieval_time_mask"].to(probability.dtype)
                 overlap = (candidate_mask * event_window[:, None, :]).sum(dim=-1)
-                overlap = overlap / event_window.sum(dim=-1, keepdim=True).clamp(min=1.0)
+                # Candidate-normalized overlap lets 1/3/6 h events compete
+                # fairly inside the broader replay label instead of always
+                # preferring the longest candidate.
+                overlap = overlap / candidate_mask.sum(dim=-1).clamp(min=1.0)
                 teacher = torch.softmax(logits + 6.0 * overlap, dim=-1)
                 active = event_active.to(probability.dtype)[:, None]
                 training_probability = active * teacher + (1.0 - active) * probability
@@ -3835,15 +4148,23 @@ class Station24DiffusionModel(nn.Module):
             indices = indices[:, 0]
         return selected_residual, selected_mask, indices, probability
 
-    def event_selector_loss(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
+    def event_selector_loss(
+        self,
+        batch: Mapping[str, torch.Tensor],
+        raw_logits: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Supervise candidate timing/morphology; targets never become conditions."""
 
-        logits = self.event_memory_logits(batch) / self.event_selector_temperature
+        logits = (
+            self.event_memory_logits(batch)
+            if raw_logits is None
+            else raw_logits
+        ) / self.event_selector_temperature
         candidate_mask = batch["retrieval_time_mask"].to(logits.dtype)
         target_mask = batch["event_window_mask"].to(logits.dtype)
         active = batch["event_active"].to(logits.dtype)
         overlap = (candidate_mask * target_mask[:, None, :]).sum(dim=-1)
-        overlap = overlap / target_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        overlap = overlap / candidate_mask.sum(dim=-1).clamp(min=1.0)
         candidate = batch["retrieval_residual"].to(logits.dtype)
         truth = batch["residual_target"].to(logits.dtype)[:, None, :, :]
         wind = self.denoiser.wind_station_mask.to(logits.dtype)[None, None, :, None]
@@ -4521,14 +4842,16 @@ class Station24DiffusionModel(nn.Module):
         mismatch_time_gate: torch.Tensor | None = None
         event_prototype: torch.Tensor | None = None
         event_memory_time_mask: torch.Tensor | None = None
+        event_memory_raw_logits: torch.Tensor | None = None
         epsilon_sample_weight: torch.Tensor | None = None
         if self.use_discrete_event_memory:
+            event_memory_raw_logits = self.event_memory_logits(batch)
             (
                 event_prototype,
                 event_memory_time_mask,
                 _,
                 _,
-            ) = self.select_event_memory(batch)
+            ) = self.select_event_memory(batch, raw_logits=event_memory_raw_logits)
             tail_route = 1.0
             if self.event_prototype_anchor_strength > 0.0:
                 active = batch["event_active"].to(clean.dtype)[:, None, None]
@@ -4596,7 +4919,8 @@ class Station24DiffusionModel(nn.Module):
         )
         if self.use_discrete_event_memory and include_auxiliary:
             diffusion_loss = diffusion_loss + (
-                self.event_selector_loss_weight * self.event_selector_loss(batch)
+                self.event_selector_loss_weight
+                * self.event_selector_loss(batch, raw_logits=event_memory_raw_logits)
             )
             target = batch["event_active"].to(diffusion_loss.dtype)
             replay_weight = batch.get("event_replay_weight")

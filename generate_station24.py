@@ -359,6 +359,10 @@ def main() -> None:
         model.use_discrete_event_memory
     ):
         raise ValueError("checkpoint discrete event-memory mode does not match config")
+    if bool(checkpoint.get("use_event_transport_transformer", False)) != bool(
+        model.use_event_transport_transformer
+    ):
+        raise ValueError("checkpoint event-transport Transformer mode does not match config")
     if bool(checkpoint.get("use_forecast_trust_center", False)) != bool(
         model.use_forecast_trust_center
     ):
@@ -385,6 +389,12 @@ def main() -> None:
             float(
                 config["model"].get(
                     "event_memory_severe_downside_fraction", 0.0
+                )
+            ),
+            tuple(
+                int(value)
+                for value in config["model"].get(
+                    "event_memory_durations", [6, 12, 24]
                 )
             ),
         )
@@ -843,6 +853,8 @@ def main() -> None:
         "checkpoint_validation_objective_type": (
             "dynamic_center_residual_diffusion_plus_unified_event_objectives"
             if model.use_forecast_trust_center
+            else "transformer_event_transport_plus_tail_epsilon_and_gate_bce"
+            if model.use_event_transport_transformer
             else "localized_tail_energy_plus_temporal_variogram_plus_body_anchor"
             if model.sampler_event_localized
             else "tail_event_epsilon_plus_gate_bce_plus_sampler_energy_score"
@@ -931,6 +943,9 @@ def main() -> None:
             model.use_retrieval_mismatch_expert
         ),
         "use_discrete_event_memory": bool(model.use_discrete_event_memory),
+        "use_event_transport_transformer": bool(
+            model.use_event_transport_transformer
+        ),
         "retrieval_method": (
             retrieval_arrays.audit["method"] if retrieval_arrays is not None else None
         ),
@@ -994,7 +1009,9 @@ def main() -> None:
             float(value) for value in tail_attention_array.mean(axis=0)
         ],
         "tail_routing_method": (
-            "two_expert_body_plus_member_level_discrete_event_memory_routing"
+            "two_expert_body_plus_transformer_localized_discrete_event_transport"
+            if model.use_event_transport_transformer
+            else "two_expert_body_plus_member_level_discrete_event_memory_routing"
             if model.use_discrete_event_memory
             else "three_way_body_deep_tail_retrieval_mismatch_categorical_routing"
             if model.use_retrieval_mismatch_expert

@@ -69,6 +69,7 @@ def _event_candidates(
     wind_indices: np.ndarray,
     wind_weight: np.ndarray,
     quantile: float,
+    event_durations: tuple[int, ...],
 ) -> list[dict[str, object]]:
     aggregate_residual = np.einsum(
         "nts,s->nt", train_residual[:, :, wind_indices], wind_weight
@@ -77,7 +78,7 @@ def _event_candidates(
     target_starts = pd.to_datetime(issues[target_column])
     records: list[dict[str, object]] = []
     raw: dict[tuple[int, int], list[dict[str, object]]] = {}
-    for duration in EVENT_DURATIONS:
+    for duration in event_durations:
         for issue_index in range(len(train_forecast)):
             valid = train_valid[issue_index][:, wind_indices].all(axis=1)
             valid_window = (
@@ -86,7 +87,11 @@ def _event_candidates(
             )
             residual = aggregate_residual[issue_index]
             level = _rolling_mean(residual, duration)
-            change = residual[duration - 1 :] - residual[: 1 - duration]
+            change = (
+                np.diff(residual, prepend=residual[:1])
+                if duration == 1
+                else residual[duration - 1 :] - residual[: 1 - duration]
+            )
             score_sets = (
                 -level,
                 -change,
@@ -130,7 +135,7 @@ def _event_candidates(
     # Normalize event magnitude within morphology/duration so a quota can retain
     # genuinely severe downside prototypes without comparing incomparable raw
     # ramp and level scores.
-    for duration in EVENT_DURATIONS:
+    for duration in event_durations:
         for type_index in range(len(EVENT_TYPES)):
             group = [
                 row
@@ -155,6 +160,7 @@ def build_discrete_event_arrays(
     event_quantile: float = 0.75,
     target_stride_hours: int = 3,
     severe_downside_fraction: float = 0.0,
+    event_durations: tuple[int, ...] = EVENT_DURATIONS,
 ) -> DiscreteEventArrays:
     """Return leakage-safe local event candidates for ``split``.
 
@@ -173,6 +179,9 @@ def build_discrete_event_arrays(
         raise ValueError("unsupported target_stride_hours")
     if not 0.0 <= severe_downside_fraction <= 0.5:
         raise ValueError("severe_downside_fraction must be in [0,0.5]")
+    event_durations = tuple(sorted({int(value) for value in event_durations}))
+    if not event_durations or any(value < 1 or value > 24 for value in event_durations):
+        raise ValueError("event_durations must contain unique hours in [1,24]")
     data_dir = Path(data_dir)
     stations = pd.read_csv(data_dir / "station_order.csv").sort_values(
         "channel_index"
@@ -200,6 +209,7 @@ def build_discrete_event_arrays(
         wind_indices,
         wind_weight,
         event_quantile,
+        event_durations,
     )
     train_dates = pd.to_datetime(train_issues["issue_date"]).dt.normalize().to_numpy()
     query_dates = pd.to_datetime(query_issues["issue_date"]).dt.normalize().to_numpy()
@@ -243,7 +253,7 @@ def build_discrete_event_arrays(
             )
             allowed &= separation > int(exclusion_days)
         pool: list[tuple[float, int, int]] = []
-        for duration in EVENT_DURATIONS:
+        for duration in event_durations:
             record_indices = np.asarray(
                 [
                     index
@@ -402,7 +412,7 @@ def build_discrete_event_arrays(
             "query_count": int(query_count),
             "event_bank_count": int(len(records)),
             "event_bank_type_counts": type_counts,
-            "durations_hours": list(EVENT_DURATIONS),
+            "durations_hours": list(event_durations),
             "event_types": list(EVENT_TYPES),
             "event_quantile": float(event_quantile),
             "top_k_candidate_pool": int(top_k),

@@ -72,7 +72,8 @@ def main() -> None:
         TYPE_NAMES[key]: int(np.sum(event_type[route] == key)) for key in TYPE_NAMES
     }
     duration_counts = {
-        str(value): int(np.sum(duration[route] == value)) for value in (6, 12, 24)
+        str(int(value)): int(np.sum(duration[route] == value))
+        for value in sorted(np.unique(duration[route]))
     }
     day_counts = {
         str(day + 1): int(np.sum((starts[route] // 24) == day)) for day in range(7)
@@ -91,6 +92,10 @@ def main() -> None:
         ),
         "mean_candidate_probability_effective_k": float(
             frame.candidate_probability_effective_k.mean()
+        ),
+        "mean_candidate_max_probability": float(probability.max(axis=1).mean()),
+        "mean_candidate_entropy": float(
+            np.mean(-np.sum(probability * np.log(probability.clip(min=1e-12)), axis=1))
         ),
         "event_type_member_counts": type_counts,
         "duration_member_counts": duration_counts,

@@ -85,6 +85,12 @@ class DiscreteEventMemoryTests(unittest.TestCase):
             "tail_epsilon_context_hours": 2,
             "use_discrete_event_memory": True,
             "train_discrete_event_memory_only": True,
+            "use_event_transport_transformer": True,
+            "event_transformer_d_model": 16,
+            "event_transformer_heads": 4,
+            "event_transformer_layers": 1,
+            "event_transformer_feedforward": 32,
+            "event_transformer_dropout": 0.0,
             "event_selector_channels": 8,
             "event_selector_loss_weight": 0.1,
             "event_selector_temperature": 0.75,
@@ -92,6 +98,7 @@ class DiscreteEventMemoryTests(unittest.TestCase):
         }
         source_config = copy.deepcopy(config)
         source_config["use_discrete_event_memory"] = False
+        source_config["use_event_transport_transformer"] = False
         source_config["train_discrete_event_memory_only"] = False
         source_config["event_selector_loss_weight"] = 0.0
         source = Station24DiffusionModel(source_config, features, adjacency)
@@ -152,6 +159,9 @@ class DiscreteEventMemoryTests(unittest.TestCase):
             "retrieval_source_start": starts.repeat(batch_size, 1),
         }
         model.train()
+        logits = model.event_memory_logits(batch)
+        self.assertEqual(tuple(logits.shape), (batch_size, candidates))
+        self.assertGreater(float(logits.std().detach()), 0.0)
         loss = model(batch)
         self.assertTrue(torch.isfinite(loss))
         loss.backward()
@@ -161,6 +171,51 @@ class DiscreteEventMemoryTests(unittest.TestCase):
         self.assertEqual(audit["event_memory_index"].shape, (batch_size, 3))
         self.assertTrue(torch.all(audit["event_memory_index"] >= 0))
         self.assertTrue(torch.all(audit["mismatch_route"] == 0))
+
+    def test_multiduration_transport_bank_includes_short_events(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rng = np.random.default_rng(13)
+            train_count, val_count = 70, 2
+            shape = (train_count, 168, 24)
+            forecast = rng.uniform(0.1, 0.9, shape).astype(np.float32)
+            residual = rng.normal(0, 0.04, shape).astype(np.float32)
+            for issue in range(train_count):
+                start = (issue * 11) % 150
+                duration = (1, 3, 6, 12)[issue % 4]
+                residual[issue, start : start + duration, :13] -= 0.30
+            np.save(root / "train_forecast.npy", forecast)
+            np.save(root / "train_residual.npy", residual)
+            np.save(root / "train_fill_mask.npy", np.zeros(shape, dtype=np.uint8))
+            np.save(
+                root / "val_forecast.npy",
+                rng.uniform(0.1, 0.9, (val_count, 168, 24)).astype(np.float32),
+            )
+            dates = pd.date_range("2025-01-01", periods=train_count, freq="D")
+            pd.DataFrame({"issue_date": dates, "target_start": dates}).to_csv(
+                root / "train_issue_dates.csv", index=False
+            )
+            val_dates = pd.date_range("2026-01-01", periods=val_count, freq="D")
+            pd.DataFrame({"issue_date": val_dates, "target_start": val_dates}).to_csv(
+                root / "val_issue_dates.csv", index=False
+            )
+            pd.DataFrame(
+                {
+                    "channel_index": np.arange(24),
+                    "data_type": ["wind"] * 13 + ["solar"] * 11,
+                    "capacity_mw": np.linspace(50, 150, 24),
+                }
+            ).to_csv(root / "station_order.csv", index=False)
+            arrays = build_discrete_event_arrays(
+                root,
+                "val",
+                top_k=16,
+                event_quantile=0.70,
+                target_stride_hours=6,
+                event_durations=(1, 3, 6, 12),
+            )
+            self.assertEqual(arrays.audit["durations_hours"], [1, 3, 6, 12])
+            self.assertTrue(np.all(np.isin(arrays.duration, [1, 3, 6, 12])))
 
 
 if __name__ == "__main__":
