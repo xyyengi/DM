@@ -7,6 +7,19 @@ LOG_ROOT="logs/station24"
 OUTPUT_ROOT="outputs_shandong/station24"
 mkdir -p "${LOG_ROOT}" "${OUTPUT_ROOT}"
 
+# The paid 32 GB GPU should not inherit malformed host-side thread settings or
+# the checkpoint's legacy 10-member generation chunk.  These only affect
+# execution efficiency; the formal sampler still runs all 500 reverse steps.
+export OMP_NUM_THREADS="${STATION24_OMP_NUM_THREADS:-8}"
+export MKL_NUM_THREADS="${STATION24_MKL_NUM_THREADS:-8}"
+export OPENBLAS_NUM_THREADS="${STATION24_OPENBLAS_NUM_THREADS:-8}"
+export NUMEXPR_NUM_THREADS="${STATION24_NUMEXPR_NUM_THREADS:-8}"
+export PYTHONUNBUFFERED=1
+
+MEMBER_CHUNK_CANDIDATES="${STATION24_MEMBER_CHUNK_CANDIDATES:-500,384,320,256,192,128,96,64,48,32}"
+MAX_GENERATION_MEMORY_FRACTION="${STATION24_MAX_GENERATION_MEMORY_FRACTION:-0.78}"
+GENERATION_PROBE_STEPS="${STATION24_GENERATION_PROBE_STEPS:-8}"
+
 if [[ "${STATION24_TAIL_RATIO_SWEEP_WORKER:-0}" != "1" ]]; then
   stamp="$(date +%Y%m%d_%H%M%S)"
   log="${LOG_ROOT}/station24_tail_ratio_sweep_${stamp}.log"
@@ -87,6 +100,10 @@ if [[ -z "${BASELINE_RESULT}" ]]; then
     --split val --n-samples 500 --seed 424242 \
     --checkpoint-state raw \
     --result-variant raw_body_tail_baseline \
+    --auto-tune-member-chunk \
+    --member-chunk-candidates "${MEMBER_CHUNK_CANDIDATES}" \
+    --max-generation-memory-fraction "${MAX_GENERATION_MEMORY_FRACTION}" \
+    --generation-probe-steps "${GENERATION_PROBE_STEPS}" \
     --energy-score-member-limit 80
 else
   echo "BASELINE_REUSED=${BASELINE_RESULT}"
@@ -107,6 +124,10 @@ for label in "${ratio_labels[@]}"; do
     --checkpoint-state raw \
     --result-variant "raw_body_tail_${label}" \
     --tail-route-probability "${ratio}" \
+    --auto-tune-member-chunk \
+    --member-chunk-candidates "${MEMBER_CHUNK_CANDIDATES}" \
+    --max-generation-memory-fraction "${MAX_GENERATION_MEMORY_FRACTION}" \
+    --generation-probe-steps "${GENERATION_PROBE_STEPS}" \
     --energy-score-member-limit 80
 done
 
