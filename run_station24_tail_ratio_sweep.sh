@@ -98,6 +98,7 @@ if [[ -z "${BASELINE_RESULT}" ]]; then
     --data-path diffusion_input_station \
     --output-dir "${BASELINE_RESULT}" \
     --split val --n-samples 500 --seed 424242 \
+    --member-chunk-size 500 \
     --checkpoint-state raw \
     --result-variant raw_body_tail_baseline \
     --auto-tune-member-chunk \
@@ -121,6 +122,7 @@ for label in "${ratio_labels[@]}"; do
     --data-path diffusion_input_station \
     --output-dir "${result}" \
     --split val --n-samples 500 --seed 424242 \
+    --member-chunk-size 500 \
     --checkpoint-state raw \
     --result-variant "raw_body_tail_${label}" \
     --tail-route-probability "${ratio}" \
