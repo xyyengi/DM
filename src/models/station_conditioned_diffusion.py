@@ -5045,6 +5045,7 @@ class Station24DiffusionModel(nn.Module):
         n_samples: int,
         forecast_guidance_scale: float = 1.0,
         return_expert_audit: bool = False,
+        tail_route_probability_override: float | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         correction = self.predict_forecast_correction(batch)
         forecast_center, history_fraction = self.predict_forecast_center(batch)
@@ -5067,6 +5068,22 @@ class Station24DiffusionModel(nn.Module):
         if self.use_body_tail_experts:
             tail_probability = self.tail_risk_probability(batch)
             tail_attention = self.tail_condition_attention(batch)
+            if tail_route_probability_override is not None:
+                if (
+                    self.use_discrete_event_memory
+                    or self.use_retrieval_mismatch_expert
+                    or self.use_tail_time_localizer
+                ):
+                    raise ValueError(
+                        "tail route probability override is restricted to the "
+                        "two-way Raw body-tail generator"
+                    )
+                override = float(tail_route_probability_override)
+                if not 0.0 <= override <= 1.0:
+                    raise ValueError("tail route probability override must be in [0,1]")
+                route_probability = torch.full_like(tail_probability, override)
+            else:
+                route_probability = tail_probability
             if self.use_discrete_event_memory:
                 tail_route = torch.bernoulli(
                     tail_probability[:, None].expand(-1, int(n_samples))
@@ -5129,7 +5146,7 @@ class Station24DiffusionModel(nn.Module):
                 )
             else:
                 tail_route = torch.bernoulli(
-                    tail_probability[:, None].expand(-1, int(n_samples))
+                    route_probability[:, None].expand(-1, int(n_samples))
                 )
             if self.use_tail_time_localizer and not self.use_discrete_event_memory:
                 tail_time_probability = self.tail_time_probability(batch)

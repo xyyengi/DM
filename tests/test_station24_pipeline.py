@@ -456,6 +456,20 @@ class Station24ModelTests(unittest.TestCase):
                 atol=1e-6,
             )
         )
+        _, body_audit = candidate.generate(
+            self.batch(batch_size=1),
+            n_samples=3,
+            return_expert_audit=True,
+            tail_route_probability_override=0.0,
+        )
+        _, tail_audit = candidate.generate(
+            self.batch(batch_size=1),
+            n_samples=3,
+            return_expert_audit=True,
+            tail_route_probability_override=1.0,
+        )
+        self.assertEqual(float(body_audit["tail_route"].sum()), 0.0)
+        self.assertEqual(float(tail_audit["tail_route"].sum()), 3.0)
 
     def test_sampler_energy_score_uses_final_members_and_only_tail_gradients(self):
         from src.models.station_conditioned_diffusion import Station24DiffusionModel

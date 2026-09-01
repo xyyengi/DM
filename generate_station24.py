@@ -85,6 +85,15 @@ def parse_args() -> argparse.Namespace:
             "subset of at most this many members; all other metrics use every member"
         ),
     )
+    parser.add_argument(
+        "--tail-route-probability",
+        type=float,
+        default=None,
+        help=(
+            "Inference-only Bernoulli routing override for the two-way Raw "
+            "body-tail generator. It does not modify checkpoint parameters."
+        ),
+    )
     parser.add_argument("--allow-test", action="store_true")
     parser.add_argument("--allow-cpu", action="store_true")
     return parser.parse_args()
@@ -133,6 +142,7 @@ def tune_member_chunk_size(
     forecast_guidance_scale: float,
     max_memory_fraction: float,
     probe_steps: int,
+    tail_route_probability: float | None = None,
 ) -> tuple[int, dict[str, object]]:
     """Select the largest CUDA member chunk below a recorded memory ceiling.
 
@@ -171,6 +181,7 @@ def tune_member_chunk_size(
                         n_samples=int(candidate),
                         forecast_guidance_scale=forecast_guidance_scale,
                         return_expert_audit=False,
+                        tail_route_probability_override=tail_route_probability,
                     )
                 torch.cuda.synchronize(device)
                 elapsed = time.perf_counter() - started
@@ -295,6 +306,9 @@ def main() -> None:
     forecast_guidance_scale = float(args.forecast_guidance_scale)
     if not 0.0 <= forecast_guidance_scale <= 1.0:
         raise ValueError("forecast-guidance-scale must be in [0,1]")
+    tail_route_probability = args.tail_route_probability
+    if tail_route_probability is not None and not 0.0 <= tail_route_probability <= 1.0:
+        raise ValueError("tail-route-probability must be in [0,1]")
     output_dir = Path(
         args.output_dir
         or run_dir / f"generation_{args.split}_n{n_samples}_seed{seed}"
@@ -445,6 +459,7 @@ def main() -> None:
             forecast_guidance_scale,
             max_generation_memory_fraction,
             generation_probe_steps,
+            tail_route_probability,
         )
         print(f"GENERATION_PREFLIGHT {json.dumps(tuning_audit, ensure_ascii=False)}")
         del probe_batch
@@ -520,6 +535,7 @@ def main() -> None:
                         n_samples=current,
                         forecast_guidance_scale=forecast_guidance_scale,
                         return_expert_audit=model.use_body_tail_experts,
+                        tail_route_probability_override=tail_route_probability,
                     )
                 if model.use_body_tail_experts:
                     samples, expert_audit = generated
@@ -983,6 +999,11 @@ def main() -> None:
         "tail_probability_min": float(tail_probability_array.min()),
         "tail_probability_max": float(tail_probability_array.max()),
         "tail_member_fraction": float(tail_route_array.mean()),
+        "tail_route_probability_override": (
+            float(tail_route_probability)
+            if tail_route_probability is not None
+            else None
+        ),
         "tail_time_probability_entropy_mean": float(
             -np.mean(
                 np.sum(
