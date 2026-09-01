@@ -36,6 +36,17 @@ def binary_auc(labels: np.ndarray, scores: np.ndarray) -> float | None:
     return wins / float(len(positive) * len(negative))
 
 
+def deep_replay_specification(replay: dict[str, object]) -> dict[str, object]:
+    """Resolve both legacy replay files and the unified deep+mismatch schema."""
+
+    if replay.get("method") == "train_unified_wind_event_replay_v1":
+        deep = replay.get("deep_replay")
+        if not isinstance(deep, dict):
+            raise ValueError("unified event replay is missing deep_replay")
+        return deep
+    return replay
+
+
 def main() -> None:
     args = parse_args()
     run_dir = Path(args.run_dir)
@@ -88,7 +99,11 @@ def main() -> None:
         "nts,s->nt", actual[..., wind], wind_capacity_weight
     )
 
-    window = 6
+    replay = json.loads((run_dir / "event_replay.json").read_text(encoding="utf-8"))
+    deep_replay = deep_replay_specification(replay)
+    window = int(deep_replay["event_window_hours"])
+    if not 1 <= window <= hours:
+        raise ValueError(f"invalid deep-event window={window}")
     severity_mw = np.zeros(issues, dtype=np.float64)
     severity_normalized = np.zeros(issues, dtype=np.float64)
     event_start = np.zeros(issues, dtype=np.int64)
@@ -106,8 +121,7 @@ def main() -> None:
             rolling_mean(mismatch_normalized, window).max()
         )
 
-    replay = json.loads((run_dir / "event_replay.json").read_text(encoding="utf-8"))
-    q80_threshold = float(replay["severity_thresholds"][0])
+    q80_threshold = float(deep_replay["severity_thresholds"][0])
     validation_event = severity_normalized >= q80_threshold
     gate_auc = binary_auc(validation_event, probability)
     gate_brier = float(np.mean((probability - validation_event.astype(float)) ** 2))
@@ -130,8 +144,9 @@ def main() -> None:
                 "issue_date": issue_dates.iloc[issue],
                 "lead_start": start,
                 "lead_end": stop - 1,
-                "forecast_minus_actual_6h_mw": float(severity_mw[issue]),
-                "actual_6h_mean_mw": actual_level,
+                "event_window_hours": window,
+                "forecast_minus_actual_event_mw": float(severity_mw[issue]),
+                "actual_event_mean_mw": actual_level,
                 "tail_probability": float(probability[issue]),
                 "body_member_count": int(len(body_values)),
                 "tail_member_count": int(len(tail_values)),
@@ -143,13 +158,13 @@ def main() -> None:
                 "tail_hit_rate": float(np.mean(tail_values <= actual_level))
                 if len(tail_values)
                 else None,
-                "body_minimum_6h_mw": float(body_values.min())
+                "body_minimum_event_mw": float(body_values.min())
                 if len(body_values)
                 else None,
-                "tail_minimum_6h_mw": float(tail_values.min())
+                "tail_minimum_event_mw": float(tail_values.min())
                 if len(tail_values)
                 else None,
-                "tail_minus_body_mean_6h_mw": float(
+                "tail_minus_body_mean_event_mw": float(
                     tail_values.mean() - body_values.mean()
                 )
                 if len(tail_values) and len(body_values)
@@ -170,6 +185,9 @@ def main() -> None:
         "tail_member_count": int(route.sum()),
         "tail_member_fraction": float(route.mean()),
         "validation_q80_event_count": int(validation_event.sum()),
+        "event_window_hours": window,
+        "event_replay_method": str(replay.get("method")),
+        "deep_replay_method": str(deep_replay.get("method")),
         "gate_q80_roc_auc": gate_auc,
         "gate_q80_brier_score": gate_brier,
         "body_aggregate_residual_mean_mw": float(body_values.mean()),
