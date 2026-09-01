@@ -64,9 +64,12 @@ def parse_results(values: list[str]) -> dict[str, Path]:
         if label in results:
             raise ValueError(f"duplicate result label {label}")
         results[label] = Path(raw_path)
-    required = {"baseline", "tail15", "tail20", "tail30"}
-    if set(results) != required:
-        raise ValueError(f"expected result labels {sorted(required)}, got {sorted(results)}")
+    allowed = {"baseline", "tail15", "tail20", "tail30"}
+    if "baseline" not in results or len(results) < 2:
+        raise ValueError("provide baseline plus at least one tail-ratio variant")
+    unexpected = set(results) - allowed
+    if unexpected:
+        raise ValueError(f"unsupported result labels: {sorted(unexpected)}")
     return results
 
 
@@ -560,9 +563,10 @@ def plot_events(
     output: Path,
     top_events: int,
 ) -> None:
-    order = ["baseline", "tail15", "tail20", "tail30"]
+    order = list(results)
     for event in events[:top_events]:
-        fig, axes = plt.subplots(4, 1, figsize=(15, 12), sharex=True)
+        fig, axes = plt.subplots(len(order), 1, figsize=(15, 3 * len(order)), sharex=True)
+        axes = np.atleast_1d(axes)
         for axis, label in zip(axes, order):
             path = results[label]
             scenarios = np.load(path / "actual_scenarios_normalized.npy", mmap_mode="r")
@@ -732,7 +736,7 @@ def main() -> None:
     member_frames = []
     quality_rows = []
     threshold = float(replay["severity_thresholds"][0])
-    for label in ("baseline", "tail15", "tail20", "tail30"):
+    for label in results:
         quality_rows.append(quality_row(label, results[label]))
         event_frame, member_frame = evaluate_result_events(
             label, results[label], events, wind, capacities, threshold, args

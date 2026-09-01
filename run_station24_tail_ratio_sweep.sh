@@ -93,7 +93,9 @@ else
 fi
 
 declare -A ratios=( [tail15]=0.15 [tail20]=0.20 [tail30]=0.30 )
-for label in tail15 tail20 tail30; do
+read -r -a ratio_labels <<<"${TAIL_RATIO_LABELS:-tail15 tail20 tail30}"
+for label in "${ratio_labels[@]}"; do
+  [[ -n "${ratios[$label]+x}" ]] || { echo "unsupported ratio label: ${label}"; exit 1; }
   ratio="${ratios[$label]}"
   result="${RESULT_ROOT}/raw_body_tail_${label}_val_n500_seed424242"
   echo "GENERATION_START label=${label} tail_probability=${ratio}"
@@ -109,29 +111,31 @@ for label in tail15 tail20 tail30; do
 done
 
 echo "SUSTAINED_DROP_DIAGNOSTIC_START"
+diagnostic_args=(
+  --run-dir "${RUN_DIR}"
+  --data-path diffusion_input_station
+  --output-dir "${DIAGNOSTIC_ROOT}"
+  --result "baseline=${BASELINE_RESULT}"
+)
+for label in "${ratio_labels[@]}"; do
+  diagnostic_args+=(
+    --result "${label}=${RESULT_ROOT}/raw_body_tail_${label}_val_n500_seed424242"
+  )
+done
 "${PYTHON_BIN}" tools/diagnose_station24_sustained_drop_tail_sweep.py \
-  --run-dir "${RUN_DIR}" \
-  --data-path diffusion_input_station \
-  --output-dir "${DIAGNOSTIC_ROOT}" \
-  --result "baseline=${BASELINE_RESULT}" \
-  --result "tail15=${RESULT_ROOT}/raw_body_tail_tail15_val_n500_seed424242" \
-  --result "tail20=${RESULT_ROOT}/raw_body_tail_tail20_val_n500_seed424242" \
-  --result "tail30=${RESULT_ROOT}/raw_body_tail_tail30_val_n500_seed424242" \
+  "${diagnostic_args[@]}" \
   --top-events 5
 
 ARCHIVE="${OUTPUT_ROOT}/station24_tail_ratio_sweep_${stamp}.tar.gz"
-tar -czf "${ARCHIVE}" \
-  -C "${PIPELINE_ROOT}" sustained_drop_coverage \
-  -C "${PIPELINE_ROOT}" \
-  validation_results/raw_body_tail_tail15_val_n500_seed424242/generation_metadata.json \
-  validation_results/raw_body_tail_tail15_val_n500_seed424242/metrics.json \
-  validation_results/raw_body_tail_tail15_val_n500_seed424242/tail_expert_route.npy \
-  validation_results/raw_body_tail_tail20_val_n500_seed424242/generation_metadata.json \
-  validation_results/raw_body_tail_tail20_val_n500_seed424242/metrics.json \
-  validation_results/raw_body_tail_tail20_val_n500_seed424242/tail_expert_route.npy \
-  validation_results/raw_body_tail_tail30_val_n500_seed424242/generation_metadata.json \
-  validation_results/raw_body_tail_tail30_val_n500_seed424242/metrics.json \
-  validation_results/raw_body_tail_tail30_val_n500_seed424242/tail_expert_route.npy
+archive_items=(sustained_drop_coverage)
+for label in "${ratio_labels[@]}"; do
+  archive_items+=(
+    "validation_results/raw_body_tail_${label}_val_n500_seed424242/generation_metadata.json"
+    "validation_results/raw_body_tail_${label}_val_n500_seed424242/metrics.json"
+    "validation_results/raw_body_tail_${label}_val_n500_seed424242/tail_expert_route.npy"
+  )
+done
+tar -czf "${ARCHIVE}" -C "${PIPELINE_ROOT}" "${archive_items[@]}"
 sha256sum "${ARCHIVE}" >"${ARCHIVE}.sha256"
 
 echo "TAIL_RATIO_SWEEP_COMPLETE"

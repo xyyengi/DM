@@ -6,10 +6,15 @@ from tools.diagnose_station24_sustained_drop_tail_sweep import (
     Event,
     best_member_match,
     contiguous_runs,
+    parse_results,
 )
 
 
 class SustainedDropTailSweepTests(unittest.TestCase):
+    def test_stage_one_accepts_baseline_and_tail30_only(self):
+        parsed = parse_results(["baseline=a", "tail30=b"])
+        self.assertEqual(list(parsed), ["baseline", "tail30"])
+
     def test_contiguous_event_duration_merges_one_hour_gap(self):
         mask = np.asarray([0, 1, 1, 0, 1, 1, 0, 0, 1], dtype=bool)
         self.assertEqual(contiguous_runs(mask, merge_gap=1), [(1, 6), (8, 9)])
