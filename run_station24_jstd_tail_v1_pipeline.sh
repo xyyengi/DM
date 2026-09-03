@@ -70,6 +70,10 @@ fi
 
 trap record_exit EXIT
 cd "${REPO_ROOT}"
+# Executing files under tools/ makes Python place tools/ rather than the
+# repository root at sys.path[0].  Export the root explicitly so both direct
+# script calls and module imports work in a clean SSH/conda environment.
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 [[ "$(git branch --show-current)" == "${EXPECTED_BRANCH}" ]] \
   || die "expected branch ${EXPECTED_BRANCH}, got $(git branch --show-current)"
 git diff --quiet || die "tracked working-tree changes are present; commit/pull first"
@@ -134,7 +138,7 @@ echo "JSTD_PREFLIGHT_START"
   tools/evaluate_station24_jstd_events.py
 "${PYTHON_BIN}" -m unittest \
   tests.test_station24_jstd_targets tests.test_station24_jstd_tail
-"${PYTHON_BIN}" tools/audit_station24_jstd_preflight.py \
+"${PYTHON_BIN}" -m tools.audit_station24_jstd_preflight \
   --config configs/station24_jstd_tail_v1_168h.yaml \
   --checkpoint "${SOURCE_CHECKPOINT}" --data-path "${DATA}" \
   --secondary-adjacency "${SECONDARY_ADJACENCY}" --output-dir "${PREFLIGHT}"
@@ -177,7 +181,7 @@ COMPARISON="${PIPELINE_ROOT}/comparisons/raw_body_tail_vs_jstd_tail_v1"
   --figure-prefix raw_body_tail_vs_jstd_tail_v1
 
 EVENT_EVAL="${PIPELINE_ROOT}/jstd_continuous_event_evaluation"
-"${PYTHON_BIN}" tools/evaluate_station24_jstd_events.py \
+"${PYTHON_BIN}" -m tools.evaluate_station24_jstd_events \
   --baseline "${BASELINE_RESULT}" --candidate "${FORMAL_RESULT}" \
   --candidate-run "${CANDIDATE_RUN}" --data-path "${DATA}" \
   --output-dir "${EVENT_EVAL}"
@@ -201,7 +205,7 @@ LEAD_DAY="${PIPELINE_ROOT}/lead_day_analysis"
   --result-dir "${FORMAL_RESULT}" --data-path "${DATA}" --output-dir "${LEAD_DAY}"
 
 RESULT_AUDIT="${PIPELINE_ROOT}/jstd_result_audit"
-"${PYTHON_BIN}" tools/audit_station24_jstd_result.py \
+"${PYTHON_BIN}" -m tools.audit_station24_jstd_result \
   --source-checkpoint "${SOURCE_CHECKPOINT}" --candidate-run "${CANDIDATE_RUN}" \
   --candidate-result "${FORMAL_RESULT}" --output-dir "${RESULT_AUDIT}"
 
