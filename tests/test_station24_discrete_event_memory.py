@@ -7,12 +7,28 @@ import numpy as np
 import pandas as pd
 import torch
 
-from station_discrete_event_memory import build_discrete_event_arrays
+from station_discrete_event_memory import _resample_patch, build_discrete_event_arrays
 from src.models.station_conditioned_diffusion import Station24DiffusionModel
 from tests.test_station24_pipeline import synthetic_static
 
 
 class DiscreteEventMemoryTests(unittest.TestCase):
+    def test_short_event_resampling_is_finite_and_preserves_endpoints(self):
+        one_hour = np.arange(4, dtype=np.float64)[None, :]
+        one_resampled = _resample_patch(one_hour, bins=6)
+        self.assertEqual(one_resampled.shape, (6, 4))
+        self.assertTrue(np.all(np.isfinite(one_resampled)))
+        self.assertTrue(np.allclose(one_resampled, np.repeat(one_hour, 6, axis=0)))
+
+        three_hour = np.stack(
+            [np.zeros(4), np.ones(4), np.full(4, 2.0)], axis=0
+        )
+        three_resampled = _resample_patch(three_hour, bins=6)
+        self.assertEqual(three_resampled.shape, (6, 4))
+        self.assertTrue(np.all(np.isfinite(three_resampled)))
+        self.assertTrue(np.allclose(three_resampled[0], three_hour[0]))
+        self.assertTrue(np.allclose(three_resampled[-1], three_hour[-1]))
+
     def test_train_only_local_memory_keeps_separate_sparse_candidates(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

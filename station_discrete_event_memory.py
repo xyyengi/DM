@@ -42,6 +42,20 @@ def _rolling_mean(values: np.ndarray, width: int) -> np.ndarray:
 def _resample_patch(values: np.ndarray, bins: int = 6) -> np.ndarray:
     """Resample [time,station] to a fixed forecast-only descriptor."""
 
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 2 or len(values) == 0:
+        raise ValueError("event patch must be a non-empty [time, station] array")
+    if len(values) < bins:
+        # Short 1 h / 3 h events cannot be split into six non-empty averaging
+        # bins.  Linear interpolation preserves their level and cross-station
+        # pattern without introducing empty slices or NaNs into the shared
+        # feature standardization used by every event duration.
+        source = np.arange(len(values), dtype=np.float64)
+        target = np.linspace(0.0, float(len(values) - 1), bins)
+        return np.stack(
+            [np.interp(target, source, values[:, station]) for station in range(values.shape[1])],
+            axis=1,
+        )
     edges = np.linspace(0, len(values), bins + 1).round().astype(int)
     blocks = []
     for left, right in zip(edges[:-1], edges[1:]):
