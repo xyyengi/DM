@@ -15,6 +15,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.models.station_joint_decomposed_tail import (
+    JSTDOutput,
+    JointSpatioTemporalDecomposedTail,
+    same_length_average,
+)
+
 
 SPATIAL_MODES = {"none", "fixed_graph", "type_gated_graph"}
 
@@ -1945,6 +1951,9 @@ class StationConditionalResUNet1D(nn.Module):
         self.use_body_tail_experts = bool(
             config.get("use_body_tail_experts", False)
         )
+        self.use_jstd_tail = bool(config.get("use_jstd_tail", False))
+        if self.use_jstd_tail and not self.use_body_tail_experts:
+            raise ValueError("JSTD tail requires the body-tail routing interface")
         self.use_discrete_event_memory = bool(
             config.get("use_discrete_event_memory", False)
         )
@@ -2003,6 +2012,7 @@ class StationConditionalResUNet1D(nn.Module):
         self.mismatch_risk_encoder: nn.Module | None = None
         self.mismatch_risk_output: nn.Linear | None = None
         self.mismatch_time_output: nn.Module | None = None
+        self.jstd_tail: JointSpatioTemporalDecomposedTail | None = None
         if self.use_retrieval_mismatch_expert and not self.use_body_tail_experts:
             raise ValueError("retrieval mismatch expert requires inherited body-tail experts")
         if self.use_body_tail_experts:
@@ -2123,6 +2133,15 @@ class StationConditionalResUNet1D(nn.Module):
                 # the inherited body, tail adapters, and global gate are exact.
                 nn.init.zeros_(self.tail_time_output[-1].weight)
                 nn.init.zeros_(self.tail_time_output[-1].bias)
+            if self.use_jstd_tail:
+                self.jstd_tail = JointSpatioTemporalDecomposedTail(
+                    self.channels[0],
+                    station_features,
+                    adjacency,
+                    capacities,
+                    secondary_adjacency=secondary_adjacency,
+                    config=config,
+                )
         if self.use_retrieval_mismatch_expert:
             retrieval_channels = int(config.get("retrieval_encoder_channels", 32))
             mismatch_channels = int(config.get("mismatch_expert_channels", 16))
@@ -2250,7 +2269,8 @@ class StationConditionalResUNet1D(nn.Module):
         retrieval_context: torch.Tensor | None = None,
         mismatch_expert_route: torch.Tensor | float | None = None,
         mismatch_time_gate: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_jstd_audit: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, JSTDOutput]:
         if noisy_residual.shape[1:] != (self.station_count, self.sequence_length):
             raise ValueError(
                 "noisy residual must be [B,S,L], got "
@@ -2390,7 +2410,8 @@ class StationConditionalResUNet1D(nn.Module):
                 * common
                 * self.wind_station_mask[None, :, None]
             )
-        if self.use_body_tail_experts:
+        jstd_output: JSTDOutput | None = None
+        if self.use_body_tail_experts and not self.use_jstd_tail:
             if tail_expert_route is None:
                 route = torch.zeros(
                     batch, 1, 1, device=output.device, dtype=output.dtype
@@ -2471,6 +2492,18 @@ class StationConditionalResUNet1D(nn.Module):
                     raise ValueError("tail_time_mask must be in [0,1]")
                 localized_route = route * localized_route
             output = output + localized_route * tail_delta
+        if self.use_jstd_tail:
+            if self.jstd_tail is None:
+                raise RuntimeError("JSTD tail module was not initialized")
+            jstd_output = self.jstd_tail(
+                hidden,
+                forecast,
+                recent_error=recent_error,
+                recent_error_mask=recent_error_mask,
+                route=tail_expert_route,
+                condition_strength=condition_strength,
+            )
+            output = output + jstd_output.correction
         if self.use_retrieval_mismatch_expert:
             if retrieval_context is None or retrieval_context.shape != (
                 batch,
@@ -2534,6 +2567,10 @@ class StationConditionalResUNet1D(nn.Module):
             )
             mismatch_delta = mismatch_delta * self.wind_station_mask[None, :, None]
             output = output + mismatch_route * hourly_gate * mismatch_delta
+        if return_jstd_audit:
+            if jstd_output is None:
+                raise RuntimeError("JSTD audit requested while JSTD tail is disabled")
+            return output, jstd_output
         return output
 
     def encode_retrieval_memory(
@@ -2727,6 +2764,15 @@ class StationConditionalResUNet1D(nn.Module):
             name for name, _ in self.named_parameters() if name.startswith(prefixes)
         )
 
+    def jstd_parameter_names(self) -> tuple[str, ...]:
+        if not self.use_jstd_tail:
+            return ()
+        return tuple(
+            name
+            for name, _ in self.named_parameters()
+            if name.startswith("jstd_tail.")
+        )
+
     def tail_time_parameter_names(self) -> tuple[str, ...]:
         if not self.use_tail_time_localizer:
             return ()
@@ -2781,6 +2827,10 @@ class StationGaussianDiffusion(nn.Module):
         event_x0_window_hours: int = 6,
         event_x0_error_scale: float = 0.10,
         event_x0_timing_temperature: float = 0.05,
+        jstd_decomposition_loss_weight: float = 0.0,
+        jstd_mask_loss_weight: float = 0.0,
+        jstd_issue_loss_weight: float = 0.0,
+        jstd_structure_loss_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.denoiser = denoiser
@@ -2812,6 +2862,12 @@ class StationGaussianDiffusion(nn.Module):
         self.event_x0_timing_temperature = float(
             event_x0_timing_temperature
         )
+        self.jstd_decomposition_loss_weight = float(
+            jstd_decomposition_loss_weight
+        )
+        self.jstd_mask_loss_weight = float(jstd_mask_loss_weight)
+        self.jstd_issue_loss_weight = float(jstd_issue_loss_weight)
+        self.jstd_structure_loss_weight = float(jstd_structure_loss_weight)
         if self.ramp_auxiliary_loss_weight < 0:
             raise ValueError("ramp auxiliary loss weight must be non-negative")
         if self.wind_common_event_loss_weight < 0:
@@ -2822,6 +2878,20 @@ class StationGaussianDiffusion(nn.Module):
             self.event_x0_sync_loss_weight,
         ) < 0:
             raise ValueError("event x0 loss weights must be non-negative")
+        if min(
+            self.jstd_decomposition_loss_weight,
+            self.jstd_mask_loss_weight,
+            self.jstd_issue_loss_weight,
+            self.jstd_structure_loss_weight,
+        ) < 0:
+            raise ValueError("JSTD loss weights must be non-negative")
+        if self.denoiser.use_jstd_tail and min(
+            self.jstd_decomposition_loss_weight,
+            self.jstd_mask_loss_weight,
+            self.jstd_issue_loss_weight,
+            self.jstd_structure_loss_weight,
+        ) <= 0:
+            raise ValueError("enabled JSTD tail requires all four JSTD losses")
         if not 1 <= self.event_x0_window_hours <= 24:
             raise ValueError("event x0 window must be in [1,24]")
         if self.event_x0_error_scale <= 0 or self.event_x0_timing_temperature <= 0:
@@ -2880,13 +2950,20 @@ class StationGaussianDiffusion(nn.Module):
         mismatch_expert_route: torch.Tensor | float | None = None,
         mismatch_time_gate: torch.Tensor | None = None,
         epsilon_sample_weight: torch.Tensor | None = None,
+        jstd_event_active: torch.Tensor | None = None,
+        jstd_event_time_support: torch.Tensor | None = None,
+        jstd_event_station_support: torch.Tensor | None = None,
+        jstd_sample_weight: torch.Tensor | None = None,
+        jstd_slow_target: torch.Tensor | None = None,
+        jstd_fast_target: torch.Tensor | None = None,
+        jstd_slow24_target: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if timestep is None:
             timestep = torch.randint(
                 0, self.num_steps, (clean.shape[0],), device=clean.device
             )
         noisy, noise = self.add_noise(clean, timestep.long(), noise=noise)
-        prediction = self.denoiser(
+        denoiser_result = self.denoiser(
             noisy,
             timestep.long(),
             forecast,
@@ -2905,7 +2982,13 @@ class StationGaussianDiffusion(nn.Module):
             retrieval_context=retrieval_context,
             mismatch_expert_route=mismatch_expert_route,
             mismatch_time_gate=mismatch_time_gate,
+            return_jstd_audit=self.denoiser.use_jstd_tail,
         )
+        if self.denoiser.use_jstd_tail:
+            prediction, jstd_output = denoiser_result
+        else:
+            prediction = denoiser_result
+            jstd_output = None
         squared_error = (prediction - noise) ** 2
         valid_mask = valid_mask.to(squared_error.dtype)
         effective_mask = valid_mask
@@ -2932,6 +3015,8 @@ class StationGaussianDiffusion(nn.Module):
             or self.event_x0_magnitude_loss_weight > 0
             or self.event_x0_timing_loss_weight > 0
             or self.event_x0_sync_loss_weight > 0
+            or self.jstd_decomposition_loss_weight > 0
+            or self.jstd_structure_loss_weight > 0
         )
         if not needs_x0:
             return epsilon_loss
@@ -2951,6 +3036,181 @@ class StationGaussianDiffusion(nn.Module):
         snr_weight = torch.sqrt(
             alpha_hat / (1.0 - alpha_hat).clamp(min=1e-6)
         ).clamp(max=1.0)
+        jstd_decomposition_loss = torch.zeros(
+            (), device=clean.device, dtype=clean.dtype
+        )
+        jstd_mask_loss = torch.zeros_like(jstd_decomposition_loss)
+        jstd_issue_loss = torch.zeros_like(jstd_decomposition_loss)
+        jstd_structure_loss = torch.zeros_like(jstd_decomposition_loss)
+        if self.denoiser.use_jstd_tail:
+            if jstd_output is None or self.denoiser.jstd_tail is None:
+                raise RuntimeError("JSTD outputs are unavailable")
+            required = {
+                "event_active": jstd_event_active,
+                "time_support": jstd_event_time_support,
+                "station_support": jstd_event_station_support,
+                "sample_weight": jstd_sample_weight,
+                "slow_target": jstd_slow_target,
+                "fast_target": jstd_fast_target,
+                "slow24_target": jstd_slow24_target,
+            }
+            missing = [name for name, value in required.items() if value is None]
+            if missing:
+                raise ValueError(f"JSTD training targets are missing: {missing}")
+            batch_size, stations, length = clean.shape
+            if jstd_event_active.shape != (batch_size,):
+                raise ValueError("jstd_event_active must be [B]")
+            if jstd_event_time_support.shape != (batch_size, length):
+                raise ValueError("jstd_event_time_support must be [B,L]")
+            if jstd_event_station_support.shape != clean.shape:
+                raise ValueError("jstd_event_station_support must be [B,S,L]")
+            for target in (jstd_slow_target, jstd_fast_target, jstd_slow24_target):
+                if target.shape != clean.shape:
+                    raise ValueError("JSTD component targets must be [B,S,L]")
+
+            active = jstd_event_active.to(clean.dtype)
+            time_support = jstd_event_time_support.to(clean.dtype)
+            station_support = jstd_event_station_support.to(clean.dtype)
+            support = torch.maximum(
+                station_support,
+                0.25 * time_support[:, None, :],
+            ) * active[:, None, None]
+            weighted_support = support * valid_mask * snr_weight
+
+            # Supervise the *increment over the frozen Raw body*, rather than
+            # asking both JSTD branches to reconstruct the full residual. This
+            # makes the two branch roles identifiable: slow corrects the Raw
+            # body's remaining low-frequency error and fast corrects only its
+            # complementary local error. The ordinary epsilon objective below
+            # still constrains their sum and the final denoising prediction.
+            sqrt_alpha = alpha_hat.sqrt().clamp(min=1e-6)
+            sqrt_one_minus_alpha = (1.0 - alpha_hat).sqrt()
+            body_prediction = prediction - jstd_output.correction
+            body_predicted_clean = (
+                noisy - sqrt_one_minus_alpha * body_prediction
+            ) / sqrt_alpha
+            correction_to_x0 = -sqrt_one_minus_alpha / sqrt_alpha
+            predicted_slow_delta = (
+                correction_to_x0 * jstd_output.slow_correction
+            )
+            predicted_fast_delta = (
+                correction_to_x0 * jstd_output.fast_correction
+            )
+            target_slow_delta = (
+                jstd_slow_target.to(clean.dtype)
+                - same_length_average(body_predicted_clean, 12)
+            )
+            body_fast = body_predicted_clean - same_length_average(
+                body_predicted_clean, 12
+            )
+            target_fast_delta = jstd_fast_target.to(clean.dtype) - body_fast
+            slow_error = F.smooth_l1_loss(
+                predicted_slow_delta,
+                target_slow_delta,
+                reduction="none",
+                beta=0.05,
+            )
+            slow_component = (slow_error * weighted_support).sum() / (
+                weighted_support.sum().clamp(min=1.0)
+            )
+            fast_component = torch.zeros_like(slow_component)
+            lag_weights = (0.50, 0.30, 0.20)
+            for lag, lag_weight in zip((1, 3, 6), lag_weights):
+                predicted_delta = (
+                    predicted_fast_delta[:, :, lag:]
+                    - predicted_fast_delta[:, :, :-lag]
+                )
+                target_delta = (
+                    target_fast_delta[:, :, lag:]
+                    - target_fast_delta[:, :, :-lag]
+                )
+                pair_support = torch.maximum(
+                    weighted_support[:, :, lag:], weighted_support[:, :, :-lag]
+                )
+                current = F.smooth_l1_loss(
+                    predicted_delta, target_delta, reduction="none", beta=0.05
+                )
+                fast_component = fast_component + lag_weight * (
+                    (current * pair_support).sum()
+                    / pair_support.sum().clamp(min=1.0)
+                )
+            slow24_error = F.smooth_l1_loss(
+                same_length_average(predicted_slow_delta, 24),
+                jstd_slow24_target.to(clean.dtype)
+                - same_length_average(body_predicted_clean, 24),
+                reduction="none",
+                beta=0.05,
+            )
+            slow24_component = (slow24_error * weighted_support).sum() / (
+                weighted_support.sum().clamp(min=1.0)
+            )
+            jstd_decomposition_loss = (
+                0.45 * slow_component
+                + 0.35 * fast_component
+                + 0.20 * slow24_component
+            )
+
+            slow_mask_target = same_length_average(station_support, 12).clamp(0.0, 1.0)
+            fast_mask_target = torch.zeros_like(station_support)
+            for lag in (1, 3, 6):
+                edge = torch.zeros_like(station_support)
+                edge[:, :, lag:] = torch.abs(
+                    station_support[:, :, lag:] - station_support[:, :, :-lag]
+                )
+                fast_mask_target = torch.maximum(fast_mask_target, edge)
+            mask_weight = valid_mask * (1.0 + 4.0 * torch.maximum(
+                slow_mask_target, fast_mask_target
+            ))
+            slow_mask_error = F.binary_cross_entropy_with_logits(
+                jstd_output.slow_mask_logit,
+                slow_mask_target,
+                reduction="none",
+            )
+            fast_mask_error = F.binary_cross_entropy_with_logits(
+                jstd_output.fast_mask_logit,
+                fast_mask_target,
+                reduction="none",
+            )
+            jstd_mask_loss = (
+                (slow_mask_error + fast_mask_error) * mask_weight
+            ).sum() / (2.0 * mask_weight.sum().clamp(min=1.0))
+            ordinary = (1.0 - active)[:, None, None] * valid_mask
+            ordinary_correction = (
+                jstd_output.slow_correction + jstd_output.fast_correction
+            ).square()
+            ordinary_zero_loss = (ordinary_correction * ordinary).sum() / (
+                ordinary.sum().clamp(min=1.0)
+            )
+            jstd_mask_loss = jstd_mask_loss + 0.10 * ordinary_zero_loss
+
+            importance = jstd_sample_weight.to(clean.dtype).reciprocal()
+            issue_error = F.binary_cross_entropy_with_logits(
+                jstd_output.issue_logit, active, reduction="none"
+            )
+            jstd_issue_loss = (issue_error * importance).sum() / (
+                importance.sum().clamp(min=1.0)
+            )
+
+            system_errors = []
+            for weight in (
+                self.denoiser.jstd_tail.wind_weight,
+                self.denoiser.jstd_tail.solar_weight,
+            ):
+                predicted_system = torch.einsum(
+                    "s,bst->bt", weight.to(clean.dtype), predicted_clean
+                )
+                target_system = torch.einsum(
+                    "s,bst->bt", weight.to(clean.dtype), clean
+                )
+                current = F.smooth_l1_loss(
+                    predicted_system, target_system, reduction="none", beta=0.05
+                )
+                system_weight = time_support * active[:, None] * snr_weight[:, 0]
+                system_errors.append(
+                    (current * system_weight).sum()
+                    / system_weight.sum().clamp(min=1.0)
+                )
+            jstd_structure_loss = 0.5 * (system_errors[0] + system_errors[1])
         lag_weight_sum = sum(self.ramp_auxiliary_lag_weights)
         ramp_loss = torch.zeros((), device=clean.device, dtype=clean.dtype)
         if self.ramp_auxiliary_loss_weight > 0:
@@ -3119,6 +3379,10 @@ class StationGaussianDiffusion(nn.Module):
             + self.event_x0_magnitude_loss_weight * event_magnitude_loss
             + self.event_x0_timing_loss_weight * event_timing_loss
             + self.event_x0_sync_loss_weight * event_sync_loss
+            + self.jstd_decomposition_loss_weight * jstd_decomposition_loss
+            + self.jstd_mask_loss_weight * jstd_mask_loss
+            + self.jstd_issue_loss_weight * jstd_issue_loss
+            + self.jstd_structure_loss_weight * jstd_structure_loss
         )
 
     def reverse_variance(self, timestep: torch.Tensor) -> torch.Tensor:
@@ -3469,6 +3733,19 @@ class Station24DiffusionModel(nn.Module):
         self.use_body_tail_experts = bool(
             self.config.get("use_body_tail_experts", False)
         )
+        self.use_jstd_tail = bool(self.config.get("use_jstd_tail", False))
+        if self.use_jstd_tail and not self.use_body_tail_experts:
+            raise ValueError("JSTD tail requires use_body_tail_experts=true")
+        if self.use_jstd_tail and any(
+            bool(self.config.get(name, False))
+            for name in (
+                "use_tail_time_localizer",
+                "use_retrieval_mismatch_expert",
+                "use_discrete_event_memory",
+                "train_sampler_energy_score_only",
+            )
+        ):
+            raise ValueError("JSTD V1 replaces legacy tail extensions; they cannot be stacked")
         self.use_tail_time_localizer = bool(
             self.config.get("use_tail_time_localizer", False)
         )
@@ -3771,6 +4048,18 @@ class Station24DiffusionModel(nn.Module):
             event_x0_timing_temperature=float(
                 self.config.get("event_x0_timing_temperature", 0.05)
             ),
+            jstd_decomposition_loss_weight=float(
+                self.config.get("jstd_decomposition_loss_weight", 0.0)
+            ),
+            jstd_mask_loss_weight=float(
+                self.config.get("jstd_mask_loss_weight", 0.0)
+            ),
+            jstd_issue_loss_weight=float(
+                self.config.get("jstd_issue_loss_weight", 0.0)
+            ),
+            jstd_structure_loss_weight=float(
+                self.config.get("jstd_structure_loss_weight", 0.0)
+            ),
         )
         self.event_selector_loss_weight = float(
             self.config.get("event_selector_loss_weight", 0.0)
@@ -3925,6 +4214,40 @@ class Station24DiffusionModel(nn.Module):
             for prefix in prefixes
             for suffix in parameter_suffixes
         )
+
+    @property
+    def jstd_trainable_parameter_names(self) -> tuple[str, ...]:
+        return tuple(
+            f"denoiser.{name}" for name in self.denoiser.jstd_parameter_names()
+        )
+
+    @property
+    def jstd_new_state_dict_keys(self) -> tuple[str, ...]:
+        suffixes = tuple(
+            name
+            for name in self.denoiser.state_dict()
+            if name.startswith("jstd_tail.")
+        )
+        return tuple(
+            sorted(
+                f"{prefix}{suffix}"
+                for prefix in ("denoiser.", "diffusion.denoiser.")
+                for suffix in suffixes
+            )
+        )
+
+    def configure_jstd_training(self) -> tuple[str, ...]:
+        """Freeze every Raw parameter and optimize only the replacement tail."""
+
+        allowed = set(self.jstd_trainable_parameter_names)
+        if not allowed:
+            raise RuntimeError("JSTD tail has no trainable parameters")
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad_(name in allowed)
+        actual = {name for name, value in self.named_parameters() if value.requires_grad}
+        if actual != allowed:
+            raise RuntimeError("JSTD parameter isolation failed")
+        return tuple(sorted(actual))
 
     @property
     def tail_time_trainable_parameter_names(self) -> tuple[str, ...]:
@@ -4626,6 +4949,14 @@ class Station24DiffusionModel(nn.Module):
         return torch.sigmoid(self.mismatch_time_logits(batch, context))
 
     def tail_risk_logits(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        if self.use_jstd_tail:
+            if self.denoiser.jstd_tail is None:
+                raise RuntimeError("JSTD tail is unavailable")
+            return self.denoiser.jstd_tail.issue_logits(
+                batch["forecast"],
+                recent_error=batch.get("recent_error"),
+                recent_error_mask=batch.get("recent_error_mask"),
+            )
         logits = self.denoiser.tail_risk_logits(
             batch["forecast"],
             forecast_revision=batch.get("forecast_revision"),
@@ -4641,6 +4972,15 @@ class Station24DiffusionModel(nn.Module):
     def tail_condition_attention(
         self, batch: Mapping[str, torch.Tensor]
     ) -> torch.Tensor:
+        if self.use_jstd_tail:
+            # Preserve the legacy result-file schema. JSTD uses station-time
+            # masks instead of the old six-signal scalar attention vector.
+            return torch.zeros(
+                batch["forecast"].shape[0],
+                6,
+                device=batch["forecast"].device,
+                dtype=batch["forecast"].dtype,
+            )
         result = self.denoiser.tail_risk_logits(
             batch["forecast"],
             forecast_revision=batch.get("forecast_revision"),
@@ -4730,6 +5070,25 @@ class Station24DiffusionModel(nn.Module):
         self, batch: Mapping[str, torch.Tensor]
     ) -> torch.Tensor:
         """Select wind-event support for the specialized tail denoising loss."""
+
+        if self.use_jstd_tail:
+            support = batch.get("jstd_event_station_support")
+            active = batch.get("jstd_event_active")
+            if support is None or active is None:
+                raise ValueError("JSTD training requires continuous station-time support")
+            if support.shape != batch["forecast"].shape:
+                raise ValueError("jstd_event_station_support must be [B,S,L]")
+            # Retain a small system-level support wherever an aggregate event is
+            # active, so joint wind/solar modes receive gradients even if only a
+            # subset of stations crosses its local threshold.
+            time_support = batch.get("jstd_event_time_support")
+            if time_support is None or time_support.shape != support.shape[:1] + support.shape[2:]:
+                raise ValueError("jstd_event_time_support must be [B,L]")
+            result = torch.maximum(
+                support.to(batch["forecast"].dtype),
+                0.25 * time_support.to(batch["forecast"].dtype)[:, None, :],
+            )
+            return result * active.to(result.dtype)[:, None, None]
 
         event_active = batch.get("event_active")
         event_window = batch.get("event_window_mask")
@@ -4844,7 +5203,15 @@ class Station24DiffusionModel(nn.Module):
         event_memory_time_mask: torch.Tensor | None = None
         event_memory_raw_logits: torch.Tensor | None = None
         epsilon_sample_weight: torch.Tensor | None = None
-        if self.use_discrete_event_memory:
+        if self.use_jstd_tail:
+            tail_route = (
+                1.0
+                if body_tail_route_override is None
+                else float(body_tail_route_override)
+            )
+            if include_auxiliary or body_tail_event_masking:
+                epsilon_sample_weight = self.body_tail_epsilon_weight(batch)
+        elif self.use_discrete_event_memory:
             event_memory_raw_logits = self.event_memory_logits(batch)
             (
                 event_prototype,
@@ -4916,6 +5283,13 @@ class Station24DiffusionModel(nn.Module):
             mismatch_expert_route=mismatch_route,
             mismatch_time_gate=mismatch_time_gate,
             epsilon_sample_weight=epsilon_sample_weight,
+            jstd_event_active=batch.get("jstd_event_active"),
+            jstd_event_time_support=batch.get("jstd_event_time_support"),
+            jstd_event_station_support=batch.get("jstd_event_station_support"),
+            jstd_sample_weight=batch.get("jstd_sample_weight"),
+            jstd_slow_target=batch.get("jstd_slow_target"),
+            jstd_fast_target=batch.get("jstd_fast_target"),
+            jstd_slow24_target=batch.get("jstd_slow24_target"),
         )
         if self.use_discrete_event_memory and include_auxiliary:
             diffusion_loss = diffusion_loss + (
@@ -4972,7 +5346,7 @@ class Station24DiffusionModel(nn.Module):
                 + self.mismatch_gate_loss_weight * gate_loss
                 + self.mismatch_time_loss_weight * time_loss
             )
-        elif self.use_body_tail_experts and include_auxiliary:
+        elif self.use_body_tail_experts and include_auxiliary and not self.use_jstd_tail:
             target = batch["event_active"].to(diffusion_loss.dtype)
             logits = self.tail_risk_logits(batch)
             replay_weight = batch.get("event_replay_weight")

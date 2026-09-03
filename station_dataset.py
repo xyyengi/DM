@@ -13,10 +13,31 @@ import torch
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from src.eval.physical_projection import _solar_elevation_degrees
+from station_jstd_targets import JSTDTargetArrays
 
 
 EXPECTED_STATIONS = 24
 EXPECTED_HOURS = 168
+
+
+def _same_length_average_numpy(value: np.ndarray, width: int) -> np.ndarray:
+    """Reflection-padded moving average over the last axis."""
+
+    value = np.asarray(value, dtype=np.float32)
+    width = int(width)
+    if not 1 <= width < value.shape[-1]:
+        raise ValueError("moving-average width must be in [1, length)")
+    left = (width - 1) // 2
+    right = width - 1 - left
+    padded = np.pad(value, ((0, 0), (left, right)), mode="reflect")
+    cumulative = np.cumsum(padded, axis=-1, dtype=np.float64)
+    cumulative = np.concatenate(
+        [np.zeros((*cumulative.shape[:-1], 1), dtype=np.float64), cumulative],
+        axis=-1,
+    )
+    return ((cumulative[..., width:] - cumulative[..., :-width]) / width).astype(
+        np.float32
+    )
 
 
 def _seed_worker(worker_id: int) -> None:
@@ -1348,6 +1369,7 @@ class StationForecastDataset(Dataset):
         state_thresholds: Mapping[str, object] | None = None,
         event_weighting: Mapping[str, object] | None = None,
         event_replay: Mapping[str, object] | None = None,
+        jstd_targets: JSTDTargetArrays | None = None,
         retrieval_arrays: object | None = None,
         forecast_trust_arrays: object | None = None,
     ) -> None:
@@ -1376,6 +1398,21 @@ class StationForecastDataset(Dataset):
             if event_replay is not None and split == "train"
             else None
         )
+        self.jstd_targets = jstd_targets if split in {"train", "val"} else None
+        if self.jstd_targets is not None:
+            if self.jstd_targets.split != split:
+                raise ValueError("JSTD target split does not match dataset split")
+            expected_n = len(self.forecast)
+            if self.jstd_targets.event_active.shape != (expected_n,):
+                raise ValueError("JSTD event_active must be [N]")
+            if self.jstd_targets.time_support.shape != (expected_n, EXPECTED_HOURS):
+                raise ValueError("JSTD time_support must be [N,168]")
+            if self.jstd_targets.station_support.shape != (
+                expected_n,
+                EXPECTED_STATIONS,
+                EXPECTED_HOURS,
+            ):
+                raise ValueError("JSTD station_support must be [N,24,168]")
         self.retrieval_arrays = retrieval_arrays
         if retrieval_arrays is not None:
             expected_queries = len(self.forecast)
@@ -1478,6 +1515,8 @@ class StationForecastDataset(Dataset):
             "event_replay_enabled": event_replay is not None,
             "event_replay_applied": bool(event_replay is not None and split == "train"),
             "event_replay_uses_target_as_condition": False,
+            "jstd_targets_enabled": self.jstd_targets is not None,
+            "jstd_targets_used_as_condition": False,
             "event_replay_independent_event_count": (
                 int(event_replay["independent_event_count"])
                 if event_replay is not None and split == "train"
@@ -1595,6 +1634,9 @@ class StationForecastDataset(Dataset):
             revision_mask=revision_mask,
         )
         target = residual / scale_tensor
+        jstd_slow_target = _same_length_average_numpy(target, 12)
+        jstd_fast_target = target - jstd_slow_target
+        jstd_slow24_target = _same_length_average_numpy(target, 24)
         historical_center = (
             np.asarray(
                 self.forecast_trust_arrays.center[index], dtype=np.float32
@@ -1652,6 +1694,17 @@ class StationForecastDataset(Dataset):
                     self.event_replay["sample_sync_station_weight"][index],
                     dtype=np.float32,
                 )
+        jstd_event_active = np.float32(0.0)
+        jstd_event_time_support = np.zeros(EXPECTED_HOURS, dtype=np.float32)
+        jstd_event_station_support = np.zeros(
+            (EXPECTED_STATIONS, EXPECTED_HOURS), dtype=np.float32
+        )
+        jstd_sample_weight = np.float32(1.0)
+        if self.jstd_targets is not None:
+            jstd_event_active = np.float32(self.jstd_targets.event_active[index])
+            jstd_event_time_support[:] = self.jstd_targets.time_support[index]
+            jstd_event_station_support[:] = self.jstd_targets.station_support[index]
+            jstd_sample_weight = np.float32(self.jstd_targets.sample_weights[index])
         return {
             "sample_index": torch.tensor(index, dtype=torch.long),
             "forecast": torch.from_numpy(forecast),
@@ -1685,6 +1738,21 @@ class StationForecastDataset(Dataset):
             "event_sync_station_weight": torch.from_numpy(
                 event_sync_station_weight
             ),
+            "jstd_event_active": torch.tensor(
+                jstd_event_active, dtype=torch.float32
+            ),
+            "jstd_event_time_support": torch.from_numpy(
+                jstd_event_time_support
+            ),
+            "jstd_event_station_support": torch.from_numpy(
+                jstd_event_station_support
+            ),
+            "jstd_sample_weight": torch.tensor(
+                jstd_sample_weight, dtype=torch.float32
+            ),
+            "jstd_slow_target": torch.from_numpy(jstd_slow_target),
+            "jstd_fast_target": torch.from_numpy(jstd_fast_target),
+            "jstd_slow24_target": torch.from_numpy(jstd_slow24_target),
             "retrieval_residual": torch.from_numpy(
                 retrieval_residual
             ),
@@ -1845,6 +1913,7 @@ def get_station_dataloader(
     state_thresholds: Mapping[str, object] | None = None,
     event_weighting: Mapping[str, object] | None = None,
     event_replay: Mapping[str, object] | None = None,
+    jstd_targets: JSTDTargetArrays | None = None,
     retrieval_arrays: object | None = None,
     forecast_trust_arrays: object | None = None,
 ) -> tuple[DataLoader, StationForecastDataset]:
@@ -1856,6 +1925,7 @@ def get_station_dataloader(
         state_thresholds=state_thresholds,
         event_weighting=event_weighting,
         event_replay=event_replay,
+        jstd_targets=jstd_targets,
         retrieval_arrays=retrieval_arrays,
         forecast_trust_arrays=forecast_trust_arrays,
     )
@@ -1863,7 +1933,14 @@ def get_station_dataloader(
     split_offset = {"train": 0, "val": 10_000, "test": 20_000}[split]
     generator.manual_seed(int(seed) + split_offset)
     sampler = None
-    if split == "train" and event_replay is not None:
+    if split == "train" and jstd_targets is not None:
+        sampler = WeightedRandomSampler(
+            torch.as_tensor(jstd_targets.sample_weights, dtype=torch.double),
+            num_samples=len(dataset),
+            replacement=True,
+            generator=generator,
+        )
+    elif split == "train" and event_replay is not None:
         replay = validate_station_event_replay(event_replay, len(dataset))
         sampler = WeightedRandomSampler(
             torch.as_tensor(replay["sample_replay_weights"], dtype=torch.double),

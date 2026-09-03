@@ -1,0 +1,157 @@
+experiment:
+  name: "station24_jstd_tail_v1_168h"
+  family: "station24_joint_spatiotemporal_decomposed_tail"
+  variant: "geo_history_actual_jstd_tail_v1"
+  description: "Frozen Raw body with one joint wind-solar localized slow-fast tail"
+
+data:
+  data_path: "./diffusion_input_station"
+  station_count: 24
+  sequence_length: 168
+  residual_definition: "actual_minus_current_forecast"
+
+target:
+  type: "residual"
+  residual_scaling:
+    method: "wind_factorized_condition_std"
+    fit_split: "train"
+    center: false
+    epsilon: 1.0e-4
+    forecast_level_quantiles: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    forecast_ramp_quantiles: [0.0, 0.25, 0.5, 0.75, 1.0]
+    forecast_revision_quantiles: [0.0, 0.25, 0.5, 0.75, 1.0]
+    ramp_lag: 3
+    factor_iterations: 6
+    factor_clip: [0.5, 2.0]
+
+model:
+  architecture: "station24_resunet"
+  spatial_mode: "fixed_graph"
+  spatial_mix_levels: ["bottleneck"]
+  spatial_gate_init: -1.0
+  parallel_spatial_fusion_levels: ["encoder_0"]
+  parallel_spatial_gate_init: -1.0
+  parallel_spatial_adjacency_mode: "fixed"
+  use_dual_fixed_graph: true
+  secondary_adjacency_path: null
+  secondary_adjacency_role: "train_unique_actual_power"
+  secondary_adjacency_fit_split: "train"
+  dual_graph_primary_logit_init: 2.0
+  dual_graph_secondary_logit_init: 0.0
+  station_count: 24
+  sequence_length: 168
+  base_channels: 32
+  num_layers: 3
+  channel_multipliers: [1, 2, 4]
+  group_norm_groups: 8
+  dropout: 0.10
+  timestep_embedding_dim: 128
+  num_steps: 500
+  beta_start: 0.0001
+  beta_end: 0.04
+  schedule: "linear"
+  reverse_variance_type: "posterior"
+
+  # Raw body condition modulation is intentionally unchanged.
+  use_forecast_ramps: false
+  forecast_ramp_lags: [3, 6]
+  use_forecast_revision: false
+  use_recent_error: true
+  recent_error_hours: 24
+  condition_gate_init: -1.0
+  use_state_encoder: true
+  state_feature_dim: 4
+  state_feature_names:
+    - "low_output_severity"
+    - "high_output_severity"
+    - "ramp_up_severity"
+    - "ramp_down_severity"
+  state_channels: [8, 16, 32]
+  state_ramp_lags: [3, 6]
+  state_low_quantile: 0.20
+  state_high_quantile: 0.90
+  state_ramp_quantile: 0.90
+  state_clip: 3.0
+  state_global_gate_init: -1.0
+  state_film_gate_init: -1.0
+
+  # JSTD replaces the legacy full-week wind-only tail; it is not a third expert.
+  use_body_tail_experts: true
+  use_jstd_tail: true
+  tail_expert_channels: 16
+  tail_epsilon_context_hours: 0
+  tail_common_gate_init: -1.0
+  tail_gate_channels: 16
+  tail_gate_prior_probability: 0.12
+  tail_gate_loss_weight: 0.05
+  use_tail_time_localizer: false
+  use_retrieval_mismatch_expert: false
+  use_discrete_event_memory: false
+  train_sampler_energy_score_only: false
+
+  jstd_channels: 24
+  jstd_system_modes: 4
+  jstd_mask_prior: 0.12
+  jstd_secondary_graph_mix: 0.20
+
+  # Continuous events: no 6/12/24 h event classes and no minimum duration.
+  jstd_event_enter_quantile: 0.90
+  jstd_event_keep_fraction: 0.50
+  jstd_station_support_quantile: 0.80
+  jstd_event_bridge_hours: 1
+
+  # Four grouped objectives. The slow/fast x0 targets are the remaining error
+  # of the frozen Raw body (not the full residual), and are SNR weighted.
+  jstd_decomposition_loss_weight: 0.15
+  jstd_mask_loss_weight: 0.04
+  jstd_issue_loss_weight: 0.05
+  jstd_structure_loss_weight: 0.08
+
+  use_extreme_event_weighting: false
+  use_event_replay_x0: false
+  ramp_auxiliary_loss_weight: 0.0
+  wind_common_event_loss_weight: 0.0
+  event_x0_magnitude_loss_weight: 0.0
+  event_x0_timing_loss_weight: 0.0
+  event_x0_sync_loss_weight: 0.0
+
+train:
+  batch_size: 8
+  gradient_accumulation_steps: 2
+  effective_batch_size: 16
+  lr: 2.0e-4
+  epochs: 300
+  weight_decay: 1.0e-4
+  patience: 40
+  validation_every: 5
+  min_delta: 1.0e-5
+  gradient_clip_norm: 1.0
+  ema_decay: 0.999
+  ema_warmup:
+    enabled: true
+    inv_gamma: 1.0
+    power: 0.75
+    min_decay: 0.0
+    update_after_step: 0
+  mixed_precision: true
+  save_every: 50
+  seed: 2027
+  validation_seed: 314159
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 2
+
+evaluation:
+  split: "val"
+  n_samples: 500
+  generation_seed: 424242
+  issue_batch_size: 2
+  member_chunk_size: 256
+  auto_tune_member_chunk: true
+  member_chunk_candidates: [500, 384, 256, 192, 128, 96, 64]
+  max_generation_memory_fraction: 0.78
+  generation_probe_steps: 8
+  energy_score_member_limit: 80
+  quantiles: [0.80, 0.90, 0.95, 0.99]
+  physical_projection: "clip_0_1_and_station_astronomical_solar_night"
+  test_locked: true

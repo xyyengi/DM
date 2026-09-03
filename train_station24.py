@@ -39,6 +39,10 @@ from station_dataset import (
 from station_retrieval_memory import build_retrieval_arrays
 from station_discrete_event_memory import build_discrete_event_arrays
 from station_forecast_trust import build_forecast_trust_arrays
+from station_jstd_targets import (
+    build_station_jstd_target_arrays,
+    fit_station_jstd_event_thresholds,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -333,13 +337,17 @@ def validate(
             dtype=batch["residual_target"].dtype,
         )
         if model.use_body_tail_experts:
-            if event_replay is None:
+            if event_replay is None and not model.use_jstd_tail:
                 raise ValueError("body-tail validation requires train event thresholds")
-            active, event_window, _ = build_body_tail_validation_events(
-                batch, model, event_replay
-            )
-            batch["event_active"] = active
-            batch["event_window_mask"] = event_window
+            if model.use_jstd_tail:
+                active = batch["jstd_event_active"]
+                event_window = batch["jstd_event_time_support"]
+            else:
+                active, event_window, _ = build_body_tail_validation_events(
+                    batch, model, event_replay
+                )
+                batch["event_active"] = active
+                batch["event_window_mask"] = event_window
             support = model.body_tail_epsilon_weight(batch) * batch[
                 "valid_mask"
             ].to(active.dtype)
@@ -348,11 +356,12 @@ def validate(
                 batch,
                 timestep=timestep,
                 noise=noise,
-                include_auxiliary=False,
+                include_auxiliary=model.use_jstd_tail,
                 body_tail_event_masking=True,
             )
-            total_loss += float(loss) * support_count
-            total_weight += support_count
+            validation_weight = batch_size if model.use_jstd_tail else support_count
+            total_loss += float(loss) * validation_weight
+            total_weight += validation_weight
             target = active
             if model.use_retrieval_mismatch_expert:
                 context, _ = model.encode_retrieval_memory(batch)
@@ -425,6 +434,15 @@ def validate(
                 location_offset_sum / total_weight
             ),
             "val_tail_event_count": float(tail_event_count),
+        }
+    if model.use_jstd_tail:
+        if total_weight <= 0.0 or tail_event_count <= 0:
+            raise ValueError("validation split contains no continuous JSTD event")
+        objective = total_loss / total_weight
+        return objective, {
+            "val_jstd_objective": objective,
+            "val_jstd_issue_bce": gate_error_sum / max(gate_samples, 1),
+            "val_jstd_event_issue_count": float(tail_event_count),
         }
     if model.use_body_tail_experts:
         if total_weight <= 0.0 or tail_event_count <= 0:
@@ -557,6 +575,10 @@ def save_checkpoint(
         "state_gate_values": model.state_gate_values,
         "wind_common_gate_value": model.wind_common_gate_value,
         "use_body_tail_experts": bool(model.use_body_tail_experts),
+        "use_jstd_tail": bool(model.use_jstd_tail),
+        "jstd_trainable_parameter_names": list(
+            model.jstd_trainable_parameter_names
+        ),
         "use_tail_time_localizer": bool(model.use_tail_time_localizer),
         "train_tail_time_localizer_only": bool(
             model.train_tail_time_localizer_only
@@ -768,6 +790,35 @@ def main() -> None:
         write_station_event_replay(
             run_dir / "event_replay.json", event_replay
         )
+    jstd_thresholds = None
+    train_jstd_targets = None
+    val_jstd_targets = None
+    if bool(config["model"].get("use_jstd_tail", False)):
+        if event_replay is not None or event_weighting is not None:
+            raise ValueError("JSTD V1 uses its own continuous targets, not legacy replay")
+        jstd_thresholds = fit_station_jstd_event_thresholds(
+            data_path, config["model"]
+        )
+        train_jstd_targets = build_station_jstd_target_arrays(
+            data_path, "train", jstd_thresholds
+        )
+        val_jstd_targets = build_station_jstd_target_arrays(
+            data_path, "val", jstd_thresholds
+        )
+        (run_dir / "jstd_event_targets.json").write_text(
+            json.dumps(
+                {
+                    "thresholds": jstd_thresholds,
+                    "train_audit": train_jstd_targets.audit,
+                    "val_audit": val_jstd_targets.audit,
+                    "train_catalog": list(train_jstd_targets.catalog),
+                    "val_catalog": list(val_jstd_targets.catalog),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     (run_dir / "config_used.yaml").write_text(
         yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8"
     )
@@ -896,6 +947,7 @@ def main() -> None:
         state_thresholds=state_thresholds,
         event_weighting=event_weighting,
         event_replay=event_replay,
+        jstd_targets=train_jstd_targets,
         retrieval_arrays=train_retrieval,
         forecast_trust_arrays=train_forecast_trust,
     )
@@ -916,6 +968,7 @@ def main() -> None:
         state_thresholds=state_thresholds,
         event_weighting=event_weighting,
         event_replay=event_replay,
+        jstd_targets=val_jstd_targets,
         retrieval_arrays=val_retrieval,
         forecast_trust_arrays=val_forecast_trust,
     )
@@ -980,7 +1033,37 @@ def main() -> None:
         initialization = torch.load(
             initialization_path, map_location="cpu", weights_only=False
         )
-        if model.train_sampler_energy_score_only:
+        if model.use_jstd_tail:
+            if initialization.get("condition_variant") != (
+                "geo_history_actual_body_tail_moe"
+            ):
+                raise ValueError("JSTD V1 must initialize from the Raw body-tail checkpoint")
+            source_state = initialization["model_state_dict"]
+            incompatible = model.load_state_dict(source_state, strict=False)
+            expected_missing = set(model.jstd_new_state_dict_keys)
+            if set(incompatible.missing_keys) != expected_missing:
+                raise ValueError(
+                    "unexpected JSTD initialization gaps: "
+                    f"{sorted(incompatible.missing_keys)}"
+                )
+            if incompatible.unexpected_keys:
+                raise ValueError(
+                    f"unexpected JSTD initialization keys: {sorted(incompatible.unexpected_keys)}"
+                )
+            trainable_names = model.configure_jstd_training()
+            initialization_manifest = {
+                "method": "frozen_raw_body_replacement_joint_spatiotemporal_decomposed_tail_v1",
+                "checkpoint": str(initialization_path),
+                "checkpoint_state_source": "raw",
+                "source_condition_variant": str(initialization["condition_variant"]),
+                "source_epoch": int(initialization["epoch"]),
+                "raw_body_and_condition_modulation_frozen": True,
+                "legacy_tail_bypassed": True,
+                "third_expert_used": False,
+                "forecast_revision_added": False,
+                "trainable_parameter_names": list(trainable_names),
+            }
+        elif model.train_sampler_energy_score_only:
             if initialization.get("condition_variant") != (
                 "geo_history_actual_body_tail_moe"
             ):
@@ -1236,7 +1319,7 @@ def main() -> None:
             raise ValueError(
                 "L1 isolates sampler Energy Score and must disable legacy x0 losses"
             )
-    elif (event_replay is None) != (configured_event_x0_weight <= 0.0):
+    elif not model.use_jstd_tail and (event_replay is None) != (configured_event_x0_weight <= 0.0):
         raise ValueError(
             "event replay and positive event x0 loss weights must be enabled together"
         )
@@ -1246,7 +1329,7 @@ def main() -> None:
         raise ValueError(
             "event replay window and event x0 loss window must match"
         )
-    if model.use_body_tail_experts and event_replay is None:
+    if model.use_body_tail_experts and event_replay is None and not model.use_jstd_tail:
         raise ValueError("body-tail expert training requires event replay labels")
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     trainable_count = sum(
@@ -1311,6 +1394,8 @@ def main() -> None:
     elif model.sampler_event_localized:
         # Raw is the formal state, but keep EMA internally coherent for audits.
         ema_trainable_state_names = None
+    elif model.use_jstd_tail:
+        ema_trainable_state_names = set(model.jstd_new_state_dict_keys)
     elif model.use_body_tail_experts:
         ema_trainable_state_names = set(model.body_tail_state_dict_keys)
     else:
@@ -1418,7 +1503,9 @@ def main() -> None:
         for batch_index, raw_batch in enumerate(train_loader, start=1):
             batch = move_batch(raw_batch, device)
             batch_size = batch["forecast"].shape[0]
-            if event_replay is not None:
+            if model.use_jstd_tail:
+                event_draws += int(batch["jstd_event_active"].sum().detach().cpu())
+            elif event_replay is not None:
                 event_draws += int(batch["event_active"].sum().detach().cpu())
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
                 base_loss = (
@@ -1707,6 +1794,10 @@ def main() -> None:
         ),
         "state_gate_values": model.state_gate_values,
         "use_body_tail_experts": bool(model.use_body_tail_experts),
+        "use_jstd_tail": bool(model.use_jstd_tail),
+        "jstd_trainable_parameter_names": list(
+            model.jstd_trainable_parameter_names
+        ),
         "use_tail_time_localizer": bool(model.use_tail_time_localizer),
         "train_tail_time_localizer_only": bool(
             model.train_tail_time_localizer_only

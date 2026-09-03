@@ -954,6 +954,7 @@ def main() -> None:
         "state_gate_values": model.state_gate_values,
         "wind_common_gate_value": model.wind_common_gate_value,
         "use_body_tail_experts": bool(model.use_body_tail_experts),
+        "use_jstd_tail": bool(model.use_jstd_tail),
         "use_tail_time_localizer": bool(model.use_tail_time_localizer),
         "use_retrieval_mismatch_expert": bool(
             model.use_retrieval_mismatch_expert
