@@ -117,6 +117,93 @@ def _correction_localization(
     }
 
 
+def _best_window_start(curve: np.ndarray, width: int) -> int:
+    score = np.convolve(curve, np.ones(int(width), dtype=float), mode="valid")
+    return int(np.argmax(score))
+
+
+def _window_overlap(start: int, stop: int, candidate: int) -> float:
+    width = stop - start
+    intersection = max(0, min(stop, candidate + width) - max(start, candidate))
+    return float(intersection / max(width, 1))
+
+
+def _structured_event_metrics(
+    slow_mask: np.ndarray,
+    fast_mask: np.ndarray,
+    slow_correction: np.ndarray,
+    fast_correction: np.ndarray,
+    source_indices: np.ndarray,
+    other_indices: np.ndarray,
+    onset: int,
+    stop: int,
+    source_weights: np.ndarray,
+    expected_sign: float,
+) -> dict[str, float]:
+    """Separate temporal localization, spatial localization, and direction."""
+
+    duration = int(stop - onset)
+    combined = slow_correction + fast_correction
+    slow_curve = np.einsum("s,st->t", source_weights, slow_mask[source_indices])
+    fast_curve = np.einsum("s,st->t", source_weights, fast_mask[source_indices])
+    correction_curve = np.einsum(
+        "s,st->t", source_weights, combined[source_indices]
+    )
+    mask_curve = 0.5 * (slow_curve + fast_curve)
+    signed_curve = float(expected_sign) * correction_curve
+    mask_start = _best_window_start(mask_curve, duration)
+    correction_start = _best_window_start(signed_curve, duration)
+    temporal_baseline = duration / slow_curve.size
+    source_inside = combined[source_indices, onset:stop]
+    other_inside = combined[other_indices, onset:stop]
+    same_source_energy = float(np.abs(combined[source_indices]).sum())
+    interval_energy = float(np.abs(source_inside).sum())
+    separate_inside = float(
+        np.abs(slow_correction[source_indices, onset:stop]).sum()
+        + np.abs(fast_correction[source_indices, onset:stop]).sum()
+    )
+    return {
+        "slow_temporal_inside_outside_ratio": _safe_ratio(
+            float(slow_curve[onset:stop].mean()),
+            float(np.delete(slow_curve, np.s_[onset:stop]).mean()),
+        ),
+        "fast_temporal_inside_outside_ratio": _safe_ratio(
+            float(fast_curve[onset:stop].mean()),
+            float(np.delete(fast_curve, np.s_[onset:stop]).mean()),
+        ),
+        "slow_spatial_source_other_ratio": _safe_ratio(
+            float(slow_mask[source_indices, onset:stop].mean()),
+            float(slow_mask[other_indices, onset:stop].mean()),
+        ),
+        "fast_spatial_source_other_ratio": _safe_ratio(
+            float(fast_mask[source_indices, onset:stop].mean()),
+            float(fast_mask[other_indices, onset:stop].mean()),
+        ),
+        "same_source_temporal_event_energy_fraction": _safe_ratio(
+            interval_energy, same_source_energy
+        ),
+        "same_source_temporal_energy_lift": _safe_ratio(
+            _safe_ratio(interval_energy, same_source_energy), temporal_baseline
+        ),
+        "event_mean_signed_correction": float(signed_curve[onset:stop].mean()),
+        "event_direction_correct_fraction": float(
+            (signed_curve[onset:stop] > 0).mean()
+        ),
+        "mask_best_window_start": float(mask_start),
+        "mask_onset_abs_error_h": float(abs(mask_start - onset)),
+        "mask_window_overlap": _window_overlap(onset, stop, mask_start),
+        "correction_best_window_start": float(correction_start),
+        "correction_onset_abs_error_h": float(abs(correction_start - onset)),
+        "correction_window_overlap": _window_overlap(onset, stop, correction_start),
+        "inside_slow_fast_cancellation_fraction": 1.0
+        - _safe_ratio(interval_energy, separate_inside),
+        "source_other_abs_correction_ratio": _safe_ratio(
+            float(np.abs(source_inside).mean()),
+            float(np.abs(other_inside).mean()),
+        ),
+    }
+
+
 def _plot_issue(
     output: Path,
     issue: int,
@@ -270,8 +357,24 @@ def main() -> None:
         batch = move_batch(raw_batch, device)
         clean = batch["residual_target"]
         per_issue = {name: [] for name in arrays}
-        support = batch["jstd_event_station_support"][0].detach().cpu().numpy() > 0.5
-        event_time = batch["jstd_event_time_support"][0].detach().cpu().numpy() > 0.5
+        item = catalog_by_issue.get(issue)
+        event_region = np.zeros((24, 168), dtype=bool)
+        event_time = np.zeros(168, dtype=bool)
+        source_indices = np.arange(24, dtype=int)
+        other_indices = np.arange(24, dtype=int)
+        source_weights = capacities / capacities.sum()
+        expected_sign = 1.0
+        if item is not None:
+            feature_column = 0 if item["source"] == "wind" else 1
+            source_indices = np.flatnonzero(station_features[:, feature_column] > 0.5)
+            other_indices = np.flatnonzero(station_features[:, feature_column] <= 0.5)
+            source_weights = capacities[source_indices]
+            source_weights = source_weights / source_weights.sum()
+            onset = int(item["lead_onset"])
+            stop = int(item["lead_stop_exclusive"])
+            event_region[source_indices, onset:stop] = True
+            event_time[onset:stop] = True
+            expected_sign = -1.0 if item["direction"] == "negative" else 1.0
         generator = torch.Generator(device=device).manual_seed(args.seed + issue * 1009)
         base_noise = torch.randn(clean.shape, generator=generator, device=device)
         issue_logit = model.tail_risk_logits(batch)
@@ -329,10 +432,25 @@ def main() -> None:
                 "slow_fast_cancellation_fraction": 1.0
                 - _safe_ratio(combined_abs, separate_abs),
             }
-            row.update({f"slow_{k}": v for k, v in _event_localization(values["slow_mask"], support).items()})
-            row.update({f"fast_{k}": v for k, v in _event_localization(values["fast_mask"], support).items()})
-            row.update({f"slow_{k}": v for k, v in _correction_localization(slow, support).items()})
-            row.update({f"fast_{k}": v for k, v in _correction_localization(fast, support).items()})
+            row.update({f"slow_{k}": v for k, v in _event_localization(values["slow_mask"], event_region).items()})
+            row.update({f"fast_{k}": v for k, v in _event_localization(values["fast_mask"], event_region).items()})
+            row.update({f"slow_{k}": v for k, v in _correction_localization(slow, event_region).items()})
+            row.update({f"fast_{k}": v for k, v in _correction_localization(fast, event_region).items()})
+            if item is not None:
+                row.update(
+                    _structured_event_metrics(
+                        values["slow_mask"],
+                        values["fast_mask"],
+                        slow,
+                        fast,
+                        source_indices,
+                        other_indices,
+                        int(item["lead_onset"]),
+                        int(item["lead_stop_exclusive"]),
+                        source_weights,
+                        expected_sign,
+                    )
+                )
             rows.append(row)
 
         for name in arrays:
@@ -394,6 +512,27 @@ def main() -> None:
         "event_slow_fast_cancellation_fraction_mean": float(
             event_rows["slow_fast_cancellation_fraction"].mean()
         ),
+        "event_slow_temporal_inside_outside_ratio_mean": float(
+            event_rows["slow_temporal_inside_outside_ratio"].mean()
+        ),
+        "event_fast_temporal_inside_outside_ratio_mean": float(
+            event_rows["fast_temporal_inside_outside_ratio"].mean()
+        ),
+        "event_same_source_temporal_energy_lift_mean": float(
+            event_rows["same_source_temporal_energy_lift"].mean()
+        ),
+        "event_direction_correct_fraction_mean": float(
+            event_rows["event_direction_correct_fraction"].mean()
+        ),
+        "event_mask_onset_abs_error_h_mean": float(
+            event_rows["mask_onset_abs_error_h"].mean()
+        ),
+        "event_correction_onset_abs_error_h_mean": float(
+            event_rows["correction_onset_abs_error_h"].mean()
+        ),
+        "event_inside_slow_fast_cancellation_fraction_mean": float(
+            event_rows["inside_slow_fast_cancellation_fraction"].mean()
+        ),
         "graph_manifest": graph_manifest,
     }
     (output / "jstd_mechanism_summary.json").write_text(
@@ -437,6 +576,13 @@ def main() -> None:
         f"- Mean slow correction outside-event fraction: {summary['event_slow_correction_outside_fraction_mean']:.4f}",
         f"- Mean fast correction outside-event fraction: {summary['event_fast_correction_outside_fraction_mean']:.4f}",
         f"- Mean slow/fast cancellation fraction: {summary['event_slow_fast_cancellation_fraction_mean']:.4f}",
+        f"- Mean slow temporal inside/outside ratio: {summary['event_slow_temporal_inside_outside_ratio_mean']:.4f}",
+        f"- Mean fast temporal inside/outside ratio: {summary['event_fast_temporal_inside_outside_ratio_mean']:.4f}",
+        f"- Mean same-source temporal correction-energy lift: {summary['event_same_source_temporal_energy_lift_mean']:.4f}",
+        f"- Mean direction-correct fraction: {summary['event_direction_correct_fraction_mean']:.4f}",
+        f"- Mean mask onset absolute error: {summary['event_mask_onset_abs_error_h_mean']:.2f} h",
+        f"- Mean correction onset absolute error: {summary['event_correction_onset_abs_error_h_mean']:.2f} h",
+        f"- Mean in-event slow/fast cancellation fraction: {summary['event_inside_slow_fast_cancellation_fraction_mean']:.4f}",
         "",
         "See `jstd_mechanism_by_issue_timestep.csv` and the per-issue PNG files for details.",
     ]

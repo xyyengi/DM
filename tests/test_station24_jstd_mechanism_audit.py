@@ -7,6 +7,7 @@ from tools.audit_station24_jstd_mechanism import (
     _binary_auc,
     _correction_localization,
     _event_localization,
+    _structured_event_metrics,
 )
 
 
@@ -30,6 +31,31 @@ class JSTDMechanismAuditMetricTests(unittest.TestCase):
         self.assertAlmostEqual(
             correction_metrics["correction_outside_event_fraction"], 0.2
         )
+
+    def test_structured_metrics_use_full_event_interval(self):
+        slow_mask = np.full((2, 8), 0.1, dtype=np.float32)
+        fast_mask = np.full((2, 8), 0.1, dtype=np.float32)
+        slow_mask[0, 3:5] = 0.8
+        fast_mask[0, 3:5] = 0.6
+        slow = np.zeros((2, 8), dtype=np.float32)
+        fast = np.zeros((2, 8), dtype=np.float32)
+        slow[0, 3:5] = -2.0
+        metrics = _structured_event_metrics(
+            slow_mask,
+            fast_mask,
+            slow,
+            fast,
+            np.asarray([0]),
+            np.asarray([1]),
+            3,
+            5,
+            np.asarray([1.0]),
+            -1.0,
+        )
+        self.assertEqual(metrics["mask_onset_abs_error_h"], 0.0)
+        self.assertEqual(metrics["correction_onset_abs_error_h"], 0.0)
+        self.assertEqual(metrics["event_direction_correct_fraction"], 1.0)
+        self.assertEqual(metrics["mask_window_overlap"], 1.0)
 
 
 if __name__ == "__main__":
