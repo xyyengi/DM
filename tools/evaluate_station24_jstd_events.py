@@ -32,7 +32,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--baseline-label", default="Raw body-tail")
     parser.add_argument("--candidate-label", default="JSTD-Tail V1")
+    parser.add_argument(
+        "--resume-existing",
+        action="store_true",
+        help="allow deterministic regeneration of files in a partial output directory",
+    )
     return parser.parse_args()
+
+
+def _markdown_table(frame: pd.DataFrame) -> str:
+    """Render a small Markdown table without pandas' optional tabulate package."""
+
+    columns = [str(column) for column in frame.columns]
+    if not columns:
+        return "(no columns)"
+
+    def render(value: object) -> str:
+        if pd.isna(value):
+            return ""
+        if isinstance(value, float):
+            text = f"{value:.6g}"
+        else:
+            text = str(value)
+        return text.replace("|", "\\|").replace("\n", " ")
+
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+    ]
+    lines.extend(
+        "| " + " | ".join(render(value) for value in row) + " |"
+        for row in frame.itertuples(index=False, name=None)
+    )
+    return "\n".join(lines)
 
 
 def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
@@ -246,7 +278,7 @@ def ramp_summary(
 def main() -> None:
     args = parse_args()
     output = Path(args.output_dir)
-    output.mkdir(parents=True, exist_ok=False)
+    output.mkdir(parents=True, exist_ok=args.resume_existing)
     target_payload = json.loads(
         (Path(args.candidate_run) / "jstd_event_targets.json").read_text(encoding="utf-8")
     )
@@ -316,7 +348,7 @@ def main() -> None:
         "",
         "## 主要标准（±6 h / 50%区间 / 75%深度）",
         "",
-        primary.to_markdown(index=False),
+        _markdown_table(primary),
         "",
         "完整三档结果见 `continuous_event_three_standard_summary.csv`，fast结果见 `fast_ramp_1_3_6h_summary.csv`。",
     ]
