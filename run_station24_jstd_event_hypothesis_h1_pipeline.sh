@@ -98,6 +98,9 @@ shopt -u nullglob
 SOURCE_RUN=${source_runs[0]}
 SOURCE_CHECKPOINT="${SOURCE_RUN}/checkpoints/model_best.pt"
 [[ -f "${SOURCE_CHECKPOINT}" ]] || die "missing JSTD V1 checkpoint ${SOURCE_CHECKPOINT}"
+SECONDARY_ADJACENCY="${SOURCE_RUN}/graphs/secondary_adjacency.npy"
+[[ -f "${SECONDARY_ADJACENCY}" ]] \
+  || die "missing frozen JSTD V1 secondary graph ${SECONDARY_ADJACENCY}"
 PARENT_RESULT="${SOURCE_JSTD_ROOT}/validation_results/jstd_tail_v1_raw_val_n500_seed424242"
 [[ -f "${PARENT_RESULT}/metrics.json" ]] \
   || die "missing JSTD V1 parent generation ${PARENT_RESULT}"
@@ -140,6 +143,7 @@ echo "JSTD_H1_TRAINING_START source_state=jstd_v1_raw"
   --config configs/station24_jstd_event_hypothesis_h1_168h.yaml \
   --data-path "${DATA}" --output-root "${TRAIN_ROOT}" \
   --exp-name "station24_jstd_event_hypothesis_h1_${JOB_STAMP}" \
+  --secondary-adjacency "${SECONDARY_ADJACENCY}" \
   --initialize-checkpoint "${SOURCE_CHECKPOINT}"
 
 shopt -s nullglob
@@ -204,6 +208,7 @@ RESULT_FILE="${LOG_FILE%.log}.results.env"
 {
   echo "finished_at=$(date --iso-8601=seconds)"
   echo "SOURCE_RUN=${SOURCE_RUN}"
+  echo "SECONDARY_ADJACENCY=${SECONDARY_ADJACENCY}"
   echo "BASELINE_RESULT=${BASELINE_RESULT}"
   echo "PARENT_RESULT=${PARENT_RESULT}"
   echo "CANDIDATE_RUN=${CANDIDATE_RUN}"
