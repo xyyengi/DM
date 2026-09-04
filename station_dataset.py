@@ -1413,6 +1413,21 @@ class StationForecastDataset(Dataset):
                 EXPECTED_HOURS,
             ):
                 raise ValueError("JSTD station_support must be [N,24,168]")
+            if self.jstd_targets.event_hypothesis.shape != (expected_n, 6):
+                raise ValueError("JSTD event_hypothesis must be [N,6]")
+            if self.jstd_targets.hypothesis_time_support.shape != (
+                expected_n,
+                EXPECTED_HOURS,
+            ):
+                raise ValueError("JSTD hypothesis_time_support must be [N,168]")
+            if self.jstd_targets.hypothesis_station_support.shape != (
+                expected_n,
+                EXPECTED_STATIONS,
+                EXPECTED_HOURS,
+            ):
+                raise ValueError(
+                    "JSTD hypothesis_station_support must be [N,24,168]"
+                )
         self.retrieval_arrays = retrieval_arrays
         if retrieval_arrays is not None:
             expected_queries = len(self.forecast)
@@ -1506,7 +1521,10 @@ class StationForecastDataset(Dataset):
             "residual_scaling_method": str(
                 self.residual_scale.get("method", "per_station_std")
             ),
-            "future_actual_used_as_condition": False,
+            "future_actual_used_as_condition": bool(
+                self.jstd_targets is not None
+                and self.condition_config.get("use_jstd_event_hypothesis", False)
+            ),
             "event_weighting_enabled": self.event_weighting is not None,
             "event_weighting_applied": bool(
                 self.event_weighting is not None and split == "train"
@@ -1516,7 +1534,16 @@ class StationForecastDataset(Dataset):
             "event_replay_applied": bool(event_replay is not None and split == "train"),
             "event_replay_uses_target_as_condition": False,
             "jstd_targets_enabled": self.jstd_targets is not None,
-            "jstd_targets_used_as_condition": False,
+            "jstd_targets_used_as_condition": bool(
+                self.jstd_targets is not None
+                and self.condition_config.get("use_jstd_event_hypothesis", False)
+            ),
+            "jstd_hypothesis_condition_semantics": (
+                "train_target_or_validation_oracle_upper_bound"
+                if self.jstd_targets is not None
+                and self.condition_config.get("use_jstd_event_hypothesis", False)
+                else None
+            ),
             "event_replay_independent_event_count": (
                 int(event_replay["independent_event_count"])
                 if event_replay is not None and split == "train"
@@ -1700,11 +1727,25 @@ class StationForecastDataset(Dataset):
             (EXPECTED_STATIONS, EXPECTED_HOURS), dtype=np.float32
         )
         jstd_sample_weight = np.float32(1.0)
+        jstd_event_hypothesis = np.zeros(6, dtype=np.float32)
+        jstd_hypothesis_time_support = np.zeros(
+            EXPECTED_HOURS, dtype=np.float32
+        )
+        jstd_hypothesis_station_support = np.zeros(
+            (EXPECTED_STATIONS, EXPECTED_HOURS), dtype=np.float32
+        )
         if self.jstd_targets is not None:
             jstd_event_active = np.float32(self.jstd_targets.event_active[index])
             jstd_event_time_support[:] = self.jstd_targets.time_support[index]
             jstd_event_station_support[:] = self.jstd_targets.station_support[index]
             jstd_sample_weight = np.float32(self.jstd_targets.sample_weights[index])
+            jstd_event_hypothesis[:] = self.jstd_targets.event_hypothesis[index]
+            jstd_hypothesis_time_support[:] = (
+                self.jstd_targets.hypothesis_time_support[index]
+            )
+            jstd_hypothesis_station_support[:] = (
+                self.jstd_targets.hypothesis_station_support[index]
+            )
         return {
             "sample_index": torch.tensor(index, dtype=torch.long),
             "forecast": torch.from_numpy(forecast),
@@ -1749,6 +1790,15 @@ class StationForecastDataset(Dataset):
             ),
             "jstd_sample_weight": torch.tensor(
                 jstd_sample_weight, dtype=torch.float32
+            ),
+            "jstd_event_hypothesis": torch.from_numpy(
+                jstd_event_hypothesis
+            ),
+            "jstd_hypothesis_time_support": torch.from_numpy(
+                jstd_hypothesis_time_support
+            ),
+            "jstd_hypothesis_station_support": torch.from_numpy(
+                jstd_hypothesis_station_support
             ),
             "jstd_slow_target": torch.from_numpy(jstd_slow_target),
             "jstd_fast_target": torch.from_numpy(jstd_fast_target),

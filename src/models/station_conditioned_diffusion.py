@@ -2269,6 +2269,7 @@ class StationConditionalResUNet1D(nn.Module):
         retrieval_context: torch.Tensor | None = None,
         mismatch_expert_route: torch.Tensor | float | None = None,
         mismatch_time_gate: torch.Tensor | None = None,
+        jstd_event_hypothesis: torch.Tensor | None = None,
         return_jstd_audit: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, JSTDOutput]:
         if noisy_residual.shape[1:] != (self.station_count, self.sequence_length):
@@ -2502,6 +2503,7 @@ class StationConditionalResUNet1D(nn.Module):
                 recent_error_mask=recent_error_mask,
                 route=tail_expert_route,
                 condition_strength=condition_strength,
+                event_hypothesis=jstd_event_hypothesis,
             )
             output = output + jstd_output.correction
         if self.use_retrieval_mismatch_expert:
@@ -2767,11 +2769,16 @@ class StationConditionalResUNet1D(nn.Module):
     def jstd_parameter_names(self) -> tuple[str, ...]:
         if not self.use_jstd_tail:
             return ()
-        return tuple(
+        names = tuple(
             name
             for name, _ in self.named_parameters()
             if name.startswith("jstd_tail.")
         )
+        if self.jstd_tail is not None and self.jstd_tail.use_event_hypothesis:
+            names = tuple(
+                name for name in names if not name.startswith("jstd_tail.issue_head.")
+            )
+        return names
 
     def tail_time_parameter_names(self) -> tuple[str, ...]:
         if not self.use_tail_time_localizer:
@@ -2831,6 +2838,7 @@ class StationGaussianDiffusion(nn.Module):
         jstd_mask_loss_weight: float = 0.0,
         jstd_issue_loss_weight: float = 0.0,
         jstd_structure_loss_weight: float = 0.0,
+        jstd_outside_zero_loss_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.denoiser = denoiser
@@ -2868,6 +2876,9 @@ class StationGaussianDiffusion(nn.Module):
         self.jstd_mask_loss_weight = float(jstd_mask_loss_weight)
         self.jstd_issue_loss_weight = float(jstd_issue_loss_weight)
         self.jstd_structure_loss_weight = float(jstd_structure_loss_weight)
+        self.jstd_outside_zero_loss_weight = float(
+            jstd_outside_zero_loss_weight
+        )
         if self.ramp_auxiliary_loss_weight < 0:
             raise ValueError("ramp auxiliary loss weight must be non-negative")
         if self.wind_common_event_loss_weight < 0:
@@ -2883,15 +2894,25 @@ class StationGaussianDiffusion(nn.Module):
             self.jstd_mask_loss_weight,
             self.jstd_issue_loss_weight,
             self.jstd_structure_loss_weight,
+            self.jstd_outside_zero_loss_weight,
         ) < 0:
             raise ValueError("JSTD loss weights must be non-negative")
-        if self.denoiser.use_jstd_tail and min(
-            self.jstd_decomposition_loss_weight,
-            self.jstd_mask_loss_weight,
-            self.jstd_issue_loss_weight,
-            self.jstd_structure_loss_weight,
-        ) <= 0:
-            raise ValueError("enabled JSTD tail requires all four JSTD losses")
+        if self.denoiser.use_jstd_tail:
+            required_jstd = [
+                self.jstd_decomposition_loss_weight,
+                self.jstd_mask_loss_weight,
+                self.jstd_structure_loss_weight,
+            ]
+            if min(required_jstd) <= 0:
+                raise ValueError(
+                    "enabled JSTD tail requires decomposition, mask, and "
+                    "structure losses"
+                )
+            if (
+                not self.denoiser.jstd_tail.use_event_hypothesis
+                and self.jstd_issue_loss_weight <= 0
+            ):
+                raise ValueError("JSTD V1 requires the issue-gate loss")
         if not 1 <= self.event_x0_window_hours <= 24:
             raise ValueError("event x0 window must be in [1,24]")
         if self.event_x0_error_scale <= 0 or self.event_x0_timing_temperature <= 0:
@@ -2957,6 +2978,7 @@ class StationGaussianDiffusion(nn.Module):
         jstd_slow_target: torch.Tensor | None = None,
         jstd_fast_target: torch.Tensor | None = None,
         jstd_slow24_target: torch.Tensor | None = None,
+        jstd_event_hypothesis: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if timestep is None:
             timestep = torch.randint(
@@ -2982,6 +3004,7 @@ class StationGaussianDiffusion(nn.Module):
             retrieval_context=retrieval_context,
             mismatch_expert_route=mismatch_expert_route,
             mismatch_time_gate=mismatch_time_gate,
+            jstd_event_hypothesis=jstd_event_hypothesis,
             return_jstd_audit=self.denoiser.use_jstd_tail,
         )
         if self.denoiser.use_jstd_tail:
@@ -3042,6 +3065,7 @@ class StationGaussianDiffusion(nn.Module):
         jstd_mask_loss = torch.zeros_like(jstd_decomposition_loss)
         jstd_issue_loss = torch.zeros_like(jstd_decomposition_loss)
         jstd_structure_loss = torch.zeros_like(jstd_decomposition_loss)
+        jstd_outside_zero_loss = torch.zeros_like(jstd_decomposition_loss)
         if self.denoiser.use_jstd_tail:
             if jstd_output is None or self.denoiser.jstd_tail is None:
                 raise RuntimeError("JSTD outputs are unavailable")
@@ -3182,14 +3206,29 @@ class StationGaussianDiffusion(nn.Module):
                 ordinary.sum().clamp(min=1.0)
             )
             jstd_mask_loss = jstd_mask_loss + 0.10 * ordinary_zero_loss
+            if self.jstd_outside_zero_loss_weight > 0.0:
+                event_extent = (support > 0).to(clean.dtype)
+                outside = (
+                    active[:, None, None]
+                    * (1.0 - event_extent)
+                    * valid_mask
+                    * snr_weight
+                )
+                outside_x0_correction = correction_to_x0 * (
+                    jstd_output.slow_correction + jstd_output.fast_correction
+                )
+                jstd_outside_zero_loss = (
+                    outside_x0_correction.square() * outside
+                ).sum() / outside.sum().clamp(min=1.0)
 
-            importance = jstd_sample_weight.to(clean.dtype).reciprocal()
-            issue_error = F.binary_cross_entropy_with_logits(
-                jstd_output.issue_logit, active, reduction="none"
-            )
-            jstd_issue_loss = (issue_error * importance).sum() / (
-                importance.sum().clamp(min=1.0)
-            )
+            if self.jstd_issue_loss_weight > 0.0:
+                importance = jstd_sample_weight.to(clean.dtype).reciprocal()
+                issue_error = F.binary_cross_entropy_with_logits(
+                    jstd_output.issue_logit, active, reduction="none"
+                )
+                jstd_issue_loss = (issue_error * importance).sum() / (
+                    importance.sum().clamp(min=1.0)
+                )
 
             system_errors = []
             for weight in (
@@ -3383,6 +3422,7 @@ class StationGaussianDiffusion(nn.Module):
             + self.jstd_mask_loss_weight * jstd_mask_loss
             + self.jstd_issue_loss_weight * jstd_issue_loss
             + self.jstd_structure_loss_weight * jstd_structure_loss
+            + self.jstd_outside_zero_loss_weight * jstd_outside_zero_loss
         )
 
     def reverse_variance(self, timestep: torch.Tensor) -> torch.Tensor:
@@ -3415,6 +3455,7 @@ class StationGaussianDiffusion(nn.Module):
         retrieval_context: torch.Tensor | None = None,
         mismatch_expert_route: torch.Tensor | float | None = None,
         mismatch_time_gate: torch.Tensor | None = None,
+        jstd_event_hypothesis: torch.Tensor | None = None,
     ) -> torch.Tensor:
         forecast_guidance_scale = float(forecast_guidance_scale)
         if not 0.0 <= forecast_guidance_scale <= 1.0:
@@ -3429,6 +3470,7 @@ class StationGaussianDiffusion(nn.Module):
             retrieval_context=retrieval_context,
             mismatch_time_gate=mismatch_time_gate,
             event_prototype=event_prototype,
+            jstd_event_hypothesis=jstd_event_hypothesis,
         )
         predicted_conditional = self.denoiser(
             noisy,
@@ -3489,6 +3531,7 @@ class StationGaussianDiffusion(nn.Module):
         retrieval_context: torch.Tensor | None = None,
         mismatch_expert_route: torch.Tensor | None = None,
         mismatch_time_gate: torch.Tensor | None = None,
+        jstd_event_hypothesis: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, stations, length = forecast.shape
         n_samples = int(n_samples)
@@ -3504,6 +3547,7 @@ class StationGaussianDiffusion(nn.Module):
             "node_state": node_state,
             "retrieval_context": retrieval_context,
             "mismatch_time_gate": mismatch_time_gate,
+            "jstd_event_hypothesis": jstd_event_hypothesis,
         }
         optional_conditions = {
             name: (
@@ -3734,8 +3778,20 @@ class Station24DiffusionModel(nn.Module):
             self.config.get("use_body_tail_experts", False)
         )
         self.use_jstd_tail = bool(self.config.get("use_jstd_tail", False))
+        self.use_jstd_event_hypothesis = bool(
+            self.config.get("use_jstd_event_hypothesis", False)
+        )
+        self.jstd_h1_tail_fraction = float(
+            self.config.get("jstd_h1_tail_fraction", 0.10)
+        )
         if self.use_jstd_tail and not self.use_body_tail_experts:
             raise ValueError("JSTD tail requires use_body_tail_experts=true")
+        if self.use_jstd_event_hypothesis and not self.use_jstd_tail:
+            raise ValueError("JSTD event hypotheses require use_jstd_tail=true")
+        if self.use_jstd_event_hypothesis and not (
+            0.0 < self.jstd_h1_tail_fraction <= 1.0
+        ):
+            raise ValueError("jstd_h1_tail_fraction must be in (0,1]")
         if self.use_jstd_tail and any(
             bool(self.config.get(name, False))
             for name in (
@@ -3914,7 +3970,11 @@ class Station24DiffusionModel(nn.Module):
         self.tail_gate_loss_weight = float(
             self.config.get("tail_gate_loss_weight", 0.0)
         )
-        if self.use_body_tail_experts and self.tail_gate_loss_weight <= 0.0:
+        if (
+            self.use_body_tail_experts
+            and not self.use_jstd_event_hypothesis
+            and self.tail_gate_loss_weight <= 0.0
+        ):
             raise ValueError(
                 "tail_gate_loss_weight must be positive for body-tail experts"
             )
@@ -4059,6 +4119,9 @@ class Station24DiffusionModel(nn.Module):
             ),
             jstd_structure_loss_weight=float(
                 self.config.get("jstd_structure_loss_weight", 0.0)
+            ),
+            jstd_outside_zero_loss_weight=float(
+                self.config.get("jstd_outside_zero_loss_weight", 0.0)
             ),
         )
         self.event_selector_loss_weight = float(
@@ -4227,6 +4290,21 @@ class Station24DiffusionModel(nn.Module):
             name
             for name in self.denoiser.state_dict()
             if name.startswith("jstd_tail.")
+        )
+        return tuple(
+            sorted(
+                f"{prefix}{suffix}"
+                for prefix in ("denoiser.", "diffusion.denoiser.")
+                for suffix in suffixes
+            )
+        )
+
+    @property
+    def jstd_hypothesis_state_dict_keys(self) -> tuple[str, ...]:
+        suffixes = tuple(
+            name
+            for name in self.denoiser.state_dict()
+            if name.startswith("jstd_tail.hypothesis_")
         )
         return tuple(
             sorted(
@@ -5072,18 +5150,28 @@ class Station24DiffusionModel(nn.Module):
         """Select wind-event support for the specialized tail denoising loss."""
 
         if self.use_jstd_tail:
-            support = batch.get("jstd_event_station_support")
+            support_key = (
+                "jstd_hypothesis_station_support"
+                if self.use_jstd_event_hypothesis
+                else "jstd_event_station_support"
+            )
+            time_key = (
+                "jstd_hypothesis_time_support"
+                if self.use_jstd_event_hypothesis
+                else "jstd_event_time_support"
+            )
+            support = batch.get(support_key)
             active = batch.get("jstd_event_active")
             if support is None or active is None:
                 raise ValueError("JSTD training requires continuous station-time support")
             if support.shape != batch["forecast"].shape:
-                raise ValueError("jstd_event_station_support must be [B,S,L]")
+                raise ValueError(f"{support_key} must be [B,S,L]")
             # Retain a small system-level support wherever an aggregate event is
             # active, so joint wind/solar modes receive gradients even if only a
             # subset of stations crosses its local threshold.
-            time_support = batch.get("jstd_event_time_support")
+            time_support = batch.get(time_key)
             if time_support is None or time_support.shape != support.shape[:1] + support.shape[2:]:
-                raise ValueError("jstd_event_time_support must be [B,L]")
+                raise ValueError(f"{time_key} must be [B,L]")
             result = torch.maximum(
                 support.to(batch["forecast"].dtype),
                 0.25 * time_support.to(batch["forecast"].dtype)[:, None, :],
@@ -5284,12 +5372,21 @@ class Station24DiffusionModel(nn.Module):
             mismatch_time_gate=mismatch_time_gate,
             epsilon_sample_weight=epsilon_sample_weight,
             jstd_event_active=batch.get("jstd_event_active"),
-            jstd_event_time_support=batch.get("jstd_event_time_support"),
-            jstd_event_station_support=batch.get("jstd_event_station_support"),
+            jstd_event_time_support=batch.get(
+                "jstd_hypothesis_time_support"
+                if self.use_jstd_event_hypothesis
+                else "jstd_event_time_support"
+            ),
+            jstd_event_station_support=batch.get(
+                "jstd_hypothesis_station_support"
+                if self.use_jstd_event_hypothesis
+                else "jstd_event_station_support"
+            ),
             jstd_sample_weight=batch.get("jstd_sample_weight"),
             jstd_slow_target=batch.get("jstd_slow_target"),
             jstd_fast_target=batch.get("jstd_fast_target"),
             jstd_slow24_target=batch.get("jstd_slow24_target"),
+            jstd_event_hypothesis=batch.get("jstd_event_hypothesis"),
         )
         if self.use_discrete_event_memory and include_auxiliary:
             diffusion_loss = diffusion_loss + (
@@ -5440,13 +5537,32 @@ class Station24DiffusionModel(nn.Module):
         event_memory_duration = None
         event_memory_train_index = None
         if self.use_body_tail_experts:
-            tail_probability = self.tail_risk_probability(batch)
-            tail_attention = self.tail_condition_attention(batch)
+            if self.use_jstd_event_hypothesis:
+                hypothesis = batch.get("jstd_event_hypothesis")
+                if hypothesis is None or hypothesis.shape != (
+                    batch["forecast"].shape[0],
+                    6,
+                ):
+                    raise ValueError(
+                        "H1 generation requires jstd_event_hypothesis [B,6]"
+                    )
+                tail_probability = (
+                    hypothesis[:, 0].to(batch["forecast"].dtype)
+                    * self.jstd_h1_tail_fraction
+                )
+                # Reuse the six-column audit channel to preserve the exact
+                # continuous hypothesis consumed by generation.
+                tail_attention = hypothesis.to(batch["forecast"].dtype)
+            else:
+                hypothesis = None
+                tail_probability = self.tail_risk_probability(batch)
+                tail_attention = self.tail_condition_attention(batch)
             if tail_route_probability_override is not None:
                 if (
                     self.use_discrete_event_memory
                     or self.use_retrieval_mismatch_expert
                     or self.use_tail_time_localizer
+                    or self.use_jstd_event_hypothesis
                 ):
                     raise ValueError(
                         "tail route probability override is restricted to the "
@@ -5518,9 +5634,42 @@ class Station24DiffusionModel(nn.Module):
                 mismatch_time_probability = self.mismatch_time_probability(
                     batch, retrieval_context
                 )
+            elif self.use_jstd_event_hypothesis:
+                tail_count = max(
+                    1,
+                    int(round(int(n_samples) * self.jstd_h1_tail_fraction)),
+                )
+                member_order = torch.randperm(
+                    int(n_samples), device=batch["forecast"].device
+                )
+                quota = torch.zeros(
+                    int(n_samples),
+                    device=batch["forecast"].device,
+                    dtype=batch["forecast"].dtype,
+                )
+                quota[member_order[:tail_count]] = 1.0
+                tail_route = hypothesis[:, 0, None].to(quota.dtype) * quota[None, :]
             else:
                 tail_route = torch.bernoulli(
                     route_probability[:, None].expand(-1, int(n_samples))
+                )
+            if self.use_jstd_event_hypothesis:
+                if self.denoiser.jstd_tail is None or hypothesis is None:
+                    raise RuntimeError("H1 JSTD tail is unavailable")
+                _, hypothesis_envelope, hypothesis_bounds = (
+                    self.denoiser.jstd_tail.event_hypothesis_fields(
+                        hypothesis, batch["forecast"].dtype
+                    )
+                )
+                tail_time_probability = hypothesis_envelope / (
+                    hypothesis_envelope.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                )
+                onset = hypothesis_bounds[:, 0].round().long()
+                tail_time_start = onset[:, None].expand(-1, int(n_samples)).clone()
+                tail_time_start = torch.where(
+                    tail_route.bool(),
+                    tail_time_start,
+                    torch.full_like(tail_time_start, -1),
                 )
             if self.use_tail_time_localizer and not self.use_discrete_event_memory:
                 tail_time_probability = self.tail_time_probability(batch)
@@ -5547,6 +5696,11 @@ class Station24DiffusionModel(nn.Module):
             retrieval_context=retrieval_context,
             mismatch_expert_route=mismatch_route,
             mismatch_time_gate=mismatch_time_probability,
+            jstd_event_hypothesis=(
+                batch.get("jstd_event_hypothesis")
+                if self.use_jstd_event_hypothesis
+                else None
+            ),
         )
         if (
             self.event_prototype_anchor_strength > 0.0

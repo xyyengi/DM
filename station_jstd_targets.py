@@ -26,6 +26,9 @@ class JSTDTargetArrays:
     event_active: np.ndarray
     time_support: np.ndarray
     station_support: np.ndarray
+    event_hypothesis: np.ndarray
+    hypothesis_time_support: np.ndarray
+    hypothesis_station_support: np.ndarray
     sample_weights: np.ndarray
     catalog: tuple[dict[str, object], ...]
     audit: dict[str, object]
@@ -195,7 +198,17 @@ def build_station_jstd_target_arrays(
     station_support = np.zeros(
         (sample_count, EXPECTED_STATIONS, EXPECTED_HOURS), dtype=np.float32
     )
+    event_hypothesis = np.zeros((sample_count, 6), dtype=np.float32)
+    hypothesis_time_support = np.zeros(
+        (sample_count, EXPECTED_HOURS), dtype=np.float32
+    )
+    hypothesis_station_support = np.zeros(
+        (sample_count, EXPECTED_STATIONS, EXPECTED_HOURS), dtype=np.float32
+    )
     catalog: list[dict[str, object]] = []
+    candidates: list[list[dict[str, object]]] = [
+        [] for _ in range(sample_count)
+    ]
     bridge = int(fitted["bridge_hours"])
     keep_fraction = float(fitted["keep_fraction"])
     station_threshold = np.asarray(fitted["station_thresholds"], dtype=np.float64)
@@ -249,6 +262,70 @@ def build_station_jstd_target_arrays(
                             "integrated_absolute_residual": float(np.sum(np.abs(segment))),
                         }
                     )
+                    candidates[sample].append(catalog[-1])
+
+    # H1 is an explicit controllability upper bound.  Each issuance receives
+    # one compact event hypothesis rather than the full future residual.  For
+    # issues containing several events, use the strongest normalized physical
+    # event so the hypothesis and localized supervision describe one coherent
+    # onset/duration pair.
+    type_aggregate: dict[str, np.ndarray] = {}
+    for type_name in ("wind", "solar"):
+        indices = stations.index[stations.data_type.eq(type_name)].to_numpy(dtype=int)
+        weights = capacity[indices] / capacity[indices].sum()
+        type_aggregate[type_name] = np.einsum(
+            "nts,s->nt", residual[:, :, indices], weights
+        )
+    selected_catalog: list[dict[str, object]] = []
+    for sample, sample_candidates in enumerate(candidates):
+        if not sample_candidates:
+            continue
+        def event_score(item: Mapping[str, object]) -> float:
+            threshold = float(
+                fitted["type_thresholds"][str(item["source"])][str(item["direction"])]
+            )
+            duration = max(int(item["actual_duration_hours"]), 1)
+            return float(item["depth"]) / max(threshold, 1e-8) * np.sqrt(duration)
+
+        chosen = max(sample_candidates, key=event_score)
+        selected_catalog.append(dict(chosen))
+        start = int(chosen["lead_onset"])
+        stop = int(chosen["lead_stop_exclusive"])
+        duration = stop - start
+        hypothesis_time_support[sample, start:stop] = time_support[sample, start:stop]
+        hypothesis_station_support[sample, :, start:stop] = station_support[
+            sample, :, start:stop
+        ]
+        signed_amplitudes: dict[str, float] = {}
+        for type_name in ("wind", "solar"):
+            segment = type_aggregate[type_name][sample, start:stop]
+            extreme = float(segment[np.argmax(np.abs(segment))])
+            direction = "positive" if extreme >= 0.0 else "negative"
+            threshold = float(fitted["type_thresholds"][type_name][direction])
+            signed_amplitudes[type_name] = float(
+                np.clip(extreme / max(threshold, 1e-8), -4.0, 4.0) / 4.0
+            )
+        source = str(chosen["source"])
+        source_indices = stations.index[
+            stations.data_type.eq(source)
+        ].to_numpy(dtype=int)
+        source_weights = capacity[source_indices]
+        source_weights = source_weights / source_weights.sum()
+        source_support = hypothesis_station_support[
+            sample, source_indices, start:stop
+        ].max(axis=1)
+        synchrony = float(np.sum(source_weights * source_support))
+        event_hypothesis[sample] = np.asarray(
+            [
+                1.0,
+                start / float(EXPECTED_HOURS - 1),
+                duration / float(EXPECTED_HOURS),
+                signed_amplitudes["wind"],
+                signed_amplitudes["solar"],
+                np.clip(synchrony, 0.0, 1.0),
+            ],
+            dtype=np.float32,
+        )
 
     event_active = (time_support.max(axis=1) > 0).astype(np.float32)
     # Moderate replay only changes how often event-bearing issuance windows are
@@ -275,12 +352,26 @@ def build_station_jstd_target_arrays(
         "contains_sub_6h_events": bool(np.any(durations < 6)) if durations.size else False,
         "fixed_duration_event_classes": False,
         "future_actual_used_as_condition": False,
+        "h1_event_hypothesis_dimension": 6,
+        "h1_event_hypothesis_fields": [
+            "active",
+            "onset_fraction",
+            "duration_fraction",
+            "signed_wind_depth",
+            "signed_solar_depth",
+            "source_synchrony",
+        ],
+        "h1_selected_event_count": int(len(selected_catalog)),
+        "h1_hypothesis_source": "split_actual_residual_for_upper_bound_only",
     }
     return JSTDTargetArrays(
         split=split,
         event_active=event_active,
         time_support=time_support,
         station_support=station_support,
+        event_hypothesis=event_hypothesis,
+        hypothesis_time_support=hypothesis_time_support,
+        hypothesis_station_support=hypothesis_station_support,
         sample_weights=sample_weights.astype(np.float64),
         catalog=tuple(catalog),
         audit=audit,

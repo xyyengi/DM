@@ -363,7 +363,9 @@ def validate(
             total_loss += float(loss) * validation_weight
             total_weight += validation_weight
             target = active
-            if model.use_retrieval_mismatch_expert:
+            if model.use_jstd_event_hypothesis:
+                logits = None
+            elif model.use_retrieval_mismatch_expert:
                 context, _ = model.encode_retrieval_memory(batch)
                 logits = model.mismatch_risk_logits(batch, context)
                 time_logits = model.mismatch_time_logits(batch, context)
@@ -373,12 +375,13 @@ def validate(
                 mismatch_time_error_sum += float(time_error.sum())
             else:
                 logits = model.tail_risk_logits(batch)
-            gate_error_sum += float(
-                F.binary_cross_entropy_with_logits(
-                    logits, target, reduction="sum"
+            if logits is not None:
+                gate_error_sum += float(
+                    F.binary_cross_entropy_with_logits(
+                        logits, target, reduction="sum"
+                    )
                 )
-            )
-            gate_samples += batch_size
+                gate_samples += batch_size
             tail_event_count += int(active.sum())
             if model.train_sampler_energy_score_only:
                 score_parts = model.sampler_energy_score_loss(
@@ -439,11 +442,17 @@ def validate(
         if total_weight <= 0.0 or tail_event_count <= 0:
             raise ValueError("validation split contains no continuous JSTD event")
         objective = total_loss / total_weight
-        return objective, {
+        metrics = {
             "val_jstd_objective": objective,
-            "val_jstd_issue_bce": gate_error_sum / max(gate_samples, 1),
             "val_jstd_event_issue_count": float(tail_event_count),
         }
+        if model.use_jstd_event_hypothesis:
+            metrics["val_jstd_oracle_event_fraction"] = float(
+                tail_event_count / max(len(loader.dataset), 1)
+            )
+        else:
+            metrics["val_jstd_issue_bce"] = gate_error_sum / max(gate_samples, 1)
+        return objective, metrics
     if model.use_body_tail_experts:
         if total_weight <= 0.0 or tail_event_count <= 0:
             raise ValueError("validation split contains no train-threshold tail event")
@@ -576,6 +585,8 @@ def save_checkpoint(
         "wind_common_gate_value": model.wind_common_gate_value,
         "use_body_tail_experts": bool(model.use_body_tail_experts),
         "use_jstd_tail": bool(model.use_jstd_tail),
+        "use_jstd_event_hypothesis": bool(model.use_jstd_event_hypothesis),
+        "jstd_h1_tail_fraction": float(model.jstd_h1_tail_fraction),
         "jstd_trainable_parameter_names": list(
             model.jstd_trainable_parameter_names
         ),
@@ -809,6 +820,26 @@ def main() -> None:
             json.dumps(
                 {
                     "thresholds": jstd_thresholds,
+                    "event_hypothesis_mode": bool(
+                        config["model"].get("use_jstd_event_hypothesis", False)
+                    ),
+                    "training_actual_residual_used_to_construct_hypothesis": bool(
+                        config["model"].get("use_jstd_event_hypothesis", False)
+                    ),
+                    "validation_actual_residual_role": (
+                        "oracle_controllability_upper_bound_and_model_selection_only"
+                        if config["model"].get(
+                            "use_jstd_event_hypothesis", False
+                        )
+                        else "offline_labels_and_model_selection_only"
+                    ),
+                    "event_hypothesis_deployable_causal_condition": (
+                        False
+                        if config["model"].get(
+                            "use_jstd_event_hypothesis", False
+                        )
+                        else None
+                    ),
                     "train_audit": train_jstd_targets.audit,
                     "val_audit": val_jstd_targets.audit,
                     "train_catalog": list(train_jstd_targets.catalog),
@@ -1034,13 +1065,24 @@ def main() -> None:
             initialization_path, map_location="cpu", weights_only=False
         )
         if model.use_jstd_tail:
-            if initialization.get("condition_variant") != (
-                "geo_history_actual_body_tail_moe"
-            ):
-                raise ValueError("JSTD V1 must initialize from the Raw body-tail checkpoint")
+            expected_source_variant = (
+                "geo_history_actual_jstd_tail_v1"
+                if model.use_jstd_event_hypothesis
+                else "geo_history_actual_body_tail_moe"
+            )
+            if initialization.get("condition_variant") != expected_source_variant:
+                raise ValueError(
+                    "JSTD initialization variant mismatch: expected "
+                    f"{expected_source_variant!r}, got "
+                    f"{initialization.get('condition_variant')!r}"
+                )
             source_state = initialization["model_state_dict"]
             incompatible = model.load_state_dict(source_state, strict=False)
-            expected_missing = set(model.jstd_new_state_dict_keys)
+            expected_missing = set(
+                model.jstd_hypothesis_state_dict_keys
+                if model.use_jstd_event_hypothesis
+                else model.jstd_new_state_dict_keys
+            )
             if set(incompatible.missing_keys) != expected_missing:
                 raise ValueError(
                     "unexpected JSTD initialization gaps: "
@@ -1052,7 +1094,11 @@ def main() -> None:
                 )
             trainable_names = model.configure_jstd_training()
             initialization_manifest = {
-                "method": "frozen_raw_body_replacement_joint_spatiotemporal_decomposed_tail_v1",
+                "method": (
+                    "jstd_v1_to_continuous_event_hypothesis_h1_finetune"
+                    if model.use_jstd_event_hypothesis
+                    else "frozen_raw_body_replacement_joint_spatiotemporal_decomposed_tail_v1"
+                ),
                 "checkpoint": str(initialization_path),
                 "checkpoint_state_source": "raw",
                 "source_condition_variant": str(initialization["condition_variant"]),
@@ -1061,6 +1107,10 @@ def main() -> None:
                 "legacy_tail_bypassed": True,
                 "third_expert_used": False,
                 "forecast_revision_added": False,
+                "event_hypothesis_conditioned": bool(
+                    model.use_jstd_event_hypothesis
+                ),
+                "issue_gate_trainable": not model.use_jstd_event_hypothesis,
                 "trainable_parameter_names": list(trainable_names),
             }
         elif model.train_sampler_energy_score_only:
@@ -1795,6 +1845,8 @@ def main() -> None:
         "state_gate_values": model.state_gate_values,
         "use_body_tail_experts": bool(model.use_body_tail_experts),
         "use_jstd_tail": bool(model.use_jstd_tail),
+        "use_jstd_event_hypothesis": bool(model.use_jstd_event_hypothesis),
+        "jstd_h1_tail_fraction": float(model.jstd_h1_tail_fraction),
         "jstd_trainable_parameter_names": list(
             model.jstd_trainable_parameter_names
         ),

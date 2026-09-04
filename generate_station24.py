@@ -24,6 +24,7 @@ from station_evaluation import evaluate_station_scenarios, save_evaluation
 from station_retrieval_memory import build_retrieval_arrays
 from station_discrete_event_memory import build_discrete_event_arrays
 from station_forecast_trust import build_forecast_trust_arrays
+from station_jstd_targets import build_station_jstd_target_arrays
 
 
 def parse_args() -> argparse.Namespace:
@@ -92,6 +93,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Inference-only Bernoulli routing override for the two-way Raw "
             "body-tail generator. It does not modify checkpoint parameters."
+        ),
+    )
+    parser.add_argument(
+        "--allow-oracle-event-hypothesis",
+        action="store_true",
+        help=(
+            "Required safety acknowledgement for the H1 validation-only "
+            "controllability upper bound. This mode derives compact event "
+            "attributes from validation actual residuals and is not causal."
         ),
     )
     parser.add_argument("--allow-test", action="store_true")
@@ -361,6 +371,12 @@ def main() -> None:
         model.use_body_tail_experts
     ):
         raise ValueError("checkpoint body-tail expert mode does not match config")
+    if bool(checkpoint.get("use_jstd_event_hypothesis", False)) != bool(
+        model.use_jstd_event_hypothesis
+    ):
+        raise ValueError(
+            "checkpoint JSTD event-hypothesis mode does not match config"
+        )
     if bool(checkpoint.get("use_tail_time_localizer", False)) != bool(
         model.use_tail_time_localizer
     ):
@@ -432,6 +448,28 @@ def main() -> None:
                 config["model"].get("forecast_trust_retrieval_temperature", 0.75)
             ),
         )
+    jstd_targets = None
+    if model.use_jstd_event_hypothesis:
+        if not args.allow_oracle_event_hypothesis:
+            raise ValueError(
+                "H1 generation is an oracle controllability audit; pass "
+                "--allow-oracle-event-hypothesis explicitly"
+            )
+        if args.split != "val":
+            raise ValueError(
+                "oracle event hypotheses are restricted to validation; test remains locked"
+            )
+        target_manifest_path = run_dir / "jstd_event_targets.json"
+        if not target_manifest_path.is_file():
+            raise FileNotFoundError(
+                f"missing H1 event-target manifest: {target_manifest_path}"
+            )
+        target_manifest = json.loads(
+            target_manifest_path.read_text(encoding="utf-8")
+        )
+        jstd_targets = build_station_jstd_target_arrays(
+            data_path, args.split, target_manifest["thresholds"]
+        )
     loader, dataset = get_station_dataloader(
         data_path,
         args.split,
@@ -443,6 +481,7 @@ def main() -> None:
         state_thresholds=checkpoint.get("state_thresholds"),
         event_weighting=checkpoint.get("event_weighting"),
         event_replay=checkpoint.get("event_replay"),
+        jstd_targets=jstd_targets,
         retrieval_arrays=retrieval_arrays,
         forecast_trust_arrays=forecast_trust_arrays,
     )
@@ -489,6 +528,7 @@ def main() -> None:
     event_memory_durations = []
     event_memory_train_indices = []
     event_memory_probabilities = []
+    jstd_event_hypotheses = []
     model.reset_parallel_spatial_gate_statistics()
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -608,6 +648,10 @@ def main() -> None:
         projected_actual_scenarios.append(projected.transpose(0, 1, 3, 2))
         actual_values.append(actual.transpose(0, 2, 1))
         forecast_values.append(forecast.transpose(0, 2, 1))
+        if model.use_jstd_event_hypothesis:
+            jstd_event_hypotheses.append(
+                raw_batch["jstd_event_hypothesis"].numpy()
+            )
         if model.use_body_tail_experts:
             if issue_tail_probability is None or issue_tail_attention is None:
                 raise RuntimeError("body-tail generation lacks routing probability")
@@ -797,6 +841,11 @@ def main() -> None:
         tail_time_probability_array,
     )
     np.save(output_dir / "tail_event_start.npy", tail_time_start_array)
+    if jstd_event_hypotheses:
+        np.save(
+            output_dir / "jstd_event_hypothesis.npy",
+            np.concatenate(jstd_event_hypotheses, axis=0),
+        )
     np.save(output_dir / "mismatch_expert_probability.npy", mismatch_probability_array)
     np.save(output_dir / "mismatch_expert_route.npy", mismatch_route_array)
     np.save(
@@ -867,6 +916,9 @@ def main() -> None:
         "checkpoint_validation_mse": float(checkpoint["val_loss"]),
         "checkpoint_validation_objective": float(checkpoint["val_loss"]),
         "checkpoint_validation_objective_type": (
+            "h1_oracle_event_hypothesis_jstd_controllability"
+            if model.use_jstd_event_hypothesis
+            else
             "jstd_tail_epsilon_plus_decomposition_mask_issue_and_structure"
             if model.use_jstd_tail
             else "dynamic_center_residual_diffusion_plus_unified_event_objectives"
@@ -957,6 +1009,17 @@ def main() -> None:
         "wind_common_gate_value": model.wind_common_gate_value,
         "use_body_tail_experts": bool(model.use_body_tail_experts),
         "use_jstd_tail": bool(model.use_jstd_tail),
+        "use_jstd_event_hypothesis": bool(model.use_jstd_event_hypothesis),
+        "jstd_h1_tail_fraction": float(model.jstd_h1_tail_fraction),
+        "oracle_event_hypothesis_acknowledged": bool(
+            args.allow_oracle_event_hypothesis
+        ),
+        "future_actual_used_as_generation_condition": bool(
+            model.use_jstd_event_hypothesis
+        ),
+        "reportable_as_causal_forecast": not bool(
+            model.use_jstd_event_hypothesis
+        ),
         "use_tail_time_localizer": bool(model.use_tail_time_localizer),
         "use_retrieval_mismatch_expert": bool(
             model.use_retrieval_mismatch_expert
@@ -1022,6 +1085,9 @@ def main() -> None:
             else None
         ),
         "tail_time_probability_semantics": (
+            "oracle_event_hypothesis_smooth_onset_duration_envelope"
+            if model.use_jstd_event_hypothesis
+            else
             "legacy_placeholder_not_applicable_jstd_uses_internal_station_time_masks"
             if model.use_jstd_tail
             else "standalone_tail_time_localizer_probability"
@@ -1030,22 +1096,38 @@ def main() -> None:
         ),
         "jstd_internal_masks_saved_in_generation_result": False,
         "jstd_internal_mask_audit_tool": (
-            "tools/audit_station24_jstd_mechanism.py"
+            None
+            if model.use_jstd_event_hypothesis
+            else "tools/audit_station24_jstd_mechanism.py"
             if model.use_jstd_tail
             else None
         ),
-        "tail_condition_attention_names": [
-            "issued_wind_level",
-            "issued_wind_down_ramp_3h",
-            "aligned_forecast_revision",
-            "forecast_low_output_state",
-            "forecast_down_ramp_state",
-            "recent_observed_forecast_error",
-        ],
+        "tail_condition_attention_names": (
+            [
+                "event_active",
+                "event_onset_fraction",
+                "event_duration_fraction",
+                "signed_wind_depth",
+                "signed_solar_depth",
+                "source_synchrony",
+            ]
+            if model.use_jstd_event_hypothesis
+            else [
+                "issued_wind_level",
+                "issued_wind_down_ramp_3h",
+                "aligned_forecast_revision",
+                "forecast_low_output_state",
+                "forecast_down_ramp_state",
+                "recent_observed_forecast_error",
+            ]
+        ),
         "tail_condition_attention_mean": [
             float(value) for value in tail_attention_array.mean(axis=0)
         ],
         "tail_routing_method": (
+            "validation_oracle_continuous_event_hypothesis_fixed_tail_fraction"
+            if model.use_jstd_event_hypothesis
+            else
             "jstd_issue_probability_plus_member_bernoulli_with_internal_station_time_masks"
             if model.use_jstd_tail
             else "two_expert_body_plus_transformer_localized_discrete_event_transport"

@@ -111,12 +111,22 @@ class JointSpatioTemporalDecomposedTail(nn.Module):
         groups = int(config.get("group_norm_groups", 8))
         self.mask_prior = float(config.get("jstd_mask_prior", 0.12))
         self.secondary_mix = float(config.get("jstd_secondary_graph_mix", 0.20))
+        self.use_event_hypothesis = bool(
+            config.get("use_jstd_event_hypothesis", False)
+        )
+        self.hypothesis_edge_temperature = float(
+            config.get("jstd_hypothesis_edge_temperature_hours", 1.5)
+        )
         if channels <= 0 or modes <= 0:
             raise ValueError("JSTD channels and system modes must be positive")
         if not 0.0 < self.mask_prior < 0.5:
             raise ValueError("jstd_mask_prior must be in (0,0.5)")
         if not 0.0 <= self.secondary_mix <= 1.0:
             raise ValueError("jstd_secondary_graph_mix must be in [0,1]")
+        if self.hypothesis_edge_temperature <= 0.0:
+            raise ValueError(
+                "jstd_hypothesis_edge_temperature_hours must be positive"
+            )
 
         primary = _normalize_adjacency(adjacency)
         if secondary_adjacency is None:
@@ -159,6 +169,15 @@ class JointSpatioTemporalDecomposedTail(nn.Module):
         )
         self.fast_fusion = self._fusion(channels, groups)
         self.slow_fusion = self._fusion(channels, groups)
+        self.hypothesis_fast_encoder: nn.Module | None = None
+        self.hypothesis_slow_encoder: nn.Module | None = None
+        if self.use_event_hypothesis:
+            self.hypothesis_fast_encoder = self._hypothesis_encoder(
+                channels, groups
+            )
+            self.hypothesis_slow_encoder = self._hypothesis_encoder(
+                channels, groups
+            )
         self.fast_raw = self._zero_head(channels)
         self.slow_raw = self._zero_head(channels)
         self.fast_mask = self._mask_head(channels, self.mask_prior)
@@ -209,6 +228,20 @@ class JointSpatioTemporalDecomposedTail(nn.Module):
         nn.init.zeros_(head.weight)
         nn.init.zeros_(head.bias)
         return head
+
+    @staticmethod
+    def _hypothesis_encoder(channels: int, groups: int) -> nn.Sequential:
+        encoder = nn.Sequential(
+            nn.Conv1d(5, channels, kernel_size=5, padding=2),
+            nn.GroupNorm(_groups(channels, groups), channels),
+            nn.SiLU(),
+            nn.Conv1d(channels, channels, kernel_size=1),
+        )
+        # Loading a V1 checkpoint with the new path enabled remains an exact
+        # functional identity before H1 training starts.
+        nn.init.zeros_(encoder[-1].weight)
+        nn.init.zeros_(encoder[-1].bias)
+        return encoder
 
     @staticmethod
     def _mask_head(channels: int, prior: float) -> nn.Conv1d:
@@ -281,6 +314,64 @@ class JointSpatioTemporalDecomposedTail(nn.Module):
         )
         return fast, slow, system
 
+    def event_hypothesis_fields(
+        self,
+        hypothesis: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Expand compact event attributes into smooth station-time fields.
+
+        ``hypothesis`` is [active, onset_fraction, duration_fraction,
+        signed_wind_depth, signed_solar_depth, source_synchrony].  This is an
+        H1 controllability input, not a future-residual map.
+        """
+
+        if hypothesis.ndim != 2 or hypothesis.shape[1] != 6:
+            raise ValueError("jstd_event_hypothesis must be [B,6]")
+        value = hypothesis.to(dtype=dtype)
+        active = value[:, 0].clamp(0.0, 1.0)
+        onset = value[:, 1].clamp(0.0, 1.0) * float(self.sequence_length - 1)
+        duration = value[:, 2].clamp(
+            1.0 / float(self.sequence_length), 1.0
+        ) * float(self.sequence_length)
+        stop = (onset + duration).clamp(max=float(self.sequence_length))
+        time = torch.arange(
+            self.sequence_length, device=value.device, dtype=dtype
+        )[None, :]
+        temperature = self.hypothesis_edge_temperature
+        envelope = (
+            torch.sigmoid((time - onset[:, None]) / temperature)
+            * torch.sigmoid((stop[:, None] - time) / temperature)
+            * active[:, None]
+        )
+        onset_edge = torch.exp(
+            -0.5 * ((time - onset[:, None]) / temperature) ** 2
+        ) * active[:, None]
+        offset_edge = torch.exp(
+            -0.5 * ((time - stop[:, None]) / temperature) ** 2
+        ) * active[:, None]
+        station_type = self.station_features[:, :2].to(dtype)
+        amplitude = (
+            value[:, 3, None] * station_type[None, :, 0]
+            + value[:, 4, None] * station_type[None, :, 1]
+        )
+        signed_envelope = amplitude[:, :, None] * envelope[:, None, :]
+        synchrony = value[:, 5].clamp(0.0, 1.0)
+        common_envelope = envelope[:, None, :].expand(
+            -1, self.station_count, -1
+        )
+        fields = torch.stack(
+            [
+                common_envelope,
+                signed_envelope,
+                amplitude[:, :, None] * onset_edge[:, None, :],
+                amplitude[:, :, None] * offset_edge[:, None, :],
+                synchrony[:, None, None] * common_envelope,
+            ],
+            dim=2,
+        )
+        return fields, envelope, torch.stack([onset, stop], dim=1)
+
     def forward(
         self,
         hidden: torch.Tensor,
@@ -289,6 +380,7 @@ class JointSpatioTemporalDecomposedTail(nn.Module):
         recent_error_mask: torch.Tensor | None = None,
         route: torch.Tensor | float | None = None,
         condition_strength: torch.Tensor | None = None,
+        event_hypothesis: torch.Tensor | None = None,
     ) -> JSTDOutput:
         if hidden.ndim != 4:
             raise ValueError("hidden must be [B,S,C,L]")
@@ -316,6 +408,28 @@ class JointSpatioTemporalDecomposedTail(nn.Module):
         slow_encoded = self.slow_condition(
             slow_condition.reshape(batch * stations, 6, length)
         )
+        if self.use_event_hypothesis:
+            if event_hypothesis is None:
+                raise ValueError(
+                    "H1 JSTD tail requires jstd_event_hypothesis"
+                )
+            if (
+                self.hypothesis_fast_encoder is None
+                or self.hypothesis_slow_encoder is None
+            ):
+                raise RuntimeError("H1 hypothesis encoders were not initialized")
+            hypothesis_fields, _, _ = self.event_hypothesis_fields(
+                event_hypothesis, forecast.dtype
+            )
+            flat_hypothesis = hypothesis_fields.reshape(
+                batch * stations, 5, length
+            )
+            fast_encoded = fast_encoded + self.hypothesis_fast_encoder(
+                flat_hypothesis
+            )
+            slow_encoded = slow_encoded + self.hypothesis_slow_encoder(
+                flat_hypothesis
+            )
         fast_feature = self.fast_fusion(torch.cat([hidden_encoded, fast_encoded], dim=1))
         slow_feature = self.slow_fusion(torch.cat([hidden_encoded, slow_encoded], dim=1))
 
