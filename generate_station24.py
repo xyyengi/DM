@@ -867,7 +867,9 @@ def main() -> None:
         "checkpoint_validation_mse": float(checkpoint["val_loss"]),
         "checkpoint_validation_objective": float(checkpoint["val_loss"]),
         "checkpoint_validation_objective_type": (
-            "dynamic_center_residual_diffusion_plus_unified_event_objectives"
+            "jstd_tail_epsilon_plus_decomposition_mask_issue_and_structure"
+            if model.use_jstd_tail
+            else "dynamic_center_residual_diffusion_plus_unified_event_objectives"
             if model.use_forecast_trust_center
             else "transformer_event_transport_plus_tail_epsilon_and_gate_bce"
             if model.use_event_transport_transformer
@@ -1019,6 +1021,19 @@ def main() -> None:
             if np.any(tail_time_start_array >= 0)
             else None
         ),
+        "tail_time_probability_semantics": (
+            "legacy_placeholder_not_applicable_jstd_uses_internal_station_time_masks"
+            if model.use_jstd_tail
+            else "standalone_tail_time_localizer_probability"
+            if model.use_tail_time_localizer
+            else "not_available"
+        ),
+        "jstd_internal_masks_saved_in_generation_result": False,
+        "jstd_internal_mask_audit_tool": (
+            "tools/audit_station24_jstd_mechanism.py"
+            if model.use_jstd_tail
+            else None
+        ),
         "tail_condition_attention_names": [
             "issued_wind_level",
             "issued_wind_down_ramp_3h",
@@ -1031,7 +1046,9 @@ def main() -> None:
             float(value) for value in tail_attention_array.mean(axis=0)
         ],
         "tail_routing_method": (
-            "two_expert_body_plus_transformer_localized_discrete_event_transport"
+            "jstd_issue_probability_plus_member_bernoulli_with_internal_station_time_masks"
+            if model.use_jstd_tail
+            else "two_expert_body_plus_transformer_localized_discrete_event_transport"
             if model.use_event_transport_transformer
             else "two_expert_body_plus_member_level_discrete_event_memory_routing"
             if model.use_discrete_event_memory
