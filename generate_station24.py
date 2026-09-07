@@ -377,6 +377,12 @@ def main() -> None:
         raise ValueError(
             "checkpoint JSTD event-hypothesis mode does not match config"
         )
+    if bool(checkpoint.get("use_jstd_segment_prior", False)) != bool(
+        model.use_jstd_segment_prior
+    ):
+        raise ValueError(
+            "checkpoint JSTD segment-prior mode does not match config"
+        )
     if bool(checkpoint.get("use_tail_time_localizer", False)) != bool(
         model.use_tail_time_localizer
     ):
@@ -529,6 +535,8 @@ def main() -> None:
     event_memory_train_indices = []
     event_memory_probabilities = []
     jstd_event_hypotheses = []
+    jstd_segment_hypotheses = []
+    jstd_segment_count_probabilities = []
     model.reset_parallel_spatial_gate_statistics()
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -559,6 +567,7 @@ def main() -> None:
         event_memory_type_chunks = []
         event_memory_duration_chunks = []
         event_memory_train_index_chunks = []
+        segment_hypothesis_chunks = []
         issue_tail_probability = None
         issue_tail_attention = None
         issue_tail_time_probability = None
@@ -566,6 +575,7 @@ def main() -> None:
         issue_mismatch_time_probability = None
         issue_retrieval_attention = None
         issue_event_memory_probability = None
+        issue_jstd_segment_count_probability = None
         remaining = n_samples
         while remaining > 0:
             current = min(member_chunk_size, remaining)
@@ -606,6 +616,9 @@ def main() -> None:
                         issue_event_memory_probability = expert_audit[
                             "event_memory_probability"
                         ].cpu()
+                        issue_jstd_segment_count_probability = expert_audit[
+                            "jstd_segment_count_probability"
+                        ].cpu()
                     mismatch_route_chunks.append(
                         expert_audit["mismatch_route"].cpu()
                     )
@@ -621,6 +634,10 @@ def main() -> None:
                     event_memory_train_index_chunks.append(
                         expert_audit["event_memory_train_index"].cpu()
                     )
+                    if model.use_jstd_segment_prior:
+                        segment_hypothesis_chunks.append(
+                            expert_audit["jstd_segment_hypotheses"].cpu().numpy()
+                        )
                 else:
                     chunks.append(generated.cpu())
             remaining -= current
@@ -651,6 +668,15 @@ def main() -> None:
         if model.use_jstd_event_hypothesis:
             jstd_event_hypotheses.append(
                 raw_batch["jstd_event_hypothesis"].numpy()
+            )
+        if model.use_jstd_segment_prior:
+            if issue_jstd_segment_count_probability is None:
+                raise RuntimeError("JSTD segment-prior audit is unavailable")
+            jstd_segment_count_probabilities.append(
+                issue_jstd_segment_count_probability.numpy()
+            )
+            jstd_segment_hypotheses.append(
+                np.concatenate(segment_hypothesis_chunks, axis=1)
             )
         if model.use_body_tail_experts:
             if issue_tail_probability is None or issue_tail_attention is None:
@@ -846,6 +872,16 @@ def main() -> None:
             output_dir / "jstd_event_hypothesis.npy",
             np.concatenate(jstd_event_hypotheses, axis=0),
         )
+    if jstd_segment_hypotheses:
+        np.save(
+            output_dir / "jstd_segment_hypotheses.npy",
+            np.concatenate(jstd_segment_hypotheses, axis=0),
+        )
+    if jstd_segment_count_probabilities:
+        np.save(
+            output_dir / "jstd_segment_count_probability.npy",
+            np.concatenate(jstd_segment_count_probabilities, axis=0),
+        )
     np.save(output_dir / "mismatch_expert_probability.npy", mismatch_probability_array)
     np.save(output_dir / "mismatch_expert_route.npy", mismatch_route_array)
     np.save(
@@ -918,6 +954,9 @@ def main() -> None:
         "checkpoint_validation_objective_type": (
             "h1_oracle_event_hypothesis_jstd_controllability"
             if model.use_jstd_event_hypothesis
+            else
+            "causal_multiscale_segment_prior_plus_jstd_slow_fast_objectives"
+            if model.use_jstd_segment_prior
             else
             "jstd_tail_epsilon_plus_decomposition_mask_issue_and_structure"
             if model.use_jstd_tail
@@ -1010,6 +1049,16 @@ def main() -> None:
         "use_body_tail_experts": bool(model.use_body_tail_experts),
         "use_jstd_tail": bool(model.use_jstd_tail),
         "use_jstd_event_hypothesis": bool(model.use_jstd_event_hypothesis),
+        "use_jstd_segment_prior": bool(model.use_jstd_segment_prior),
+        "jstd_segment_prior_loss_weight": float(
+            model.jstd_segment_prior_loss_weight
+        ),
+        "jstd_segment_max_events": int(
+            config["model"].get("jstd_segment_max_events", 2)
+        ),
+        "jstd_segment_tail_fraction": float(
+            config["model"].get("jstd_segment_tail_fraction", 0.10)
+        ),
         "jstd_h1_tail_fraction": float(model.jstd_h1_tail_fraction),
         "oracle_event_hypothesis_acknowledged": bool(
             args.allow_oracle_event_hypothesis
@@ -1087,6 +1136,8 @@ def main() -> None:
         "tail_time_probability_semantics": (
             "oracle_event_hypothesis_smooth_onset_duration_envelope"
             if model.use_jstd_event_hypothesis
+            else "causal_segment_prior_mixture_over_onset_and_duration"
+            if model.use_jstd_segment_prior
             else
             "legacy_placeholder_not_applicable_jstd_uses_internal_station_time_masks"
             if model.use_jstd_tail
@@ -1113,6 +1164,15 @@ def main() -> None:
             ]
             if model.use_jstd_event_hypothesis
             else [
+                "sampled_event_active",
+                "sampled_onset_fraction",
+                "sampled_duration_fraction",
+                "sampled_signed_wind_depth",
+                "sampled_signed_solar_depth",
+                "sampled_source_synchrony",
+            ]
+            if model.use_jstd_segment_prior
+            else [
                 "issued_wind_level",
                 "issued_wind_down_ramp_3h",
                 "aligned_forecast_revision",
@@ -1127,6 +1187,8 @@ def main() -> None:
         "tail_routing_method": (
             "validation_oracle_continuous_event_hypothesis_fixed_tail_fraction"
             if model.use_jstd_event_hypothesis
+            else "causal_member_level_continuous_segment_hypothesis_sampling"
+            if model.use_jstd_segment_prior
             else
             "jstd_issue_probability_plus_member_bernoulli_with_internal_station_time_masks"
             if model.use_jstd_tail

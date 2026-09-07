@@ -29,6 +29,7 @@ class JSTDTargetArrays:
     event_hypothesis: np.ndarray
     hypothesis_time_support: np.ndarray
     hypothesis_station_support: np.ndarray
+    segment_hypotheses: np.ndarray
     sample_weights: np.ndarray
     catalog: tuple[dict[str, object], ...]
     audit: dict[str, object]
@@ -91,6 +92,7 @@ def fit_station_jstd_event_thresholds(
     keep_fraction = float(config.get("jstd_event_keep_fraction", 0.50))
     station_quantile = float(config.get("jstd_station_support_quantile", 0.80))
     bridge_hours = int(config.get("jstd_event_bridge_hours", 1))
+    segment_max_events = int(config.get("jstd_segment_max_events", 2))
     if not 0.5 <= enter_quantile < 1.0:
         raise ValueError("jstd_event_enter_quantile must be in [0.5,1)")
     if not 0.0 < keep_fraction < 1.0:
@@ -99,6 +101,8 @@ def fit_station_jstd_event_thresholds(
         raise ValueError("jstd_station_support_quantile must be in [0.5,1)")
     if not 0 <= bridge_hours <= 3:
         raise ValueError("jstd_event_bridge_hours must be in [0,3]")
+    if not 1 <= segment_max_events <= 4:
+        raise ValueError("jstd_segment_max_events must be in [1,4]")
 
     residual = np.asarray(np.load(root / "train_residual.npy", mmap_mode="r"), dtype=np.float64)
     valid = np.asarray(np.load(root / "train_fill_mask.npy", mmap_mode="r")) == 0
@@ -148,6 +152,7 @@ def fit_station_jstd_event_thresholds(
         "keep_fraction": keep_fraction,
         "station_support_quantile": station_quantile,
         "bridge_hours": bridge_hours,
+        "segment_max_events": segment_max_events,
         "type_thresholds": type_thresholds,
         "station_thresholds": station_thresholds.tolist(),
     }
@@ -170,6 +175,8 @@ def validate_station_jstd_event_thresholds(
     thresholds = np.asarray(result.get("station_thresholds"), dtype=np.float64)
     if thresholds.shape != (EXPECTED_STATIONS, 2) or np.any(thresholds <= 0):
         raise ValueError("invalid JSTD station thresholds")
+    if not 1 <= int(result.get("segment_max_events", 2)) <= 4:
+        raise ValueError("invalid JSTD segment_max_events")
     return result
 
 
@@ -204,6 +211,10 @@ def build_station_jstd_target_arrays(
     )
     hypothesis_station_support = np.zeros(
         (sample_count, EXPECTED_STATIONS, EXPECTED_HOURS), dtype=np.float32
+    )
+    segment_max_events = int(fitted.get("segment_max_events", 2))
+    segment_hypotheses = np.zeros(
+        (sample_count, segment_max_events, 6), dtype=np.float32
     )
     catalog: list[dict[str, object]] = []
     candidates: list[list[dict[str, object]]] = [
@@ -277,6 +288,7 @@ def build_station_jstd_target_arrays(
             "nts,s->nt", residual[:, :, indices], weights
         )
     selected_catalog: list[dict[str, object]] = []
+    segment_catalog: list[dict[str, object]] = []
     for sample, sample_candidates in enumerate(candidates):
         if not sample_candidates:
             continue
@@ -327,6 +339,91 @@ def build_station_jstd_target_arrays(
             dtype=np.float32,
         )
 
+        # Construct a small set of non-overlapping *continuous* event segments.
+        # Wind and solar candidates whose physical supports overlap are merged
+        # into one joint event; duration remains the exact hourly support and is
+        # never quantized into 6/12/24 h classes.  The fixed number below is only
+        # a maximum number of simultaneous hypotheses carried by one issuance.
+        ordered = sorted(
+            sample_candidates,
+            key=lambda item: (int(item["lead_onset"]), int(item["lead_stop_exclusive"])),
+        )
+        merged: list[dict[str, object]] = []
+        for item in ordered:
+            start = int(item["lead_onset"])
+            stop = int(item["lead_stop_exclusive"])
+            # Each source event has already had short internal gaps bridged by
+            # `_bridge_short_gaps`.  At the joint-catalogue level only merge
+            # genuinely overlapping wind/solar events.  Bridging again here
+            # can collapse two adjacent events with opposite directions into
+            # one contradictory segment target.
+            if merged and start <= int(merged[-1]["stop"]):
+                merged[-1]["stop"] = max(int(merged[-1]["stop"]), stop)
+                merged[-1]["members"].append(item)
+            else:
+                merged.append({"start": start, "stop": stop, "members": [item]})
+
+        for group in merged:
+            start = int(group["start"])
+            stop = int(group["stop"])
+            duration = max(stop - start, 1)
+            group["score"] = max(event_score(item) for item in group["members"])
+            group["duration"] = duration
+        selected_groups = sorted(
+            sorted(merged, key=lambda item: float(item["score"]), reverse=True)[
+                :segment_max_events
+            ],
+            key=lambda item: int(item["start"]),
+        )
+        for slot, group in enumerate(selected_groups):
+            start = int(group["start"])
+            stop = int(group["stop"])
+            duration = max(stop - start, 1)
+            signed_amplitudes = {}
+            synchrony_values = []
+            for type_name in ("wind", "solar"):
+                segment = type_aggregate[type_name][sample, start:stop]
+                extreme = float(segment[np.argmax(np.abs(segment))])
+                direction = "positive" if extreme >= 0.0 else "negative"
+                threshold = float(fitted["type_thresholds"][type_name][direction])
+                signed_amplitudes[type_name] = float(
+                    np.clip(extreme / max(threshold, 1e-8), -4.0, 4.0) / 4.0
+                )
+                type_indices = stations.index[
+                    stations.data_type.eq(type_name)
+                ].to_numpy(dtype=int)
+                type_weights = capacity[type_indices]
+                type_weights = type_weights / type_weights.sum()
+                local_support = station_support[
+                    sample, type_indices, start:stop
+                ].max(axis=1)
+                synchrony_values.append(float(np.sum(type_weights * local_support)))
+            synchrony = float(np.clip(max(synchrony_values), 0.0, 1.0))
+            segment_hypotheses[sample, slot] = np.asarray(
+                [
+                    1.0,
+                    start / float(EXPECTED_HOURS - 1),
+                    duration / float(EXPECTED_HOURS),
+                    signed_amplitudes["wind"],
+                    signed_amplitudes["solar"],
+                    synchrony,
+                ],
+                dtype=np.float32,
+            )
+            segment_catalog.append(
+                {
+                    "sample_index": int(sample),
+                    "slot": int(slot),
+                    "lead_onset": start,
+                    "lead_stop_exclusive": stop,
+                    "actual_duration_hours": duration,
+                    "signed_wind_depth": signed_amplitudes["wind"],
+                    "signed_solar_depth": signed_amplitudes["solar"],
+                    "source_synchrony": synchrony,
+                    "merged_candidate_count": int(len(group["members"])),
+                }
+            )
+
     event_active = (time_support.max(axis=1) > 0).astype(np.float32)
     # Moderate replay only changes how often event-bearing issuance windows are
     # drawn. The per-sample inverse weight still calibrates issue-level gates.
@@ -363,6 +460,18 @@ def build_station_jstd_target_arrays(
         ],
         "h1_selected_event_count": int(len(selected_catalog)),
         "h1_hypothesis_source": "split_actual_residual_for_upper_bound_only",
+        "segment_max_events": segment_max_events,
+        "segment_target_count": int(len(segment_catalog)),
+        "segment_event_count_distribution": {
+            str(count): int(
+                np.sum(segment_hypotheses[:, :, 0].sum(axis=1) == count)
+            )
+            for count in range(segment_max_events + 1)
+        },
+        "segment_target_semantics": (
+            "train_supervision_only_joint_overlapping_continuous_events"
+        ),
+        "segment_catalog": segment_catalog,
     }
     return JSTDTargetArrays(
         split=split,
@@ -372,6 +481,7 @@ def build_station_jstd_target_arrays(
         event_hypothesis=event_hypothesis,
         hypothesis_time_support=hypothesis_time_support,
         hypothesis_station_support=hypothesis_station_support,
+        segment_hypotheses=segment_hypotheses,
         sample_weights=sample_weights.astype(np.float64),
         catalog=tuple(catalog),
         audit=audit,

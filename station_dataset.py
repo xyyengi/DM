@@ -1428,6 +1428,17 @@ class StationForecastDataset(Dataset):
                 raise ValueError(
                     "JSTD hypothesis_station_support must be [N,24,168]"
                 )
+            segment_max_events = int(
+                self.condition_config.get("jstd_segment_max_events", 2)
+            )
+            if self.jstd_targets.segment_hypotheses.shape != (
+                expected_n,
+                segment_max_events,
+                6,
+            ):
+                raise ValueError(
+                    "JSTD segment_hypotheses must be [N,E,6]"
+                )
         self.retrieval_arrays = retrieval_arrays
         if retrieval_arrays is not None:
             expected_queries = len(self.forecast)
@@ -1734,6 +1745,13 @@ class StationForecastDataset(Dataset):
         jstd_hypothesis_station_support = np.zeros(
             (EXPECTED_STATIONS, EXPECTED_HOURS), dtype=np.float32
         )
+        jstd_segment_hypotheses = np.zeros(
+            (
+                int(self.condition_config.get("jstd_segment_max_events", 2)),
+                6,
+            ),
+            dtype=np.float32,
+        )
         if self.jstd_targets is not None:
             jstd_event_active = np.float32(self.jstd_targets.event_active[index])
             jstd_event_time_support[:] = self.jstd_targets.time_support[index]
@@ -1745,6 +1763,9 @@ class StationForecastDataset(Dataset):
             )
             jstd_hypothesis_station_support[:] = (
                 self.jstd_targets.hypothesis_station_support[index]
+            )
+            jstd_segment_hypotheses[:] = (
+                self.jstd_targets.segment_hypotheses[index]
             )
         return {
             "sample_index": torch.tensor(index, dtype=torch.long),
@@ -1799,6 +1820,9 @@ class StationForecastDataset(Dataset):
             ),
             "jstd_hypothesis_station_support": torch.from_numpy(
                 jstd_hypothesis_station_support
+            ),
+            "jstd_segment_hypotheses": torch.from_numpy(
+                jstd_segment_hypotheses
             ),
             "jstd_slow_target": torch.from_numpy(jstd_slow_target),
             "jstd_fast_target": torch.from_numpy(jstd_fast_target),

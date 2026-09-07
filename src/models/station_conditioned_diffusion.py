@@ -2774,7 +2774,10 @@ class StationConditionalResUNet1D(nn.Module):
             for name, _ in self.named_parameters()
             if name.startswith("jstd_tail.")
         )
-        if self.jstd_tail is not None and self.jstd_tail.use_event_hypothesis:
+        if self.jstd_tail is not None and (
+            self.jstd_tail.use_event_hypothesis
+            or self.jstd_tail.use_segment_prior
+        ):
             names = tuple(
                 name for name in names if not name.startswith("jstd_tail.issue_head.")
             )
@@ -2909,7 +2912,10 @@ class StationGaussianDiffusion(nn.Module):
                     "structure losses"
                 )
             if (
-                not self.denoiser.jstd_tail.use_event_hypothesis
+                not (
+                    self.denoiser.jstd_tail.use_event_hypothesis
+                    or self.denoiser.jstd_tail.use_segment_prior
+                )
                 and self.jstd_issue_loss_weight <= 0
             ):
                 raise ValueError("JSTD V1 requires the issue-gate loss")
@@ -3552,11 +3558,23 @@ class StationGaussianDiffusion(nn.Module):
         optional_conditions = {
             name: (
                 value.repeat_interleave(n_samples, dim=0)
-                if value is not None
+                if value is not None and value.shape[0] == batch
+                else value
+                if value is not None and value.shape[0] == batch * n_samples
                 else None
             )
             for name, value in optional_conditions.items()
         }
+        invalid_optional = [
+            name
+            for name, value in optional_conditions.items()
+            if value is not None and value.shape[0] != batch * n_samples
+        ]
+        if invalid_optional:
+            raise ValueError(
+                "sampling conditions have invalid batch dimensions: "
+                f"{invalid_optional}"
+            )
         if tail_expert_route is not None:
             route = tail_expert_route.to(device=forecast.device, dtype=forecast.dtype)
             if route.shape == (batch, n_samples):
@@ -3781,6 +3799,12 @@ class Station24DiffusionModel(nn.Module):
         self.use_jstd_event_hypothesis = bool(
             self.config.get("use_jstd_event_hypothesis", False)
         )
+        self.use_jstd_segment_prior = bool(
+            self.config.get("use_jstd_segment_prior", False)
+        )
+        self.jstd_segment_prior_loss_weight = float(
+            self.config.get("jstd_segment_prior_loss_weight", 0.0)
+        )
         self.jstd_h1_tail_fraction = float(
             self.config.get("jstd_h1_tail_fraction", 0.10)
         )
@@ -3788,6 +3812,12 @@ class Station24DiffusionModel(nn.Module):
             raise ValueError("JSTD tail requires use_body_tail_experts=true")
         if self.use_jstd_event_hypothesis and not self.use_jstd_tail:
             raise ValueError("JSTD event hypotheses require use_jstd_tail=true")
+        if self.use_jstd_segment_prior and not self.use_jstd_tail:
+            raise ValueError("JSTD segment prior requires use_jstd_tail=true")
+        if self.use_jstd_event_hypothesis and self.use_jstd_segment_prior:
+            raise ValueError("oracle H1 and causal segment prior are exclusive")
+        if self.use_jstd_segment_prior and self.jstd_segment_prior_loss_weight <= 0.0:
+            raise ValueError("JSTD segment prior requires a positive loss weight")
         if self.use_jstd_event_hypothesis and not (
             0.0 < self.jstd_h1_tail_fraction <= 1.0
         ):
@@ -3973,6 +4003,7 @@ class Station24DiffusionModel(nn.Module):
         if (
             self.use_body_tail_experts
             and not self.use_jstd_event_hypothesis
+            and not self.use_jstd_segment_prior
             and self.tail_gate_loss_weight <= 0.0
         ):
             raise ValueError(
@@ -4305,6 +4336,21 @@ class Station24DiffusionModel(nn.Module):
             name
             for name in self.denoiser.state_dict()
             if name.startswith("jstd_tail.hypothesis_")
+        )
+        return tuple(
+            sorted(
+                f"{prefix}{suffix}"
+                for prefix in ("denoiser.", "diffusion.denoiser.")
+                for suffix in suffixes
+            )
+        )
+
+    @property
+    def jstd_segment_prior_state_dict_keys(self) -> tuple[str, ...]:
+        suffixes = tuple(
+            name
+            for name in self.denoiser.state_dict()
+            if name.startswith("jstd_tail.segment_prior.")
         )
         return tuple(
             sorted(
@@ -5386,8 +5432,30 @@ class Station24DiffusionModel(nn.Module):
             jstd_slow_target=batch.get("jstd_slow_target"),
             jstd_fast_target=batch.get("jstd_fast_target"),
             jstd_slow24_target=batch.get("jstd_slow24_target"),
-            jstd_event_hypothesis=batch.get("jstd_event_hypothesis"),
+            jstd_event_hypothesis=(
+                batch.get("jstd_segment_hypotheses")
+                if self.use_jstd_segment_prior
+                else batch.get("jstd_event_hypothesis")
+            ),
         )
+        if self.use_jstd_segment_prior and include_auxiliary:
+            if self.denoiser.jstd_tail is None:
+                raise RuntimeError("JSTD segment prior is unavailable")
+            segment_target = batch.get("jstd_segment_hypotheses")
+            segment_weight = batch.get("jstd_sample_weight")
+            if segment_target is None or segment_weight is None:
+                raise ValueError("JSTD segment-prior targets are missing")
+            segment_loss, _ = self.denoiser.jstd_tail.segment_prior_loss(
+                batch["forecast"],
+                segment_target,
+                segment_weight,
+                recent_error=batch.get("recent_error"),
+                recent_error_mask=batch.get("recent_error_mask"),
+            )
+            diffusion_loss = (
+                diffusion_loss
+                + self.jstd_segment_prior_loss_weight * segment_loss
+            )
         if self.use_discrete_event_memory and include_auxiliary:
             diffusion_loss = diffusion_loss + (
                 self.event_selector_loss_weight
@@ -5536,8 +5604,43 @@ class Station24DiffusionModel(nn.Module):
         event_memory_type = None
         event_memory_duration = None
         event_memory_train_index = None
+        jstd_segment_hypotheses = None
+        jstd_segment_count_probability = None
         if self.use_body_tail_experts:
-            if self.use_jstd_event_hypothesis:
+            if self.use_jstd_segment_prior:
+                if self.denoiser.jstd_tail is None:
+                    raise RuntimeError("JSTD segment prior is unavailable")
+                jstd_segment_hypotheses, segment_audit = (
+                    self.denoiser.jstd_tail.sample_segment_hypotheses(
+                        batch["forecast"],
+                        int(n_samples),
+                        recent_error=batch.get("recent_error"),
+                        recent_error_mask=batch.get("recent_error_mask"),
+                    )
+                )
+                tail_probability = segment_audit["tail_probability"]
+                tail_route = (segment_audit["counts"] > 0).to(
+                    batch["forecast"].dtype
+                )
+                jstd_segment_count_probability = segment_audit[
+                    "count_probability"
+                ]
+                tail_time_probability = segment_audit["time_probability"]
+                segment_starts = segment_audit["starts"]
+                sentinel = torch.full_like(segment_starts, self.denoiser.sequence_length)
+                earliest = torch.where(segment_starts >= 0, segment_starts, sentinel).amin(
+                    dim=-1
+                )
+                tail_time_start = torch.where(
+                    tail_route.bool(), earliest, torch.full_like(earliest, -1)
+                )
+                active_weight = jstd_segment_hypotheses[..., 0]
+                denominator = active_weight.sum(dim=(1, 2)).clamp(min=1.0)
+                tail_attention = (
+                    jstd_segment_hypotheses * active_weight[..., None]
+                ).sum(dim=(1, 2)) / denominator[:, None]
+                hypothesis = None
+            elif self.use_jstd_event_hypothesis:
                 hypothesis = batch.get("jstd_event_hypothesis")
                 if hypothesis is None or hypothesis.shape != (
                     batch["forecast"].shape[0],
@@ -5563,6 +5666,7 @@ class Station24DiffusionModel(nn.Module):
                     or self.use_retrieval_mismatch_expert
                     or self.use_tail_time_localizer
                     or self.use_jstd_event_hypothesis
+                    or self.use_jstd_segment_prior
                 ):
                     raise ValueError(
                         "tail route probability override is restricted to the "
@@ -5574,7 +5678,9 @@ class Station24DiffusionModel(nn.Module):
                 route_probability = torch.full_like(tail_probability, override)
             else:
                 route_probability = tail_probability
-            if self.use_discrete_event_memory:
+            if self.use_jstd_segment_prior:
+                pass
+            elif self.use_discrete_event_memory:
                 tail_route = torch.bernoulli(
                     tail_probability[:, None].expand(-1, int(n_samples))
                 )
@@ -5697,7 +5803,15 @@ class Station24DiffusionModel(nn.Module):
             mismatch_expert_route=mismatch_route,
             mismatch_time_gate=mismatch_time_probability,
             jstd_event_hypothesis=(
-                batch.get("jstd_event_hypothesis")
+                jstd_segment_hypotheses.reshape(
+                    batch["forecast"].shape[0] * int(n_samples),
+                    self.denoiser.jstd_tail.segment_max_events,
+                    6,
+                )
+                if self.use_jstd_segment_prior
+                and jstd_segment_hypotheses is not None
+                and self.denoiser.jstd_tail is not None
+                else batch.get("jstd_event_hypothesis")
                 if self.use_jstd_event_hypothesis
                 else None
             ),
@@ -5808,4 +5922,26 @@ class Station24DiffusionModel(nn.Module):
             "event_memory_train_index": event_memory_train_index,
             "forecast_center": forecast_center,
             "forecast_history_fraction": history_fraction,
+            "jstd_segment_hypotheses": (
+                jstd_segment_hypotheses
+                if jstd_segment_hypotheses is not None
+                else torch.zeros(
+                    batch_size,
+                    int(n_samples),
+                    1,
+                    6,
+                    device=samples.device,
+                    dtype=samples.dtype,
+                )
+            ),
+            "jstd_segment_count_probability": (
+                jstd_segment_count_probability
+                if jstd_segment_count_probability is not None
+                else torch.zeros(
+                    batch_size,
+                    1,
+                    device=samples.device,
+                    dtype=samples.dtype,
+                )
+            ),
         }

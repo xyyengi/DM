@@ -84,6 +84,93 @@ class JSTDOutput:
     issue_logit: torch.Tensor
 
 
+@dataclass
+class SegmentEventPriorOutput:
+    """Distribution parameters for ordered continuous event segments."""
+
+    count_logits: torch.Tensor
+    onset_logits: torch.Tensor
+    attribute_raw: torch.Tensor
+
+
+class SegmentEventPrior(nn.Module):
+    """Causal distribution over event count, onset, duration, and joint marks.
+
+    Slots are ordered by onset in the training target.  They are not event
+    classes or experts: each slot uses the same semantic fields and retains an
+    arbitrary integer-hour duration through a continuous conditional density.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        sequence_length: int,
+        max_events: int,
+        groups: int,
+    ) -> None:
+        super().__init__()
+        self.sequence_length = int(sequence_length)
+        self.max_events = int(max_events)
+        self.encoder = nn.Sequential(
+            nn.Conv1d(channels + 2, channels, kernel_size=5, padding=2),
+            nn.GroupNorm(_groups(channels, groups), channels),
+            nn.SiLU(),
+            nn.Conv1d(
+                channels, channels, kernel_size=5, padding=4, dilation=2
+            ),
+            nn.GroupNorm(_groups(channels, groups), channels),
+            nn.SiLU(),
+            nn.Conv1d(
+                channels, channels, kernel_size=5, padding=8, dilation=4
+            ),
+            nn.GroupNorm(_groups(channels, groups), channels),
+            nn.SiLU(),
+        )
+        self.count_head = nn.Sequential(
+            nn.Linear(2 * channels, channels),
+            nn.SiLU(),
+            nn.Linear(channels, self.max_events + 1),
+        )
+        self.onset_head = nn.Conv1d(channels, self.max_events, kernel_size=1)
+        # Per slot/hour: duration, wind depth, and solar depth each use
+        # location+log-scale; synchrony uses one logit (7 values total).
+        self.attribute_head = nn.Conv1d(
+            channels, self.max_events * 7, kernel_size=1
+        )
+        nn.init.zeros_(self.count_head[-1].weight)
+        nn.init.zeros_(self.count_head[-1].bias)
+        nn.init.zeros_(self.onset_head.weight)
+        nn.init.zeros_(self.onset_head.bias)
+        nn.init.zeros_(self.attribute_head.weight)
+        nn.init.zeros_(self.attribute_head.bias)
+
+    def forward(self, system_feature: torch.Tensor) -> SegmentEventPriorOutput:
+        if system_feature.ndim != 3:
+            raise ValueError("segment prior system feature must be [B,C,L]")
+        batch, _, length = system_feature.shape
+        if length != self.sequence_length:
+            raise ValueError("segment prior sequence length mismatch")
+        lead = torch.linspace(
+            0.0, 1.0, length, device=system_feature.device,
+            dtype=system_feature.dtype,
+        )
+        position = torch.stack(
+            [lead, torch.sin(2.0 * math.pi * lead)], dim=0
+        )[None].expand(batch, -1, -1)
+        encoded = self.encoder(torch.cat([system_feature, position], dim=1))
+        pooled = torch.cat(
+            [encoded.mean(dim=-1), encoded.amax(dim=-1)], dim=1
+        )
+        attributes = self.attribute_head(encoded).reshape(
+            batch, self.max_events, 7, length
+        )
+        return SegmentEventPriorOutput(
+            count_logits=self.count_head(pooled),
+            onset_logits=self.onset_head(encoded),
+            attribute_raw=attributes,
+        )
+
+
 class JointSpatioTemporalDecomposedTail(nn.Module):
     """One joint wind/solar tail with localized slow and fast corrections.
 
@@ -114,6 +201,15 @@ class JointSpatioTemporalDecomposedTail(nn.Module):
         self.use_event_hypothesis = bool(
             config.get("use_jstd_event_hypothesis", False)
         )
+        self.use_segment_prior = bool(
+            config.get("use_jstd_segment_prior", False)
+        )
+        self.segment_max_events = int(
+            config.get("jstd_segment_max_events", 2)
+        )
+        self.segment_tail_fraction = float(
+            config.get("jstd_segment_tail_fraction", 0.10)
+        )
         self.hypothesis_edge_temperature = float(
             config.get("jstd_hypothesis_edge_temperature_hours", 1.5)
         )
@@ -126,6 +222,16 @@ class JointSpatioTemporalDecomposedTail(nn.Module):
         if self.hypothesis_edge_temperature <= 0.0:
             raise ValueError(
                 "jstd_hypothesis_edge_temperature_hours must be positive"
+            )
+        if not 1 <= self.segment_max_events <= 4:
+            raise ValueError("jstd_segment_max_events must be in [1,4]")
+        if not 0.0 < self.segment_tail_fraction < 0.5:
+            raise ValueError(
+                "jstd_segment_tail_fraction must be in (0,0.5)"
+            )
+        if self.use_event_hypothesis and self.use_segment_prior:
+            raise ValueError(
+                "oracle event hypotheses and causal segment prior are exclusive"
             )
 
         primary = _normalize_adjacency(adjacency)
@@ -171,7 +277,7 @@ class JointSpatioTemporalDecomposedTail(nn.Module):
         self.slow_fusion = self._fusion(channels, groups)
         self.hypothesis_fast_encoder: nn.Module | None = None
         self.hypothesis_slow_encoder: nn.Module | None = None
-        if self.use_event_hypothesis:
+        if self.use_event_hypothesis or self.use_segment_prior:
             self.hypothesis_fast_encoder = self._hypothesis_encoder(
                 channels, groups
             )
@@ -190,6 +296,14 @@ class JointSpatioTemporalDecomposedTail(nn.Module):
             nn.Conv1d(channels, channels, kernel_size=3, padding=1),
             nn.SiLU(),
         )
+        self.segment_prior: SegmentEventPrior | None = None
+        if self.use_segment_prior:
+            self.segment_prior = SegmentEventPrior(
+                channels,
+                self.sequence_length,
+                self.segment_max_events,
+                groups,
+            )
         self.slow_modes = nn.Conv1d(channels, modes, kernel_size=1)
         self.fast_modes = nn.Conv1d(channels, modes, kernel_size=1)
         nn.init.zeros_(self.slow_modes.weight)
@@ -326,51 +440,259 @@ class JointSpatioTemporalDecomposedTail(nn.Module):
         H1 controllability input, not a future-residual map.
         """
 
-        if hypothesis.ndim != 2 or hypothesis.shape[1] != 6:
-            raise ValueError("jstd_event_hypothesis must be [B,6]")
+        squeeze_event = hypothesis.ndim == 2
+        if squeeze_event:
+            hypothesis = hypothesis[:, None, :]
+        if hypothesis.ndim != 3 or hypothesis.shape[2] != 6:
+            raise ValueError("jstd_event_hypothesis must be [B,6] or [B,E,6]")
         value = hypothesis.to(dtype=dtype)
-        active = value[:, 0].clamp(0.0, 1.0)
-        onset = value[:, 1].clamp(0.0, 1.0) * float(self.sequence_length - 1)
-        duration = value[:, 2].clamp(
+        active = value[:, :, 0].clamp(0.0, 1.0)
+        onset = value[:, :, 1].clamp(0.0, 1.0) * float(self.sequence_length - 1)
+        duration = value[:, :, 2].clamp(
             1.0 / float(self.sequence_length), 1.0
         ) * float(self.sequence_length)
         stop = (onset + duration).clamp(max=float(self.sequence_length))
         time = torch.arange(
             self.sequence_length, device=value.device, dtype=dtype
-        )[None, :]
+        )[None, None, :]
         temperature = self.hypothesis_edge_temperature
         envelope = (
-            torch.sigmoid((time - onset[:, None]) / temperature)
-            * torch.sigmoid((stop[:, None] - time) / temperature)
-            * active[:, None]
+            torch.sigmoid((time - onset[:, :, None]) / temperature)
+            * torch.sigmoid((stop[:, :, None] - time) / temperature)
+            * active[:, :, None]
         )
         onset_edge = torch.exp(
-            -0.5 * ((time - onset[:, None]) / temperature) ** 2
-        ) * active[:, None]
+            -0.5 * ((time - onset[:, :, None]) / temperature) ** 2
+        ) * active[:, :, None]
         offset_edge = torch.exp(
-            -0.5 * ((time - stop[:, None]) / temperature) ** 2
-        ) * active[:, None]
+            -0.5 * ((time - stop[:, :, None]) / temperature) ** 2
+        ) * active[:, :, None]
         station_type = self.station_features[:, :2].to(dtype)
         amplitude = (
-            value[:, 3, None] * station_type[None, :, 0]
-            + value[:, 4, None] * station_type[None, :, 1]
+            value[:, :, 3, None] * station_type[None, None, :, 0]
+            + value[:, :, 4, None] * station_type[None, None, :, 1]
         )
-        signed_envelope = amplitude[:, :, None] * envelope[:, None, :]
-        synchrony = value[:, 5].clamp(0.0, 1.0)
-        common_envelope = envelope[:, None, :].expand(
+        signed_envelope = (
+            amplitude[:, :, :, None] * envelope[:, :, None, :]
+        ).sum(dim=1)
+        synchrony = value[:, :, 5].clamp(0.0, 1.0)
+        common_envelope = envelope.amax(dim=1)[:, None, :].expand(
             -1, self.station_count, -1
         )
+        onset_field = (
+            amplitude[:, :, :, None] * onset_edge[:, :, None, :]
+        ).sum(dim=1)
+        offset_field = (
+            amplitude[:, :, :, None] * offset_edge[:, :, None, :]
+        ).sum(dim=1)
+        sync_envelope = (
+            synchrony[:, :, None, None]
+            * envelope[:, :, None, :]
+        ).amax(dim=1).expand(-1, self.station_count, -1)
         fields = torch.stack(
             [
                 common_envelope,
                 signed_envelope,
-                amplitude[:, :, None] * onset_edge[:, None, :],
-                amplitude[:, :, None] * offset_edge[:, None, :],
-                synchrony[:, None, None] * common_envelope,
+                onset_field,
+                offset_field,
+                sync_envelope,
             ],
             dim=2,
         )
-        return fields, envelope, torch.stack([onset, stop], dim=1)
+        combined_envelope = envelope.amax(dim=1)
+        bounds = torch.stack([onset, stop], dim=-1)
+        if squeeze_event:
+            bounds = bounds[:, 0]
+        return fields, combined_envelope, bounds
+
+    def segment_prior_output(
+        self,
+        forecast: torch.Tensor,
+        recent_error: torch.Tensor | None = None,
+        recent_error_mask: torch.Tensor | None = None,
+    ) -> SegmentEventPriorOutput:
+        if not self.use_segment_prior or self.segment_prior is None:
+            raise RuntimeError("causal JSTD segment prior is disabled")
+        _, _, system_condition = self._causal_condition_groups(
+            forecast, recent_error, recent_error_mask
+        )
+        return self.segment_prior(self.system_encoder(system_condition))
+
+    @staticmethod
+    def _normal_nll(
+        target: torch.Tensor,
+        location: torch.Tensor,
+        raw_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        scale = F.softplus(raw_scale).clamp(min=0.02, max=0.35)
+        return 0.5 * ((target - location) / scale).square() + torch.log(scale)
+
+    def segment_prior_loss(
+        self,
+        forecast: torch.Tensor,
+        target: torch.Tensor,
+        sample_weight: torch.Tensor,
+        recent_error: torch.Tensor | None = None,
+        recent_error_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Proper structured loss using train/validation labels, never conditions."""
+
+        if target.ndim != 3 or target.shape[1:] != (
+            self.segment_max_events, 6
+        ):
+            raise ValueError("segment prior target must be [B,E,6]")
+        output = self.segment_prior_output(
+            forecast, recent_error, recent_error_mask
+        )
+        active = target[:, :, 0].to(forecast.dtype)
+        count = active.sum(dim=1).long().clamp(max=self.segment_max_events)
+        importance = sample_weight.to(forecast.dtype).reciprocal()
+        count_error = F.cross_entropy(
+            output.count_logits, count, reduction="none"
+        )
+        count_loss = (count_error * importance).sum() / importance.sum().clamp(min=1.0)
+
+        onset_index = (
+            target[:, :, 1].clamp(0.0, 1.0)
+            * float(self.sequence_length - 1)
+        ).round().long()
+        onset_error = F.cross_entropy(
+            output.onset_logits.reshape(-1, self.sequence_length),
+            onset_index.reshape(-1),
+            reduction="none",
+        ).reshape_as(active)
+        slot_weight = active * importance[:, None]
+        onset_loss = (onset_error * slot_weight).sum() / slot_weight.sum().clamp(min=1.0)
+
+        gather_index = onset_index[:, :, None, None].expand(-1, -1, 7, 1)
+        attributes = output.attribute_raw.gather(-1, gather_index)[..., 0]
+        duration_location = torch.sigmoid(attributes[:, :, 0])
+        wind_location = torch.tanh(attributes[:, :, 2])
+        solar_location = torch.tanh(attributes[:, :, 4])
+        duration_error = self._normal_nll(
+            target[:, :, 2], duration_location, attributes[:, :, 1]
+        )
+        wind_error = self._normal_nll(
+            target[:, :, 3], wind_location, attributes[:, :, 3]
+        )
+        solar_error = self._normal_nll(
+            target[:, :, 4], solar_location, attributes[:, :, 5]
+        )
+        sync_error = F.binary_cross_entropy_with_logits(
+            attributes[:, :, 6], target[:, :, 5].clamp(0.0, 1.0),
+            reduction="none",
+        )
+        mark_error = duration_error + 0.5 * (wind_error + solar_error) + sync_error
+        mark_loss = (mark_error * slot_weight).sum() / slot_weight.sum().clamp(min=1.0)
+        total = count_loss + onset_loss + mark_loss
+        return total, {
+            "count": count_loss.detach(),
+            "onset": onset_loss.detach(),
+            "mark": mark_loss.detach(),
+        }
+
+    def sample_segment_hypotheses(
+        self,
+        forecast: torch.Tensor,
+        members: int,
+        recent_error: torch.Tensor | None = None,
+        recent_error_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Sample member-specific causal segment hypotheses."""
+
+        output = self.segment_prior_output(
+            forecast, recent_error, recent_error_mask
+        )
+        batch = forecast.shape[0]
+        count_probability = torch.softmax(output.count_logits, dim=-1)
+        learned_event_probability = 1.0 - count_probability[:, 0]
+        nonzero_probability = count_probability[:, 1:]
+        nonzero_probability = nonzero_probability / nonzero_probability.sum(
+            dim=-1, keepdim=True
+        ).clamp(min=1e-8)
+        sampled_nonzero_count = 1 + torch.multinomial(
+            nonzero_probability, int(members), replacement=True
+        )
+        tail_count = max(
+            1, int(round(int(members) * self.segment_tail_fraction))
+        )
+        route = torch.zeros(
+            batch, int(members), device=forecast.device, dtype=torch.bool
+        )
+        for batch_index in range(batch):
+            order = torch.randperm(int(members), device=forecast.device)
+            route[batch_index, order[:tail_count]] = True
+        counts = torch.where(
+            route, sampled_nonzero_count, torch.zeros_like(sampled_nonzero_count)
+        )
+        hypotheses = torch.zeros(
+            batch, int(members), self.segment_max_events, 6,
+            device=forecast.device, dtype=forecast.dtype,
+        )
+        starts = torch.full(
+            (batch, int(members), self.segment_max_events), -1,
+            device=forecast.device, dtype=torch.long,
+        )
+        for slot in range(self.segment_max_events):
+            active = counts > slot
+            onset_probability = torch.softmax(
+                output.onset_logits[:, slot], dim=-1
+            )
+            sampled_onset = torch.multinomial(
+                onset_probability, int(members), replacement=True
+            )
+            starts[:, :, slot] = torch.where(
+                active, sampled_onset, torch.full_like(sampled_onset, -1)
+            )
+            raw = output.attribute_raw[:, slot]
+            gathered = raw.gather(
+                -1,
+                sampled_onset[:, None, :].expand(-1, 7, -1),
+            ).transpose(1, 2)
+            def sampled_normal(location: torch.Tensor, raw_scale: torch.Tensor) -> torch.Tensor:
+                scale = F.softplus(raw_scale).clamp(min=0.02, max=0.35)
+                return location + scale * torch.randn_like(location)
+
+            duration = sampled_normal(
+                torch.sigmoid(gathered[:, :, 0]), gathered[:, :, 1]
+            ).clamp(1.0 / float(self.sequence_length), 1.0)
+            wind = sampled_normal(
+                torch.tanh(gathered[:, :, 2]), gathered[:, :, 3]
+            ).clamp(-1.0, 1.0)
+            solar = sampled_normal(
+                torch.tanh(gathered[:, :, 4]), gathered[:, :, 5]
+            ).clamp(-1.0, 1.0)
+            synchrony = torch.sigmoid(gathered[:, :, 6])
+            hypotheses[:, :, slot, 0] = active.to(forecast.dtype)
+            hypotheses[:, :, slot, 1] = sampled_onset.to(forecast.dtype) / float(
+                self.sequence_length - 1
+            )
+            hypotheses[:, :, slot, 2] = duration
+            hypotheses[:, :, slot, 3] = wind
+            hypotheses[:, :, slot, 4] = solar
+            hypotheses[:, :, slot, 5] = synchrony
+        survival = torch.stack(
+            [nonzero_probability[:, slot:].sum(dim=1)
+             for slot in range(self.segment_max_events)],
+            dim=1,
+        )
+        time_probability = (
+            survival[:, :, None]
+            * torch.softmax(output.onset_logits, dim=-1)
+        ).sum(dim=1)
+        time_probability = time_probability / time_probability.sum(
+            dim=-1, keepdim=True
+        ).clamp(min=1e-8)
+        return hypotheses, {
+            "tail_probability": torch.full_like(
+                learned_event_probability, self.segment_tail_fraction
+            ),
+            "learned_event_probability": learned_event_probability,
+            "count_probability": count_probability,
+            "counts": counts,
+            "starts": starts,
+            "time_probability": time_probability,
+        }
 
     def forward(
         self,
@@ -408,10 +730,10 @@ class JointSpatioTemporalDecomposedTail(nn.Module):
         slow_encoded = self.slow_condition(
             slow_condition.reshape(batch * stations, 6, length)
         )
-        if self.use_event_hypothesis:
+        if self.use_event_hypothesis or self.use_segment_prior:
             if event_hypothesis is None:
                 raise ValueError(
-                    "H1 JSTD tail requires jstd_event_hypothesis"
+                    "event-conditioned JSTD tail requires jstd_event_hypothesis"
                 )
             if (
                 self.hypothesis_fast_encoder is None

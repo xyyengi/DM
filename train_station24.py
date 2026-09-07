@@ -363,7 +363,7 @@ def validate(
             total_loss += float(loss) * validation_weight
             total_weight += validation_weight
             target = active
-            if model.use_jstd_event_hypothesis:
+            if model.use_jstd_event_hypothesis or model.use_jstd_segment_prior:
                 logits = None
             elif model.use_retrieval_mismatch_expert:
                 context, _ = model.encode_retrieval_memory(batch)
@@ -450,6 +450,8 @@ def validate(
             metrics["val_jstd_oracle_event_fraction"] = float(
                 tail_event_count / max(len(loader.dataset), 1)
             )
+        elif model.use_jstd_segment_prior:
+            metrics["val_jstd_segment_prior_included"] = 1.0
         else:
             metrics["val_jstd_issue_bce"] = gate_error_sum / max(gate_samples, 1)
         return objective, metrics
@@ -586,6 +588,10 @@ def save_checkpoint(
         "use_body_tail_experts": bool(model.use_body_tail_experts),
         "use_jstd_tail": bool(model.use_jstd_tail),
         "use_jstd_event_hypothesis": bool(model.use_jstd_event_hypothesis),
+        "use_jstd_segment_prior": bool(model.use_jstd_segment_prior),
+        "jstd_segment_prior_loss_weight": float(
+            model.jstd_segment_prior_loss_weight
+        ),
         "jstd_h1_tail_fraction": float(model.jstd_h1_tail_fraction),
         "jstd_trainable_parameter_names": list(
             model.jstd_trainable_parameter_names
@@ -823,20 +829,28 @@ def main() -> None:
                     "event_hypothesis_mode": bool(
                         config["model"].get("use_jstd_event_hypothesis", False)
                     ),
+                    "causal_segment_prior_mode": bool(
+                        config["model"].get("use_jstd_segment_prior", False)
+                    ),
                     "training_actual_residual_used_to_construct_hypothesis": bool(
                         config["model"].get("use_jstd_event_hypothesis", False)
+                        or config["model"].get("use_jstd_segment_prior", False)
                     ),
                     "validation_actual_residual_role": (
                         "oracle_controllability_upper_bound_and_model_selection_only"
                         if config["model"].get(
                             "use_jstd_event_hypothesis", False
                         )
-                        else "offline_labels_and_model_selection_only"
+                        else "offline_labels_and_model_selection_only_never_generation_condition"
                     ),
                     "event_hypothesis_deployable_causal_condition": (
                         False
                         if config["model"].get(
                             "use_jstd_event_hypothesis", False
+                        )
+                        else True
+                        if config["model"].get(
+                            "use_jstd_segment_prior", False
                         )
                         else None
                     ),
@@ -1066,6 +1080,9 @@ def main() -> None:
         )
         if model.use_jstd_tail:
             expected_source_variant = (
+                "geo_history_actual_jstd_event_hypothesis_h1"
+                if model.use_jstd_segment_prior
+                else
                 "geo_history_actual_jstd_tail_v1"
                 if model.use_jstd_event_hypothesis
                 else "geo_history_actual_body_tail_moe"
@@ -1079,7 +1096,9 @@ def main() -> None:
             source_state = initialization["model_state_dict"]
             incompatible = model.load_state_dict(source_state, strict=False)
             expected_missing = set(
-                model.jstd_hypothesis_state_dict_keys
+                model.jstd_segment_prior_state_dict_keys
+                if model.use_jstd_segment_prior
+                else model.jstd_hypothesis_state_dict_keys
                 if model.use_jstd_event_hypothesis
                 else model.jstd_new_state_dict_keys
             )
@@ -1095,6 +1114,9 @@ def main() -> None:
             trainable_names = model.configure_jstd_training()
             initialization_manifest = {
                 "method": (
+                    "h1_renderer_to_causal_multiscale_segment_event_prior"
+                    if model.use_jstd_segment_prior
+                    else
                     "jstd_v1_to_continuous_event_hypothesis_h1_finetune"
                     if model.use_jstd_event_hypothesis
                     else "frozen_raw_body_replacement_joint_spatiotemporal_decomposed_tail_v1"
@@ -1109,8 +1131,13 @@ def main() -> None:
                 "forecast_revision_added": False,
                 "event_hypothesis_conditioned": bool(
                     model.use_jstd_event_hypothesis
+                    or model.use_jstd_segment_prior
                 ),
-                "issue_gate_trainable": not model.use_jstd_event_hypothesis,
+                "causal_segment_prior": bool(model.use_jstd_segment_prior),
+                "issue_gate_trainable": not (
+                    model.use_jstd_event_hypothesis
+                    or model.use_jstd_segment_prior
+                ),
                 "trainable_parameter_names": list(trainable_names),
             }
         elif model.train_sampler_energy_score_only:
@@ -1846,6 +1873,10 @@ def main() -> None:
         "use_body_tail_experts": bool(model.use_body_tail_experts),
         "use_jstd_tail": bool(model.use_jstd_tail),
         "use_jstd_event_hypothesis": bool(model.use_jstd_event_hypothesis),
+        "use_jstd_segment_prior": bool(model.use_jstd_segment_prior),
+        "jstd_segment_prior_loss_weight": float(
+            model.jstd_segment_prior_loss_weight
+        ),
         "jstd_h1_tail_fraction": float(model.jstd_h1_tail_fraction),
         "jstd_trainable_parameter_names": list(
             model.jstd_trainable_parameter_names
