@@ -166,7 +166,7 @@ def main() -> None:
         weight_decay=0.0,
     )
     scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
-    scale_gradient_by_channel = None
+    scale_gradient_norm_by_channel = None
     changed_groups: set[str] = set()
     trainable_before = {
         name: value.detach().cpu().clone()
@@ -185,17 +185,38 @@ def main() -> None:
         scaler.scale(model_loss).backward()
         scaler.unscale_(optimizer)
         if optimization_step == 0:
-            attribute_bias = model.denoiser.jstd_tail.segment_prior.attribute_head.bias
-            scale_gradient_by_channel = {
-                str(index): float(attribute_bias.grad[index].detach().cpu())
-                for index in (1, 3, 5, 8, 10, 12)
-            }
+            attribute_head = (
+                model.denoiser.jstd_tail.segment_prior.attribute_head
+            )
+            attribute_weight_gradient = attribute_head.weight.grad.reshape(
+                model_config["jstd_segment_max_events"], 7, -1
+            )
+            attribute_bias_gradient = attribute_head.bias.grad.reshape(
+                model_config["jstd_segment_max_events"], 7
+            )
+            # A scalar bias gradient can legitimately cancel across samples,
+            # especially under AMP.  Audit the complete output-channel parameter
+            # gradient instead: both event-slot rows, weights, and biases.  A
+            # zero norm here really means that the scale channel is disconnected.
+            scale_gradient_norm_by_channel = {}
+            for channel, label in (
+                (1, "duration_scale"),
+                (3, "wind_depth_scale"),
+                (5, "solar_depth_scale"),
+            ):
+                channel_weight = attribute_weight_gradient[:, channel, :].float()
+                channel_bias = attribute_bias_gradient[:, channel].float()
+                norm = torch.sqrt(
+                    channel_weight.square().sum() + channel_bias.square().sum()
+                )
+                scale_gradient_norm_by_channel[label] = float(norm.detach().cpu())
             if any(
                 not np.isfinite(value) or abs(value) <= 1.0e-10
-                for value in scale_gradient_by_channel.values()
+                for value in scale_gradient_norm_by_channel.values()
             ):
                 raise ValueError(
-                    "one or more duration/depth scale heads have zero gradients"
+                    "one or more complete duration/depth scale output channels "
+                    "have zero parameter-gradient norm"
                 )
         scaler.step(optimizer)
         scaler.update()
@@ -350,7 +371,9 @@ def main() -> None:
         "scale_parameterization": (
             model.denoiser.jstd_tail.segment_scale_parameterization
         ),
-        "scale_gradient_by_attribute_channel": scale_gradient_by_channel,
+        "scale_gradient_norm_by_attribute_channel": (
+            scale_gradient_norm_by_channel
+        ),
         "updated_prior_groups": sorted(changed_groups),
         "boundary_atom_check": "PASS",
         "integrated_generation_smoke_test": True,
