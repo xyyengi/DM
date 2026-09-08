@@ -34,3 +34,4 @@ __pycache__/
 /tools/evaluate_v5tf_extreme_events.py
 # Local PaperSpine/report rewriting artifacts are not model source files.
 paper_rewriting_output/
+third_party/Diffusion-TS/

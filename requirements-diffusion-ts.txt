@@ -1,0 +1,3 @@
+# Install in dm_env / dm_preflight, leaving the installed torch build unchanged.
+einops==0.8.1
+tqdm==4.67.1

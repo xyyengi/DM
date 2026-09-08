@@ -1,0 +1,38 @@
+experiment: station24_diffusion_ts_joint_inherited_v2
+upstream_commit: 566307e6cf2d8095e58de4c6e3a6ae965b69b5b5
+inherit_run: outputs_shandong/station24/body_tail_moe_20260824_191036/training/20260824_191044_station24_body_tail_moe_20260824_191036_seed2027
+model:
+  version: diffusion_ts_joint_inherited_v2
+  sequence_length: 168
+  station_count: 24
+  d_model: 64
+  n_heads: 4
+  encoder_layers: 2
+  decoder_layers: 3
+  dropout: 0.1
+  diffusion_steps: 500
+  fourier_weight: 2.592296279363144
+  structure_weights:
+    ramp: 0.2
+    slow: 0.2
+    synchrony: 0.1
+    aggregate: 0.2
+train:
+  seed: 2027
+  batch_size: 8
+  accumulation: 2
+  epochs: 220
+  patience_epochs: 40
+  validation_every: 5
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  amp: true
+  validation_seed: 314159
+generation:
+  members: 500
+  seed: 424242
+  steps: 500
+  chunk: 32
+  energy_members: 80
+  state: raw
