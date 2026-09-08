@@ -1053,6 +1053,14 @@ def main() -> None:
         "jstd_segment_prior_loss_weight": float(
             model.jstd_segment_prior_loss_weight
         ),
+        "train_jstd_segment_prior_only": bool(
+            model.train_jstd_segment_prior_only
+        ),
+        "jstd_segment_scale_parameterization": (
+            model.denoiser.jstd_tail.segment_scale_parameterization
+            if model.denoiser.jstd_tail is not None
+            else None
+        ),
         "jstd_segment_max_events": int(
             config["model"].get("jstd_segment_max_events", 2)
         ),

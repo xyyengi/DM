@@ -2882,6 +2882,7 @@ class StationGaussianDiffusion(nn.Module):
         self.jstd_outside_zero_loss_weight = float(
             jstd_outside_zero_loss_weight
         )
+        self.last_loss_components: dict[str, torch.Tensor] = {}
         if self.ramp_auxiliary_loss_weight < 0:
             raise ValueError("ramp auxiliary loss weight must be non-negative")
         if self.wind_common_event_loss_weight < 0:
@@ -3048,6 +3049,10 @@ class StationGaussianDiffusion(nn.Module):
             or self.jstd_structure_loss_weight > 0
         )
         if not needs_x0:
+            self.last_loss_components = {
+                "epsilon": epsilon_loss.detach(),
+                "total": epsilon_loss.detach(),
+            }
             return epsilon_loss
         if residual_scale is None or residual_scale.shape != clean.shape:
             raise ValueError(
@@ -3417,7 +3422,7 @@ class StationGaussianDiffusion(nn.Module):
                 sync_error * sync_weight
             ).sum() / sync_weight.sum().clamp(min=1.0)
 
-        return (
+        total_loss = (
             epsilon_loss
             + self.ramp_auxiliary_loss_weight * ramp_loss
             + self.wind_common_event_loss_weight * common_event_loss
@@ -3430,6 +3435,21 @@ class StationGaussianDiffusion(nn.Module):
             + self.jstd_structure_loss_weight * jstd_structure_loss
             + self.jstd_outside_zero_loss_weight * jstd_outside_zero_loss
         )
+        self.last_loss_components = {
+            "epsilon": epsilon_loss.detach(),
+            "ramp": ramp_loss.detach(),
+            "wind_common_event": common_event_loss.detach(),
+            "event_magnitude": event_magnitude_loss.detach(),
+            "event_timing": event_timing_loss.detach(),
+            "event_sync": event_sync_loss.detach(),
+            "jstd_decomposition": jstd_decomposition_loss.detach(),
+            "jstd_mask": jstd_mask_loss.detach(),
+            "jstd_issue": jstd_issue_loss.detach(),
+            "jstd_structure": jstd_structure_loss.detach(),
+            "jstd_outside_zero": jstd_outside_zero_loss.detach(),
+            "total": total_loss.detach(),
+        }
+        return total_loss
 
     def reverse_variance(self, timestep: torch.Tensor) -> torch.Tensor:
         beta = self.beta[timestep]
@@ -3792,6 +3812,7 @@ class Station24DiffusionModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = dict(config)
+        self.last_loss_components: dict[str, torch.Tensor] = {}
         self.use_body_tail_experts = bool(
             self.config.get("use_body_tail_experts", False)
         )
@@ -3804,6 +3825,9 @@ class Station24DiffusionModel(nn.Module):
         )
         self.jstd_segment_prior_loss_weight = float(
             self.config.get("jstd_segment_prior_loss_weight", 0.0)
+        )
+        self.train_jstd_segment_prior_only = bool(
+            self.config.get("train_jstd_segment_prior_only", False)
         )
         self.jstd_h1_tail_fraction = float(
             self.config.get("jstd_h1_tail_fraction", 0.10)
@@ -3818,6 +3842,10 @@ class Station24DiffusionModel(nn.Module):
             raise ValueError("oracle H1 and causal segment prior are exclusive")
         if self.use_jstd_segment_prior and self.jstd_segment_prior_loss_weight <= 0.0:
             raise ValueError("JSTD segment prior requires a positive loss weight")
+        if self.train_jstd_segment_prior_only and not self.use_jstd_segment_prior:
+            raise ValueError(
+                "train_jstd_segment_prior_only requires use_jstd_segment_prior=true"
+            )
         if self.use_jstd_event_hypothesis and not (
             0.0 < self.jstd_h1_tail_fraction <= 1.0
         ):
@@ -4360,10 +4388,22 @@ class Station24DiffusionModel(nn.Module):
             )
         )
 
+    @property
+    def jstd_segment_prior_trainable_parameter_names(self) -> tuple[str, ...]:
+        return tuple(
+            f"denoiser.{name}"
+            for name, _ in self.denoiser.named_parameters()
+            if name.startswith("jstd_tail.segment_prior.")
+        )
+
     def configure_jstd_training(self) -> tuple[str, ...]:
         """Freeze every Raw parameter and optimize only the replacement tail."""
 
-        allowed = set(self.jstd_trainable_parameter_names)
+        allowed = set(
+            self.jstd_segment_prior_trainable_parameter_names
+            if self.train_jstd_segment_prior_only
+            else self.jstd_trainable_parameter_names
+        )
         if not allowed:
             raise RuntimeError("JSTD tail has no trainable parameters")
         for name, parameter in self.named_parameters():
@@ -5307,6 +5347,30 @@ class Station24DiffusionModel(nn.Module):
         body_tail_event_masking: bool = False,
         body_tail_route_override: float | None = None,
     ) -> torch.Tensor:
+        if self.train_jstd_segment_prior_only and include_auxiliary:
+            if self.denoiser.jstd_tail is None:
+                raise RuntimeError("JSTD segment prior is unavailable")
+            segment_target = batch.get("jstd_segment_hypotheses")
+            segment_weight = batch.get("jstd_sample_weight")
+            if segment_target is None or segment_weight is None:
+                raise ValueError("JSTD segment-prior targets are missing")
+            segment_loss, segment_parts = (
+                self.denoiser.jstd_tail.segment_prior_loss(
+                    batch["forecast"],
+                    segment_target,
+                    segment_weight,
+                    recent_error=batch.get("recent_error"),
+                    recent_error_mask=batch.get("recent_error_mask"),
+                )
+            )
+            self.last_loss_components = {
+                "segment_total": segment_loss.detach(),
+                **{
+                    f"segment_{name}": value.detach()
+                    for name, value in segment_parts.items()
+                },
+            }
+            return segment_loss
         correction = self.predict_forecast_correction(batch)
         condition_forecast, history_fraction = self.predict_forecast_center(batch)
         clean = batch["residual_target"]
@@ -5438,6 +5502,10 @@ class Station24DiffusionModel(nn.Module):
                 else batch.get("jstd_event_hypothesis")
             ),
         )
+        self.last_loss_components = {
+            f"diffusion_{name}": value.detach()
+            for name, value in self.diffusion.last_loss_components.items()
+        }
         if self.use_jstd_segment_prior and include_auxiliary:
             if self.denoiser.jstd_tail is None:
                 raise RuntimeError("JSTD segment prior is unavailable")
@@ -5445,7 +5513,7 @@ class Station24DiffusionModel(nn.Module):
             segment_weight = batch.get("jstd_sample_weight")
             if segment_target is None or segment_weight is None:
                 raise ValueError("JSTD segment-prior targets are missing")
-            segment_loss, _ = self.denoiser.jstd_tail.segment_prior_loss(
+            segment_loss, segment_parts = self.denoiser.jstd_tail.segment_prior_loss(
                 batch["forecast"],
                 segment_target,
                 segment_weight,
@@ -5455,6 +5523,15 @@ class Station24DiffusionModel(nn.Module):
             diffusion_loss = (
                 diffusion_loss
                 + self.jstd_segment_prior_loss_weight * segment_loss
+            )
+            self.last_loss_components.update(
+                {
+                    "segment_total": segment_loss.detach(),
+                    **{
+                        f"segment_{name}": value.detach()
+                        for name, value in segment_parts.items()
+                    },
+                }
             )
         if self.use_discrete_event_memory and include_auxiliary:
             diffusion_loss = diffusion_loss + (

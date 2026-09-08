@@ -210,6 +210,37 @@ class JointSpatioTemporalDecomposedTail(nn.Module):
         self.segment_tail_fraction = float(
             config.get("jstd_segment_tail_fraction", 0.10)
         )
+        # Missing field deliberately retains historical checkpoint semantics.
+        self.segment_scale_parameterization = str(
+            config.get("jstd_segment_scale_parameterization", "legacy_clamp")
+        )
+        if self.segment_scale_parameterization not in (
+            "legacy_clamp",
+            "bounded_sigmoid",
+            "transformed_normal_v2",
+        ):
+            raise ValueError("unknown JSTD segment scale parameterization")
+        self.segment_duration_scale_bounds = tuple(
+            float(value)
+            for value in config.get(
+                "jstd_segment_duration_latent_scale_bounds", [0.05, 1.50]
+            )
+        )
+        self.segment_depth_scale_bounds = tuple(
+            float(value)
+            for value in config.get(
+                "jstd_segment_depth_latent_scale_bounds", [0.02, 0.80]
+            )
+        )
+        self.segment_duration_initial_hours = float(
+            config.get("jstd_segment_duration_initial_hours", 7.0)
+        )
+        self.segment_duration_initial_scale = float(
+            config.get("jstd_segment_duration_initial_latent_scale", 0.55)
+        )
+        self.segment_depth_initial_scale = float(
+            config.get("jstd_segment_depth_initial_latent_scale", 0.20)
+        )
         self.hypothesis_edge_temperature = float(
             config.get("jstd_hypothesis_edge_temperature_hours", 1.5)
         )
@@ -304,6 +335,8 @@ class JointSpatioTemporalDecomposedTail(nn.Module):
                 self.segment_max_events,
                 groups,
             )
+            if self.segment_scale_parameterization == "transformed_normal_v2":
+                self._initialize_transformed_segment_prior()
         self.slow_modes = nn.Conv1d(channels, modes, kernel_size=1)
         self.fast_modes = nn.Conv1d(channels, modes, kernel_size=1)
         nn.init.zeros_(self.slow_modes.weight)
@@ -519,13 +552,99 @@ class JointSpatioTemporalDecomposedTail(nn.Module):
         return self.segment_prior(self.system_encoder(system_condition))
 
     @staticmethod
+    def _inverse_bounded_sigmoid(value: float, bounds: tuple[float, float]) -> float:
+        lower, upper = bounds
+        if not lower < value < upper:
+            raise ValueError("initial scale must lie strictly inside its bounds")
+        probability = (value - lower) / (upper - lower)
+        return math.log(probability / (1.0 - probability))
+
+    def _initialize_transformed_segment_prior(self) -> None:
+        if self.segment_prior is None:
+            raise RuntimeError("segment prior is unavailable")
+        if not 1.0 <= self.segment_duration_initial_hours < self.sequence_length:
+            raise ValueError(
+                "jstd_segment_duration_initial_hours must be in [1, sequence_length)"
+            )
+        duration_fraction = self.segment_duration_initial_hours / float(
+            self.sequence_length
+        )
+        duration_location = math.log(
+            duration_fraction / (1.0 - duration_fraction)
+        )
+        duration_scale = self._inverse_bounded_sigmoid(
+            self.segment_duration_initial_scale,
+            self.segment_duration_scale_bounds,
+        )
+        depth_scale = self._inverse_bounded_sigmoid(
+            self.segment_depth_initial_scale,
+            self.segment_depth_scale_bounds,
+        )
+        with torch.no_grad():
+            bias = self.segment_prior.attribute_head.bias.reshape(
+                self.segment_max_events, 7
+            )
+            bias[:, 0] = duration_location
+            bias[:, 1] = duration_scale
+            bias[:, 2] = 0.0
+            bias[:, 3] = depth_scale
+            bias[:, 4] = 0.0
+            bias[:, 5] = depth_scale
+            bias[:, 6] = 0.0
+
+    def segment_scale(
+        self,
+        raw_scale: torch.Tensor,
+        attribute: str = "legacy",
+    ) -> torch.Tensor:
+        if self.segment_scale_parameterization == "transformed_normal_v2":
+            if attribute == "duration":
+                lower, upper = self.segment_duration_scale_bounds
+            elif attribute == "depth":
+                lower, upper = self.segment_depth_scale_bounds
+            else:
+                raise ValueError(
+                    "transformed_normal_v2 scale requires duration or depth"
+                )
+            if not 0.0 < lower < upper:
+                raise ValueError("JSTD transformed scale bounds are invalid")
+            return lower + (upper - lower) * torch.sigmoid(raw_scale)
+        if self.segment_scale_parameterization == "bounded_sigmoid":
+            return 0.02 + 0.33 * torch.sigmoid(raw_scale)
+        return F.softplus(raw_scale).clamp(min=0.02, max=0.35)
+
     def _normal_nll(
+        self,
         target: torch.Tensor,
         location: torch.Tensor,
         raw_scale: torch.Tensor,
+        attribute: str = "legacy",
     ) -> torch.Tensor:
-        scale = F.softplus(raw_scale).clamp(min=0.02, max=0.35)
+        scale = self.segment_scale(raw_scale, attribute)
         return 0.5 * ((target - location) / scale).square() + torch.log(scale)
+
+    def _transformed_normal_nll(
+        self,
+        target: torch.Tensor,
+        location: torch.Tensor,
+        raw_scale: torch.Tensor,
+        attribute: str,
+    ) -> torch.Tensor:
+        if attribute == "duration":
+            epsilon = 0.5 / float(self.sequence_length)
+            bounded = target.clamp(epsilon, 1.0 - epsilon)
+            latent = torch.logit(bounded)
+            log_inverse_jacobian = torch.log(bounded) + torch.log1p(-bounded)
+        elif attribute == "depth":
+            bounded = target.clamp(-1.0 + 1.0e-4, 1.0 - 1.0e-4)
+            latent = torch.atanh(bounded)
+            log_inverse_jacobian = torch.log1p(-bounded.square())
+        else:
+            raise ValueError("transformed normal attribute must be duration or depth")
+        return (
+            self._normal_nll(latent, location, raw_scale, attribute)
+            + log_inverse_jacobian
+        )
 
     def segment_prior_loss(
         self,
@@ -566,18 +685,38 @@ class JointSpatioTemporalDecomposedTail(nn.Module):
 
         gather_index = onset_index[:, :, None, None].expand(-1, -1, 7, 1)
         attributes = output.attribute_raw.gather(-1, gather_index)[..., 0]
-        duration_location = torch.sigmoid(attributes[:, :, 0])
-        wind_location = torch.tanh(attributes[:, :, 2])
-        solar_location = torch.tanh(attributes[:, :, 4])
-        duration_error = self._normal_nll(
-            target[:, :, 2], duration_location, attributes[:, :, 1]
-        )
-        wind_error = self._normal_nll(
-            target[:, :, 3], wind_location, attributes[:, :, 3]
-        )
-        solar_error = self._normal_nll(
-            target[:, :, 4], solar_location, attributes[:, :, 5]
-        )
+        if self.segment_scale_parameterization == "transformed_normal_v2":
+            duration_error = self._transformed_normal_nll(
+                target[:, :, 2],
+                attributes[:, :, 0],
+                attributes[:, :, 1],
+                "duration",
+            )
+            wind_error = self._transformed_normal_nll(
+                target[:, :, 3],
+                attributes[:, :, 2],
+                attributes[:, :, 3],
+                "depth",
+            )
+            solar_error = self._transformed_normal_nll(
+                target[:, :, 4],
+                attributes[:, :, 4],
+                attributes[:, :, 5],
+                "depth",
+            )
+        else:
+            duration_location = torch.sigmoid(attributes[:, :, 0])
+            wind_location = torch.tanh(attributes[:, :, 2])
+            solar_location = torch.tanh(attributes[:, :, 4])
+            duration_error = self._normal_nll(
+                target[:, :, 2], duration_location, attributes[:, :, 1]
+            )
+            wind_error = self._normal_nll(
+                target[:, :, 3], wind_location, attributes[:, :, 3]
+            )
+            solar_error = self._normal_nll(
+                target[:, :, 4], solar_location, attributes[:, :, 5]
+            )
         sync_error = F.binary_cross_entropy_with_logits(
             attributes[:, :, 6], target[:, :, 5].clamp(0.0, 1.0),
             reduction="none",
@@ -649,19 +788,40 @@ class JointSpatioTemporalDecomposedTail(nn.Module):
                 -1,
                 sampled_onset[:, None, :].expand(-1, 7, -1),
             ).transpose(1, 2)
-            def sampled_normal(location: torch.Tensor, raw_scale: torch.Tensor) -> torch.Tensor:
-                scale = F.softplus(raw_scale).clamp(min=0.02, max=0.35)
+            def sampled_normal(
+                location: torch.Tensor,
+                raw_scale: torch.Tensor,
+                attribute: str = "legacy",
+            ) -> torch.Tensor:
+                scale = self.segment_scale(raw_scale, attribute)
                 return location + scale * torch.randn_like(location)
 
-            duration = sampled_normal(
-                torch.sigmoid(gathered[:, :, 0]), gathered[:, :, 1]
-            ).clamp(1.0 / float(self.sequence_length), 1.0)
-            wind = sampled_normal(
-                torch.tanh(gathered[:, :, 2]), gathered[:, :, 3]
-            ).clamp(-1.0, 1.0)
-            solar = sampled_normal(
-                torch.tanh(gathered[:, :, 4]), gathered[:, :, 5]
-            ).clamp(-1.0, 1.0)
+            if self.segment_scale_parameterization == "transformed_normal_v2":
+                duration = torch.sigmoid(
+                    sampled_normal(
+                        gathered[:, :, 0], gathered[:, :, 1], "duration"
+                    )
+                )
+                wind = torch.tanh(
+                    sampled_normal(
+                        gathered[:, :, 2], gathered[:, :, 3], "depth"
+                    )
+                )
+                solar = torch.tanh(
+                    sampled_normal(
+                        gathered[:, :, 4], gathered[:, :, 5], "depth"
+                    )
+                )
+            else:
+                duration = sampled_normal(
+                    torch.sigmoid(gathered[:, :, 0]), gathered[:, :, 1]
+                ).clamp(1.0 / float(self.sequence_length), 1.0)
+                wind = sampled_normal(
+                    torch.tanh(gathered[:, :, 2]), gathered[:, :, 3]
+                ).clamp(-1.0, 1.0)
+                solar = sampled_normal(
+                    torch.tanh(gathered[:, :, 4]), gathered[:, :, 5]
+                ).clamp(-1.0, 1.0)
             synchrony = torch.sigmoid(gathered[:, :, 6])
             hypotheses[:, :, slot, 0] = active.to(forecast.dtype)
             hypotheses[:, :, slot, 1] = sampled_onset.to(forecast.dtype) / float(

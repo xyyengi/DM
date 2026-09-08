@@ -1,0 +1,48 @@
+{
+  "experiment_family": "station24_jstd_msep",
+  "audit_date": "2026-09-08",
+  "audited_source_commit": "e4f5ac3",
+  "working_tree_fix_commit": "see_commit_containing_this_manifest",
+  "overall_status": "CPU_PREFLIGHT_PASSED_CUDA_PENDING",
+  "launch_eligible": false,
+  "checks": {
+    "historical_checkpoint_semantics_preserved": "PASS",
+    "python_syntax_compile": "PASS",
+    "legacy_scale_dead_gradient_reproduced": "PASS",
+    "transformed_scale_runtime_unit_tests": "PASS",
+    "prior_only_optimizer_runtime_test": "PASS",
+    "frozen_renderer_state_runtime_test": "PASS",
+    "fixed_batch_overfit": "PASS",
+    "save_reload": "PASS",
+    "cuda_amp": "NOT RUN",
+    "three_member_generation_smoke": "PASS",
+    "final_sample_slow_fast_ablation": "NOT RUN"
+  },
+  "existing_checkpoint_branch_audit": {
+    "slow_output_nonzero": "PASS",
+    "fast_output_nonzero": "PASS",
+    "slow_gradient_nonzero": "PASS",
+    "fast_gradient_nonzero": "PASS",
+    "slow_fast_cancellation_detected": false,
+    "fast_low12_leakage_fraction_range": [0.209, 0.268],
+    "scope": "label-conditioned offline epsilon forward/backward only"
+  },
+  "blocking_reasons": [
+    "Target-server CUDA/AMP preflight has not been executed.",
+    "No version-locked formal V2 experiment config has been approved.",
+    "Final-sample paired body/slow/fast/full ablation has not been executed."
+  ],
+  "cpu_preflight_evidence": {
+    "environment": "dm_preflight / torch 2.14.0+cpu",
+    "unit_tests": "52 passed (JSTD targets/tail/H1/MSEP plus Station-24 pipeline)",
+    "initial_prior_loss": 2.9808602333068848,
+    "loss_after_10_updates": 2.0419411659240723,
+    "scale_gradient_channels_nonzero": 6,
+    "updated_groups": ["attributes", "count", "encoder", "onset"],
+    "frozen_renderer_unchanged": true,
+    "boundary_atom_check": "PASS",
+    "save_reload": "PASS",
+    "three_member_generation_smoke": "PASS",
+    "report": "outputs_shandong/station24/jstd_msep_v2_local_preflight_20260908/jstd_msep_preflight.json"
+  }
+}

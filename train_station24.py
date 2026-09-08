@@ -289,6 +289,8 @@ def validate(
     sampler_issue_count = 0.0
     body_anchor_sum = 0.0
     body_anchor_count = 0
+    component_sums: dict[str, torch.Tensor] = {}
+    component_weight = 0.0
     for raw_batch in loader:
         batch = move_batch(raw_batch, device)
         batch_size = batch["forecast"].shape[0]
@@ -360,6 +362,15 @@ def validate(
                 body_tail_event_masking=True,
             )
             validation_weight = batch_size if model.use_jstd_tail else support_count
+            if model.use_jstd_tail:
+                for name, value in model.last_loss_components.items():
+                    contribution = value.detach() * validation_weight
+                    component_sums[name] = (
+                        component_sums[name] + contribution
+                        if name in component_sums
+                        else contribution
+                    )
+                component_weight += validation_weight
             total_loss += float(loss) * validation_weight
             total_weight += validation_weight
             target = active
@@ -446,6 +457,14 @@ def validate(
             "val_jstd_objective": objective,
             "val_jstd_event_issue_count": float(tail_event_count),
         }
+        metrics.update(
+            {
+                f"val_component_{name}": float(
+                    total / max(component_weight, 1.0)
+                )
+                for name, total in component_sums.items()
+            }
+        )
         if model.use_jstd_event_hypothesis:
             metrics["val_jstd_oracle_event_fraction"] = float(
                 tail_event_count / max(len(loader.dataset), 1)
@@ -592,10 +611,23 @@ def save_checkpoint(
         "jstd_segment_prior_loss_weight": float(
             model.jstd_segment_prior_loss_weight
         ),
+        "train_jstd_segment_prior_only": bool(
+            model.train_jstd_segment_prior_only
+        ),
+        "jstd_segment_scale_parameterization": (
+            model.denoiser.jstd_tail.segment_scale_parameterization
+            if model.denoiser.jstd_tail is not None
+            else None
+        ),
         "jstd_h1_tail_fraction": float(model.jstd_h1_tail_fraction),
         "jstd_trainable_parameter_names": list(
             model.jstd_trainable_parameter_names
         ),
+        "jstd_optimizer_parameter_names": [
+            name
+            for name, parameter in model.named_parameters()
+            if model.use_jstd_tail and parameter.requires_grad
+        ],
         "use_tail_time_localizer": bool(model.use_tail_time_localizer),
         "train_tail_time_localizer_only": bool(
             model.train_tail_time_localizer_only
@@ -1134,6 +1166,9 @@ def main() -> None:
                     or model.use_jstd_segment_prior
                 ),
                 "causal_segment_prior": bool(model.use_jstd_segment_prior),
+                "train_segment_prior_only": bool(
+                    model.train_jstd_segment_prior_only
+                ),
                 "issue_gate_trainable": not (
                     model.use_jstd_event_hypothesis
                     or model.use_jstd_segment_prior
@@ -1472,7 +1507,11 @@ def main() -> None:
         # Raw is the formal state, but keep EMA internally coherent for audits.
         ema_trainable_state_names = None
     elif model.use_jstd_tail:
-        ema_trainable_state_names = set(model.jstd_new_state_dict_keys)
+        ema_trainable_state_names = set(
+            model.jstd_segment_prior_state_dict_keys
+            if model.train_jstd_segment_prior_only
+            else model.jstd_new_state_dict_keys
+        )
     elif model.use_body_tail_experts:
         ema_trainable_state_names = set(model.body_tail_state_dict_keys)
     else:
@@ -1574,6 +1613,8 @@ def main() -> None:
         sampler_es_batches = 0
         sampler_body_anchor_sum = 0.0
         sampler_body_anchor_count = 0.0
+        component_sums: dict[str, torch.Tensor] = {}
+        component_weight = 0.0
         sampler_score_iterator = (
             iter(sampler_score_loader) if sampler_score_loader is not None else None
         )
@@ -1590,6 +1631,15 @@ def main() -> None:
                     if model.train_tail_time_localizer_only
                     else model(batch)
                 )
+                if model.use_jstd_tail:
+                    for name, value in model.last_loss_components.items():
+                        contribution = value.detach() * batch_size
+                        component_sums[name] = (
+                            component_sums[name] + contribution
+                            if name in component_sums
+                            else contribution
+                        )
+                    component_weight += batch_size
                 loss = base_loss
                 score_parts = None
                 if (
@@ -1692,6 +1742,14 @@ def main() -> None:
             "optimizer_updates": float(optimizer_updates),
             "ema_decay": float(current_ema_decay),
         }
+        row.update(
+            {
+                f"train_component_{name}": float(
+                    total / max(component_weight, 1.0)
+                )
+                for name, total in component_sums.items()
+            }
+        )
         if model.train_sampler_energy_score_only:
             row.update(
                 {
@@ -1820,18 +1878,26 @@ def main() -> None:
             "Tail event-time NLL"
             if model.train_tail_time_localizer_only
             else (
+                "Segment-prior structured NLL"
+                if model.train_jstd_segment_prior_only
+                else (
                 "Tail anchor + final-member Energy Score"
                 if model.train_sampler_energy_score_only
                 else "Fixed-noise epsilon MSE"
+                )
             )
         ),
         title=(
             "Station24 tail time localization"
             if model.train_tail_time_localizer_only
             else (
+                "Station24 causal segment-prior training"
+                if model.train_jstd_segment_prior_only
+                else (
                 "Station24 sampler Energy Score L1"
                 if model.train_sampler_energy_score_only
                 else "Station24 diffusion training"
+                )
             )
         ),
     )
@@ -1877,10 +1943,23 @@ def main() -> None:
         "jstd_segment_prior_loss_weight": float(
             model.jstd_segment_prior_loss_weight
         ),
+        "train_jstd_segment_prior_only": bool(
+            model.train_jstd_segment_prior_only
+        ),
+        "jstd_segment_scale_parameterization": (
+            model.denoiser.jstd_tail.segment_scale_parameterization
+            if model.denoiser.jstd_tail is not None
+            else None
+        ),
         "jstd_h1_tail_fraction": float(model.jstd_h1_tail_fraction),
         "jstd_trainable_parameter_names": list(
             model.jstd_trainable_parameter_names
         ),
+        "jstd_optimizer_parameter_names": [
+            name
+            for name, parameter in model.named_parameters()
+            if model.use_jstd_tail and parameter.requires_grad
+        ],
         "use_tail_time_localizer": bool(model.use_tail_time_localizer),
         "train_tail_time_localizer_only": bool(
             model.train_tail_time_localizer_only
