@@ -646,6 +646,7 @@ class JointSpatioTemporalDecomposedTail(nn.Module):
             + log_inverse_jacobian
         )
 
+    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)
     def segment_prior_loss(
         self,
         forecast: torch.Tensor,
@@ -654,7 +655,13 @@ class JointSpatioTemporalDecomposedTail(nn.Module):
         recent_error: torch.Tensor | None = None,
         recent_error_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Proper structured loss using train/validation labels, never conditions."""
+        """Proper structured loss using train/validation labels, never conditions.
+
+        The distributional NLL is deliberately evaluated in FP32 under CUDA
+        autocast.  Half precision can underflow the bounded scale derivatives,
+        disconnecting duration/depth uncertainty heads while the rest of the
+        mixed-precision model appears to train normally.
+        """
 
         if target.ndim != 3 or target.shape[1:] != (
             self.segment_max_events, 6

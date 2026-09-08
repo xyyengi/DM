@@ -216,7 +216,8 @@ def main() -> None:
             ):
                 raise ValueError(
                     "one or more complete duration/depth scale output channels "
-                    "have zero parameter-gradient norm"
+                    "have zero or non-finite parameter-gradient norm: "
+                    f"{scale_gradient_norm_by_channel}"
                 )
         scaler.step(optimizer)
         scaler.update()
