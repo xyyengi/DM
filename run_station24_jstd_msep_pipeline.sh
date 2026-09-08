@@ -205,6 +205,7 @@ RESULT_AUDIT="${PIPELINE_ROOT}/msep_result_audit"
 "${PYTHON_BIN}" -m tools.audit_station24_jstd_msep_result \
   --raw-result "${BASELINE_RESULT}" --h1-result "${H1_RESULT}" \
   --candidate-result "${FORMAL_RESULT}" --event-eval "${EVENT_EVAL}" \
+  --candidate-label "${MSEP_RESULT_LABEL}" \
   --output-dir "${RESULT_AUDIT}"
 
 ARCHIVE="${OUTPUT_ROOT}/station24_$(basename "${PIPELINE_ROOT}").tar.gz"

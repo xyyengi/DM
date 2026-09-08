@@ -21,6 +21,9 @@ GEN_SEED=${GEN_SEED:-424242}
 ISSUE_BATCH=${ISSUE_BATCH:-2}
 MEMBER_CHUNK=${MEMBER_CHUNK:-500}
 ENERGY_MEMBERS=${ENERGY_MEMBERS:-80}
+MSEP_RUN_FAMILY=${MSEP_RUN_FAMILY:-jstd_msep}
+MSEP_RESULT_VARIANT=${MSEP_RESULT_VARIANT:-geo_history_actual_jstd_msep_causal_raw}
+MSEP_RESULT_LABEL=${MSEP_RESULT_LABEL:-JSTD-MSEP causal}
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -51,7 +54,10 @@ launch_background() {
     OUTPUT_ROOT="${OUTPUT_ROOT}" LOG_ROOT="${LOG_ROOT}" \
     FORMAL_MEMBERS="${FORMAL_MEMBERS}" GEN_SEED="${GEN_SEED}" \
     ISSUE_BATCH="${ISSUE_BATCH}" MEMBER_CHUNK="${MEMBER_CHUNK}" \
-    ENERGY_MEMBERS="${ENERGY_MEMBERS}" CONDA_ENV_NAME="${CONDA_ENV_NAME:-dm_env}" \
+    ENERGY_MEMBERS="${ENERGY_MEMBERS}" MSEP_RUN_FAMILY="${MSEP_RUN_FAMILY}" \
+    MSEP_RESULT_VARIANT="${MSEP_RESULT_VARIANT}" \
+    MSEP_RESULT_LABEL="${MSEP_RESULT_LABEL}" \
+    CONDA_ENV_NAME="${CONDA_ENV_NAME:-dm_env}" \
     bash "$0" > "${log_file}" 2>&1 < /dev/null &
   local pid=$!
   printf '%s\n' "${pid}" > "${pid_file}"
@@ -82,7 +88,7 @@ git diff --cached --quiet || die "staged changes are present; commit/pull first"
 [[ "${GEN_SEED}" -eq 424242 ]] || die "generation seed must remain 424242"
 
 shopt -s nullglob
-candidate_runs=("${PIPELINE_ROOT}"/training/*_station24_jstd_msep_*_seed2027)
+candidate_runs=("${PIPELINE_ROOT}"/training/*_station24_${MSEP_RUN_FAMILY}_*_seed2027)
 shopt -u nullglob
 [[ ${#candidate_runs[@]} -eq 1 ]] || die "expected exactly one JSTD-MSEP training run"
 CANDIDATE_RUN=${candidate_runs[0]}
@@ -116,7 +122,7 @@ fi
 [[ -n "${BASELINE_RESULT}" && -f "${BASELINE_RESULT}/metrics.json" ]] \
   || die "Raw 500-member baseline result not found; pass argument 3"
 
-FORMAL_RESULT="${PIPELINE_ROOT}/validation_results/jstd_msep_causal_raw_val_n${FORMAL_MEMBERS}_seed${GEN_SEED}"
+FORMAL_RESULT="${PIPELINE_ROOT}/validation_results/${MSEP_RUN_FAMILY}_causal_raw_val_n${FORMAL_MEMBERS}_seed${GEN_SEED}"
 if [[ ! -f "${FORMAL_RESULT}/metrics.json" ]]; then
   if [[ -e "${FORMAL_RESULT}" ]]; then
     FORMAL_RESULT="${PIPELINE_ROOT}/validation_results/jstd_msep_causal_raw_val_n${FORMAL_MEMBERS}_seed${GEN_SEED}_resumed_${JOB_STAMP}"
@@ -128,7 +134,7 @@ if [[ ! -f "${FORMAL_RESULT}/metrics.json" ]]; then
     --seed "${GEN_SEED}" --issue-batch-size "${ISSUE_BATCH}" \
     --member-chunk-size "${MEMBER_CHUNK}" --auto-tune-member-chunk \
     --energy-score-member-limit "${ENERGY_MEMBERS}" --checkpoint-state raw \
-    --result-variant geo_history_actual_jstd_msep_causal_raw
+    --result-variant "${MSEP_RESULT_VARIANT}"
 else
   echo "JSTD_MSEP_GENERATION_REUSED result=${FORMAL_RESULT}"
 fi
@@ -140,8 +146,8 @@ COMPARISON="${POST_ROOT}/raw_body_tail_vs_jstd_msep"
   "${BASELINE_RESULT}" "${FORMAL_RESULT}" --data-path "${DATA}" \
   --output-dir "${COMPARISON}" \
   --baseline-variant geo_history_actual_body_tail_moe_raw \
-  --candidate-variant geo_history_actual_jstd_msep_causal_raw \
-  --baseline-label "Raw body-tail" --candidate-label "JSTD-MSEP causal" \
+  --candidate-variant "${MSEP_RESULT_VARIANT}" \
+  --baseline-label "Raw body-tail" --candidate-label "${MSEP_RESULT_LABEL}" \
   --baseline-spatial-levels bottleneck --candidate-spatial-levels bottleneck \
   --baseline-parallel-levels encoder_0 --candidate-parallel-levels encoder_0 \
   --baseline-parallel-adjacency fixed --candidate-parallel-adjacency fixed \
@@ -153,25 +159,26 @@ EVENT_EVAL="${POST_ROOT}/continuous_event_evaluation"
   --baseline "${BASELINE_RESULT}" --candidate "${FORMAL_RESULT}" \
   --candidate-run "${CANDIDATE_RUN}" --data-path "${DATA}" \
   --output-dir "${EVENT_EVAL}" \
-  --baseline-label "Raw body-tail" --candidate-label "JSTD-MSEP causal"
+  --baseline-label "Raw body-tail" --candidate-label "${MSEP_RESULT_LABEL}"
 
 H1_EVENT_EVAL="${POST_ROOT}/h1_upper_bound_comparison"
 "${PYTHON_BIN}" -m tools.evaluate_station24_jstd_events \
   --baseline "${H1_RESULT}" --candidate "${FORMAL_RESULT}" \
   --candidate-run "${CANDIDATE_RUN}" --data-path "${DATA}" \
   --output-dir "${H1_EVENT_EVAL}" \
-  --baseline-label "H1 oracle upper bound" --candidate-label "JSTD-MSEP causal"
+  --baseline-label "H1 oracle upper bound" --candidate-label "${MSEP_RESULT_LABEL}"
 
 TAIL="${POST_ROOT}/extreme_wind_tail"
 "${PYTHON_BIN}" tools/plot_station24_extreme_tail.py \
   --baseline "${BASELINE_RESULT}" --candidate "${FORMAL_RESULT}" \
   --data-path "${DATA}" --output-dir "${TAIL}" --top-issues 5 \
-  --baseline-label "Raw body-tail" --candidate-label "JSTD-MSEP causal"
+  --baseline-label "Raw body-tail" --candidate-label "${MSEP_RESULT_LABEL}"
 
 RESULT_AUDIT="${POST_ROOT}/msep_result_audit"
 "${PYTHON_BIN}" -m tools.audit_station24_jstd_msep_result \
   --raw-result "${BASELINE_RESULT}" --h1-result "${H1_RESULT}" \
   --candidate-result "${FORMAL_RESULT}" --event-eval "${EVENT_EVAL}" \
+  --candidate-label "${MSEP_RESULT_LABEL}" \
   --output-dir "${RESULT_AUDIT}"
 
 ARCHIVE="${OUTPUT_ROOT}/station24_$(basename "${PIPELINE_ROOT}")_finalized_${JOB_STAMP}.tar.gz"

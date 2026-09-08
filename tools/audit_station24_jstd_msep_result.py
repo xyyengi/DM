@@ -18,6 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-result", required=True)
     parser.add_argument("--event-eval", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--candidate-label", default="JSTD-MSEP causal")
     return parser.parse_args()
 
 
@@ -81,12 +82,16 @@ def main() -> None:
         Path(args.event_eval) / "continuous_event_three_standard_summary.csv"
     )
     causal_rows = event_frame[
-        event_frame.variant.eq("JSTD-MSEP causal")
+        event_frame.variant.eq(args.candidate_label)
         & event_frame.scope.eq("independent_physical")
         & event_frame.standard.eq("primary")
     ]
     if causal_rows.empty:
-        raise ValueError("MSEP event evaluation lacks primary independent rows")
+        available = sorted(event_frame.variant.dropna().astype(str).unique())
+        raise ValueError(
+            "MSEP event evaluation lacks primary independent rows for "
+            f"candidate label {args.candidate_label!r}; available={available}"
+        )
 
     metrics = {
         "raw": ordinary_metrics(raw),
