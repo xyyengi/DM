@@ -29,6 +29,17 @@ def move(batch, device):
     return {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
 
+def precision_policy(config, device):
+    """Explicit precision; absent dtype preserves legacy CUDA FP16 behavior."""
+    name=config["train"].get("amp_dtype","float16")
+    if name not in ("float16","bfloat16"):
+        raise ValueError(f"unsupported amp_dtype: {name}")
+    enabled=device=="cuda" and bool(config["train"].get("amp",True))
+    if enabled and name=="bfloat16" and not torch.cuda.is_bf16_supported():
+        raise ValueError("BF16 is required by this config; device does not support it")
+    return enabled,getattr(torch,name),enabled and name=="float16"
+
+
 @lru_cache(maxsize=4)
 def inherited_assets(run, data):
     root=Path(run); manifest=json.loads((root/"graphs/graph_manifest.json").read_text(encoding="utf-8"))
@@ -96,6 +107,8 @@ def preflight(args, config, model, scale):
               "version": model.VERSION, "config_sha256": digest(args.config),
               "fingerprint": evidence_fingerprint(args), "torch_version": torch.__version__}
     try:
+        amp_enabled,amp_dtype,scale_enabled=precision_policy(config,args.device)
+        report["precision"]={"autocast_enabled":amp_enabled,"dtype":str(amp_dtype),"grad_scaler_enabled":scale_enabled}
         ds = loader(args.data, "train", scale, 2, 2027, config).dataset
         for split in ("train", "val"):
             fill = np.load(Path(args.data)/f"{split}_fill_mask.npy")
@@ -116,7 +129,7 @@ def preflight(args, config, model, scale):
         noise = torch.randn(2, 168, 24, device=args.device)
         t = torch.tensor([50, 250], device=args.device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0)
-        scaler = torch.amp.GradScaler(args.device, enabled=args.device == "cuda")
+        scaler = torch.amp.GradScaler(args.device, enabled=scale_enabled)
         before = {k: p.detach().clone() for k, p in model.named_parameters()}
         before_buffers={k:p.detach().clone() for k,p in model.named_buffers()}
         start = time.perf_counter()
@@ -124,7 +137,7 @@ def preflight(args, config, model, scale):
         gradient_seen = set()
         for step in range(12):
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(args.device, enabled=args.device == "cuda"):
+            with torch.amp.autocast(args.device, enabled=amp_enabled, dtype=amp_dtype):
                 loss, _ = model(batch, t, noise)
             if not torch.isfinite(loss):
                 raise ValueError("nonfinite loss")
@@ -133,6 +146,7 @@ def preflight(args, config, model, scale):
             for name, p in model.named_parameters():
                 if p.grad is not None:
                     if not torch.isfinite(p.grad).all():
+                        report["nonfinite_gradient"]={"parameter":name,"step":step,"loss":float(loss.detach()),"scale":scaler.get_scale()}
                         raise ValueError(f"nonfinite gradient: {name}")
                     if p.grad.abs().max() > 0:
                         gradient_seen.add(name)
@@ -232,7 +246,7 @@ def preflight(args, config, model, scale):
             model.train(); optimizer.zero_grad(set_to_none=True)
             torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
             started = time.perf_counter()
-            with torch.amp.autocast("cuda", enabled=config["train"]["amp"]):
+            with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
                 configured_loss, _ = model(configured)
             scaler.scale(configured_loss).backward(); scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
@@ -279,7 +293,8 @@ def train(args, config, model, scale):
     tr = loader(args.data, "train", scale, tc["batch_size"], tc["seed"], config)
     va = loader(args.data, "val", scale, tc["batch_size"], tc["seed"], config)
     optimizer = torch.optim.AdamW(model.parameters(), lr=tc["learning_rate"], weight_decay=tc["weight_decay"])
-    scaler = torch.amp.GradScaler(args.device, enabled=args.device == "cuda" and tc["amp"])
+    amp_enabled,amp_dtype,scale_enabled=precision_policy(config,args.device)
+    scaler = torch.amp.GradScaler(args.device, enabled=scale_enabled)
     history, best, best_epoch = [], float("inf"), 0
     for epoch in range(1, tc["epochs"]+1):
         started = time.perf_counter(); model.train(); optimizer.zero_grad(set_to_none=True)
@@ -288,7 +303,7 @@ def train(args, config, model, scale):
             batch = move(batch, args.device)
             group_start = (j//tc["accumulation"])*tc["accumulation"]
             group_samples = min(tc["accumulation"]*tc["batch_size"], len(tr.dataset)-group_start*tc["batch_size"])
-            with torch.amp.autocast(args.device, enabled=scaler.is_enabled()):
+            with torch.amp.autocast(args.device, enabled=amp_enabled, dtype=amp_dtype):
                 loss, parts = model(batch)
             if not torch.isfinite(loss):
                 raise ValueError("nonfinite training loss")

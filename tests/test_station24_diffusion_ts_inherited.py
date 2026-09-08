@@ -64,11 +64,34 @@ class InheritedJointTests(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(),"target CUDA/AMP NOT RUN on CPU")
     def test_cuda_amp_training(self):
         self.model.cuda().train();batch={k:v.cuda() for k,v in self.batch.items()}
-        with torch.amp.autocast("cuda"):
+        self.assertTrue(torch.cuda.is_bf16_supported(),"BF16 required")
+        with torch.amp.autocast("cuda",dtype=torch.bfloat16):
             loss,_=self.model(batch,torch.tensor([50,250],device="cuda"))
         loss.backward()
         for k,p in self.model.named_parameters():
             self.assertIsNotNone(p.grad,k);self.assertTrue(torch.isfinite(p.grad).all(),k)
+
+    def test_bf16_cpu_backward_and_update(self):
+        # Numeric smoke test only, NOT CUDA certification.
+        self.model.train()
+        opt=torch.optim.AdamW(self.model.parameters(),lr=.001,weight_decay=0)
+        before={k:p.detach().clone() for k,p in self.model.named_parameters()}
+        for _ in range(3):
+            opt.zero_grad()
+            with torch.amp.autocast("cpu",dtype=torch.bfloat16):
+                loss,_=self.model(self.batch,torch.tensor([50,250]))
+            loss.backward()
+            for k,p in self.model.named_parameters():
+                self.assertIsNotNone(p.grad,k);self.assertTrue(torch.isfinite(p.grad).all(),k)
+            opt.step()
+        for k,p in self.model.named_parameters():self.assertFalse(torch.equal(before[k],p),k)
+
+    def test_precision_legacy_and_bf16_policy(self):
+        from unittest.mock import patch
+        from tools.station24_diffusion_ts_experiment import precision_policy
+        self.assertEqual(precision_policy({"train":{"amp":True}},"cuda"),(True,torch.float16,True))
+        with patch("torch.cuda.is_bf16_supported",return_value=True):
+            self.assertEqual(precision_policy({"train":{"amp":True,"amp_dtype":"bfloat16"}},"cuda"),(True,torch.bfloat16,False))
 
 
 if __name__=="__main__":unittest.main()

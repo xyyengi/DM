@@ -2,6 +2,18 @@
 
 日期：2026-09-09。独立配置 `configs/station24_diffusion_ts_joint_inherited_v2.yaml`，模型版本 `diffusion_ts_joint_inherited_v2`。此前的条件较少V1代码和配置保留为后续消融，不覆盖Raw body-tail及历史结果。
 
+## 2026-09-09 CUDA预检溢出修复
+
+当前启动脚本改用独立配置`station24_diffusion_ts_joint_inherited_v2_bf16.yaml`及独立`...v2_bf16_时间戳`输出。原FP16配置保留。模型、条件、损失和采样设置不变；训练显式BF16 autocast，不使用FP16 GradScaler。缺失`amp_dtype`字段继续保持旧FP16行为。设备不支持BF16则停止，不静默回退。
+
+服务器原错误发生于预检`nonfinite gradient: graph_gate`，尚未通过训练许可。首个坏参数不等于根因所在。本机同一真实批次、同一模型初始化和噪声的CPU数值对照：FP32 loss75.487、无坏梯度；FP16×65536 loss75.489、36个坏梯度，首个为graph_gate；FP16×1无坏梯度；BF16×1 loss75.724、无坏梯度。这支持“FP16梯度缩放溢出”的解释，但不替代目标CUDA复现。
+
+参考PyTorch AMP文档：https://docs.pytorch.org/docs/stable/amp 。默认GradScaler初始scale为65536；FP16数值范围可能导致梯度溢出。此次不删有限性检查、不把NaN改成0、不跳过失败更新。
+
+新增CPU BF16反传及实际更新测试，以及旧FP16/BF16精度策略测试；CUDA单测和预检使用与正式训练相同的BF16策略。CPU常规预检仍为FP32，报告明确CUDA NOT RUN；另有CPU BF16专项测试。新服务器日志在`precision`字段记录dtype和GradScaler开关。
+
+修复后本机64项测试：62 PASS、2 CUDA NOT RUN（skip），56.868秒。新配置CPU预检PASS：`outputs_shandong/station24/diffusion_ts_joint_inherited_v2_bf16_preflight_local_01/preflight.json`；目标服务器BF16预检仍NOT RUN，未获免预检启动资格。
+
 ## 模型定义
 
 **没有主体/尾部专家，没有二分类路由，也没有tail成员比例。** 所有成员由同一个全参数可训练模型生成24场站×168小时实际功率。趋势/周期/剩余重构是每条轨迹内部相加的成分，不是三个专家。
