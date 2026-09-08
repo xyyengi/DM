@@ -20,6 +20,10 @@ GEN_SEED=${GEN_SEED:-424242}
 ISSUE_BATCH=${ISSUE_BATCH:-2}
 MEMBER_CHUNK=${MEMBER_CHUNK:-500}
 ENERGY_MEMBERS=${ENERGY_MEMBERS:-80}
+MSEP_CONFIG=${MSEP_CONFIG:-configs/station24_jstd_msep_168h.yaml}
+MSEP_RUN_FAMILY=${MSEP_RUN_FAMILY:-jstd_msep}
+MSEP_RESULT_VARIANT=${MSEP_RESULT_VARIANT:-geo_history_actual_jstd_msep_causal_raw}
+MSEP_RESULT_LABEL=${MSEP_RESULT_LABEL:-JSTD-MSEP causal}
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -50,7 +54,11 @@ launch_background() {
     SOURCE_H1_ROOT="${SOURCE_H1_ROOT}" BASELINE_RESULT="${BASELINE_RESULT}" \
     FORMAL_MEMBERS="${FORMAL_MEMBERS}" GEN_SEED="${GEN_SEED}" \
     ISSUE_BATCH="${ISSUE_BATCH}" MEMBER_CHUNK="${MEMBER_CHUNK}" \
-    ENERGY_MEMBERS="${ENERGY_MEMBERS}" CONDA_ENV_NAME="${CONDA_ENV_NAME:-dm_env}" \
+    ENERGY_MEMBERS="${ENERGY_MEMBERS}" MSEP_CONFIG="${MSEP_CONFIG}" \
+    MSEP_RUN_FAMILY="${MSEP_RUN_FAMILY}" \
+    MSEP_RESULT_VARIANT="${MSEP_RESULT_VARIANT}" \
+    MSEP_RESULT_LABEL="${MSEP_RESULT_LABEL}" \
+    CONDA_ENV_NAME="${CONDA_ENV_NAME:-dm_env}" \
     bash "$0" > "${log_file}" 2>&1 < /dev/null &
   local pid=$!
   printf '%s\n' "${pid}" > "${pid_file}"
@@ -114,7 +122,7 @@ fi
 [[ -n "${BASELINE_RESULT}" && -f "${BASELINE_RESULT}/metrics.json" ]] \
   || die "Raw 500-member baseline result not found; pass argument 2"
 
-PIPELINE_ROOT="${OUTPUT_ROOT}/jstd_msep_${JOB_STAMP}"
+PIPELINE_ROOT="${OUTPUT_ROOT}/${MSEP_RUN_FAMILY}_${JOB_STAMP}"
 TRAIN_ROOT="${PIPELINE_ROOT}/training"
 RESULT_ROOT="${PIPELINE_ROOT}/validation_results"
 PREFLIGHT="${PIPELINE_ROOT}/preflight"
@@ -132,24 +140,24 @@ echo "JSTD_MSEP_PREFLIGHT_START"
   tests.test_station24_jstd_targets tests.test_station24_jstd_tail \
   tests.test_station24_jstd_h1 tests.test_station24_jstd_msep
 "${PYTHON_BIN}" -m tools.audit_station24_jstd_msep_preflight \
-  --config configs/station24_jstd_msep_168h.yaml \
+  --config "${MSEP_CONFIG}" \
   --checkpoint "${SOURCE_CHECKPOINT}" --data-path "${DATA}" \
   --output-dir "${PREFLIGHT}"
 
 echo "JSTD_MSEP_TRAINING_START source_state=h1_raw causal_segment_prior=true"
 "${PYTHON_BIN}" train_station24.py \
-  --config configs/station24_jstd_msep_168h.yaml \
+  --config "${MSEP_CONFIG}" \
   --data-path "${DATA}" --output-root "${TRAIN_ROOT}" \
-  --exp-name "station24_jstd_msep_${JOB_STAMP}" \
+  --exp-name "station24_${MSEP_RUN_FAMILY}_${JOB_STAMP}" \
   --secondary-adjacency "${SECONDARY_ADJACENCY}" \
   --initialize-checkpoint "${SOURCE_CHECKPOINT}"
 
 shopt -s nullglob
-candidate_runs=("${TRAIN_ROOT}"/*_station24_jstd_msep_*_seed2027)
+candidate_runs=("${TRAIN_ROOT}"/*_station24_${MSEP_RUN_FAMILY}_*_seed2027)
 shopt -u nullglob
 [[ ${#candidate_runs[@]} -eq 1 ]] || die "expected exactly one MSEP training run"
 CANDIDATE_RUN=${candidate_runs[0]}
-FORMAL_RESULT="${RESULT_ROOT}/jstd_msep_causal_raw_val_n${FORMAL_MEMBERS}_seed${GEN_SEED}"
+FORMAL_RESULT="${RESULT_ROOT}/${MSEP_RUN_FAMILY}_causal_raw_val_n${FORMAL_MEMBERS}_seed${GEN_SEED}"
 
 echo "JSTD_MSEP_CAUSAL_GENERATION_START members=${FORMAL_MEMBERS} fixed_tail_fraction=0.10"
 "${PYTHON_BIN}" generate_station24.py \
@@ -158,15 +166,15 @@ echo "JSTD_MSEP_CAUSAL_GENERATION_START members=${FORMAL_MEMBERS} fixed_tail_fra
   --seed "${GEN_SEED}" --issue-batch-size "${ISSUE_BATCH}" \
   --member-chunk-size "${MEMBER_CHUNK}" --auto-tune-member-chunk \
   --energy-score-member-limit "${ENERGY_MEMBERS}" --checkpoint-state raw \
-  --result-variant geo_history_actual_jstd_msep_causal_raw
+  --result-variant "${MSEP_RESULT_VARIANT}"
 
 COMPARISON="${PIPELINE_ROOT}/comparisons/raw_body_tail_vs_jstd_msep"
 "${PYTHON_BIN}" tools/compare_station24_multiscale_2a.py \
   "${BASELINE_RESULT}" "${FORMAL_RESULT}" --data-path "${DATA}" \
   --output-dir "${COMPARISON}" \
   --baseline-variant geo_history_actual_body_tail_moe_raw \
-  --candidate-variant geo_history_actual_jstd_msep_causal_raw \
-  --baseline-label "Raw body-tail" --candidate-label "JSTD-MSEP causal" \
+  --candidate-variant "${MSEP_RESULT_VARIANT}" \
+  --baseline-label "Raw body-tail" --candidate-label "${MSEP_RESULT_LABEL}" \
   --baseline-spatial-levels bottleneck --candidate-spatial-levels bottleneck \
   --baseline-parallel-levels encoder_0 --candidate-parallel-levels encoder_0 \
   --baseline-parallel-adjacency fixed --candidate-parallel-adjacency fixed \
@@ -178,20 +186,20 @@ EVENT_EVAL="${PIPELINE_ROOT}/continuous_event_evaluation"
   --baseline "${BASELINE_RESULT}" --candidate "${FORMAL_RESULT}" \
   --candidate-run "${CANDIDATE_RUN}" --data-path "${DATA}" \
   --output-dir "${EVENT_EVAL}" \
-  --baseline-label "Raw body-tail" --candidate-label "JSTD-MSEP causal"
+  --baseline-label "Raw body-tail" --candidate-label "${MSEP_RESULT_LABEL}"
 
 H1_EVENT_EVAL="${PIPELINE_ROOT}/h1_upper_bound_comparison"
 "${PYTHON_BIN}" -m tools.evaluate_station24_jstd_events \
   --baseline "${H1_RESULT}" --candidate "${FORMAL_RESULT}" \
   --candidate-run "${CANDIDATE_RUN}" --data-path "${DATA}" \
   --output-dir "${H1_EVENT_EVAL}" \
-  --baseline-label "H1 oracle upper bound" --candidate-label "JSTD-MSEP causal"
+  --baseline-label "H1 oracle upper bound" --candidate-label "${MSEP_RESULT_LABEL}"
 
 TAIL="${PIPELINE_ROOT}/extreme_wind_tail/raw_body_tail_vs_jstd_msep"
 "${PYTHON_BIN}" tools/plot_station24_extreme_tail.py \
   --baseline "${BASELINE_RESULT}" --candidate "${FORMAL_RESULT}" \
   --data-path "${DATA}" --output-dir "${TAIL}" --top-issues 5 \
-  --baseline-label "Raw body-tail" --candidate-label "JSTD-MSEP causal"
+  --baseline-label "Raw body-tail" --candidate-label "${MSEP_RESULT_LABEL}"
 
 RESULT_AUDIT="${PIPELINE_ROOT}/msep_result_audit"
 "${PYTHON_BIN}" -m tools.audit_station24_jstd_msep_result \
