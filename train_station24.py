@@ -339,9 +339,9 @@ def validate(
             dtype=batch["residual_target"].dtype,
         )
         if model.use_body_tail_experts:
-            if event_replay is None and not model.use_jstd_tail:
+            if event_replay is None and not (model.use_jstd_tail or model.use_joint_multiresidual_tail):
                 raise ValueError("body-tail validation requires train event thresholds")
-            if model.use_jstd_tail:
+            if model.use_jstd_tail or model.use_joint_multiresidual_tail:
                 active = batch["jstd_event_active"]
                 event_window = batch["jstd_event_time_support"]
             else:
@@ -358,11 +358,11 @@ def validate(
                 batch,
                 timestep=timestep,
                 noise=noise,
-                include_auxiliary=model.use_jstd_tail,
+                include_auxiliary=(model.use_jstd_tail or model.use_joint_multiresidual_tail),
                 body_tail_event_masking=True,
             )
-            validation_weight = batch_size if model.use_jstd_tail else support_count
-            if model.use_jstd_tail:
+            validation_weight = batch_size if (model.use_jstd_tail or model.use_joint_multiresidual_tail) else support_count
+            if model.use_jstd_tail or model.use_joint_multiresidual_tail:
                 for name, value in model.last_loss_components.items():
                     contribution = value.detach() * validation_weight
                     component_sums[name] = (
@@ -449,7 +449,7 @@ def validate(
             ),
             "val_tail_event_count": float(tail_event_count),
         }
-    if model.use_jstd_tail:
+    if model.use_jstd_tail or model.use_joint_multiresidual_tail:
         if total_weight <= 0.0 or tail_event_count <= 0:
             raise ValueError("validation split contains no continuous JSTD event")
         objective = total_loss / total_weight
@@ -606,6 +606,18 @@ def save_checkpoint(
         "wind_common_gate_value": model.wind_common_gate_value,
         "use_body_tail_experts": bool(model.use_body_tail_experts),
         "use_jstd_tail": bool(model.use_jstd_tail),
+        "use_joint_multiresidual_tail": bool(model.use_joint_multiresidual_tail),
+        "joint_multiresidual_tail_fraction": float(
+            model.joint_multiresidual_tail_fraction
+        ),
+        "joint_multiresidual_trainable_parameter_names": list(
+            model.joint_multiresidual_trainable_parameter_names
+        ),
+        "joint_multiresidual_optimizer_parameter_names": [
+            name
+            for name, parameter in model.named_parameters()
+            if model.use_joint_multiresidual_tail and parameter.requires_grad
+        ],
         "use_jstd_event_hypothesis": bool(model.use_jstd_event_hypothesis),
         "use_jstd_segment_prior": bool(model.use_jstd_segment_prior),
         "jstd_segment_prior_loss_weight": float(
@@ -842,7 +854,9 @@ def main() -> None:
     jstd_thresholds = None
     train_jstd_targets = None
     val_jstd_targets = None
-    if bool(config["model"].get("use_jstd_tail", False)):
+    if bool(config["model"].get("use_jstd_tail", False)) or bool(
+        config["model"].get("use_joint_multiresidual_tail", False)
+    ):
         if event_replay is not None or event_weighting is not None:
             raise ValueError("JSTD V1 uses its own continuous targets, not legacy replay")
         jstd_thresholds = fit_station_jstd_event_thresholds(
@@ -1110,8 +1124,11 @@ def main() -> None:
         initialization = torch.load(
             initialization_path, map_location="cpu", weights_only=False
         )
-        if model.use_jstd_tail:
+        if model.use_jstd_tail or model.use_joint_multiresidual_tail:
             expected_source_variant = (
+                "geo_history_actual_body_tail_moe"
+                if model.use_joint_multiresidual_tail
+                else
                 "geo_history_actual_jstd_event_hypothesis_h1"
                 if model.use_jstd_segment_prior
                 else
@@ -1128,6 +1145,9 @@ def main() -> None:
             source_state = initialization["model_state_dict"]
             incompatible = model.load_state_dict(source_state, strict=False)
             expected_missing = set(
+                model.joint_multiresidual_new_state_dict_keys
+                if model.use_joint_multiresidual_tail
+                else
                 model.jstd_segment_prior_state_dict_keys
                 if model.use_jstd_segment_prior
                 else model.jstd_hypothesis_state_dict_keys
@@ -1143,10 +1163,16 @@ def main() -> None:
                 raise ValueError(
                     f"unexpected JSTD initialization keys: {sorted(incompatible.unexpected_keys)}"
                 )
-            trainable_names = model.configure_jstd_training()
+            trainable_names = (
+                model.configure_body_tail_training()
+                if model.use_joint_multiresidual_tail
+                else model.configure_jstd_training()
+            )
             initialization_manifest = {
                 "method": (
-                    "h1_renderer_to_causal_multiscale_segment_event_prior"
+                    "raw_body_to_joint_multiresolution_residual_tail_v1"
+                    if model.use_joint_multiresidual_tail
+                    else "h1_renderer_to_causal_multiscale_segment_event_prior"
                     if model.use_jstd_segment_prior
                     else
                     "jstd_v1_to_continuous_event_hypothesis_h1_finetune"
@@ -1172,6 +1198,7 @@ def main() -> None:
                 "issue_gate_trainable": not (
                     model.use_jstd_event_hypothesis
                     or model.use_jstd_segment_prior
+                    or model.use_joint_multiresidual_tail
                 ),
                 "trainable_parameter_names": list(trainable_names),
             }
@@ -1431,7 +1458,7 @@ def main() -> None:
             raise ValueError(
                 "L1 isolates sampler Energy Score and must disable legacy x0 losses"
             )
-    elif not model.use_jstd_tail and (event_replay is None) != (configured_event_x0_weight <= 0.0):
+    elif not (model.use_jstd_tail or model.use_joint_multiresidual_tail) and (event_replay is None) != (configured_event_x0_weight <= 0.0):
         raise ValueError(
             "event replay and positive event x0 loss weights must be enabled together"
         )
@@ -1441,7 +1468,7 @@ def main() -> None:
         raise ValueError(
             "event replay window and event x0 loss window must match"
         )
-    if model.use_body_tail_experts and event_replay is None and not model.use_jstd_tail:
+    if model.use_body_tail_experts and event_replay is None and not (model.use_jstd_tail or model.use_joint_multiresidual_tail):
         raise ValueError("body-tail expert training requires event replay labels")
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     trainable_count = sum(
@@ -1601,6 +1628,14 @@ def main() -> None:
             torch.cuda.synchronize(device)
         train_started = time.perf_counter()
         model.train()
+        if model.use_joint_multiresidual_tail:
+            # The Raw body is a fixed teacher for this experiment. Keeping the
+            # whole module in train mode would activate its Dropout even though
+            # its parameters are frozen, so the tail would chase a moving target.
+            model.eval()
+            if model.denoiser.joint_multiresidual_tail is None:
+                raise RuntimeError("joint multiresidual tail is unavailable")
+            model.denoiser.joint_multiresidual_tail.train()
         total_loss = 0.0
         total_samples = 0
         event_draws = 0
@@ -1621,7 +1656,7 @@ def main() -> None:
         for batch_index, raw_batch in enumerate(train_loader, start=1):
             batch = move_batch(raw_batch, device)
             batch_size = batch["forecast"].shape[0]
-            if model.use_jstd_tail:
+            if model.use_jstd_tail or model.use_joint_multiresidual_tail:
                 event_draws += int(batch["jstd_event_active"].sum().detach().cpu())
             elif event_replay is not None:
                 event_draws += int(batch["event_active"].sum().detach().cpu())
@@ -1631,7 +1666,7 @@ def main() -> None:
                     if model.train_tail_time_localizer_only
                     else model(batch)
                 )
-                if model.use_jstd_tail:
+                if model.use_jstd_tail or model.use_joint_multiresidual_tail:
                     for name, value in model.last_loss_components.items():
                         contribution = value.detach() * batch_size
                         component_sums[name] = (
@@ -1938,6 +1973,18 @@ def main() -> None:
         "state_gate_values": model.state_gate_values,
         "use_body_tail_experts": bool(model.use_body_tail_experts),
         "use_jstd_tail": bool(model.use_jstd_tail),
+        "use_joint_multiresidual_tail": bool(model.use_joint_multiresidual_tail),
+        "joint_multiresidual_tail_fraction": float(
+            model.joint_multiresidual_tail_fraction
+        ),
+        "joint_multiresidual_trainable_parameter_names": list(
+            model.joint_multiresidual_trainable_parameter_names
+        ),
+        "joint_multiresidual_optimizer_parameter_names": [
+            name
+            for name, parameter in model.named_parameters()
+            if model.use_joint_multiresidual_tail and parameter.requires_grad
+        ],
         "use_jstd_event_hypothesis": bool(model.use_jstd_event_hypothesis),
         "use_jstd_segment_prior": bool(model.use_jstd_segment_prior),
         "jstd_segment_prior_loss_weight": float(

@@ -371,6 +371,12 @@ def main() -> None:
         model.use_body_tail_experts
     ):
         raise ValueError("checkpoint body-tail expert mode does not match config")
+    if bool(checkpoint.get("use_joint_multiresidual_tail", False)) != bool(
+        model.use_joint_multiresidual_tail
+    ):
+        raise ValueError(
+            "checkpoint joint multiresidual tail mode does not match config"
+        )
     if bool(checkpoint.get("use_jstd_event_hypothesis", False)) != bool(
         model.use_jstd_event_hypothesis
     ):
@@ -960,6 +966,8 @@ def main() -> None:
             else
             "jstd_tail_epsilon_plus_decomposition_mask_issue_and_structure"
             if model.use_jstd_tail
+            else "joint_multiresolution_wind_solar_residual_tail"
+            if model.use_joint_multiresidual_tail
             else "dynamic_center_residual_diffusion_plus_unified_event_objectives"
             if model.use_forecast_trust_center
             else "transformer_event_transport_plus_tail_epsilon_and_gate_bce"
@@ -1048,6 +1056,13 @@ def main() -> None:
         "wind_common_gate_value": model.wind_common_gate_value,
         "use_body_tail_experts": bool(model.use_body_tail_experts),
         "use_jstd_tail": bool(model.use_jstd_tail),
+        "use_joint_multiresidual_tail": bool(model.use_joint_multiresidual_tail),
+        "joint_multiresidual_tail_fraction": float(
+            model.joint_multiresidual_tail_fraction
+        ),
+        "joint_multiresidual_haar_levels": int(
+            config["model"].get("joint_multiresidual_haar_levels", 3)
+        ),
         "use_jstd_event_hypothesis": bool(model.use_jstd_event_hypothesis),
         "use_jstd_segment_prior": bool(model.use_jstd_segment_prior),
         "jstd_segment_prior_loss_weight": float(
