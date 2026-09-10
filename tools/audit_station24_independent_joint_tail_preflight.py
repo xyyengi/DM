@@ -40,6 +40,10 @@ def parse_args() -> argparse.Namespace:
 
 def batch(device: torch.device, length: int) -> dict[str, torch.Tensor]:
     count = 2
+    time_support = torch.zeros(count, length, device=device)
+    time_support[0, length // 4:length // 2] = 1.0
+    station_support = torch.zeros(count, 24, length, device=device)
+    station_support[0, :13, length // 4:length // 2] = 1.0
     return {
         "residual_target": torch.randn(count, 24, length, device=device),
         "residual": torch.randn(count, 24, length, device=device),
@@ -51,6 +55,10 @@ def batch(device: torch.device, length: int) -> dict[str, torch.Tensor]:
         "recent_error": torch.randn(count, 24, 24, device=device),
         "recent_error_mask": torch.ones(count, 24, 1, device=device),
         "node_state": torch.rand(count, 24, 4, length, device=device),
+        "jstd_event_active": torch.tensor([1.0, 0.0], device=device),
+        "jstd_event_time_support": time_support,
+        "jstd_event_station_support": station_support,
+        "jstd_sample_weight": torch.ones(count, device=device),
     }
 
 
@@ -70,6 +78,19 @@ def main() -> None:
         raise ValueError("independent tail must not contain a body-tail adapter")
     if bool(model_config.get("use_jstd_event_hypothesis", False)):
         raise ValueError("oracle event hypotheses are forbidden")
+    event_balanced_names = (
+        "event_balanced_ramp_loss_weight",
+        "event_balanced_shape_loss_weight",
+        "event_balanced_slow_loss_weight",
+    )
+    event_balanced_v2 = any(float(model_config.get(name, 0.0)) > 0.0 for name in event_balanced_names)
+    if event_balanced_v2:
+        if not all(float(model_config.get(name, 0.0)) > 0.0 for name in event_balanced_names):
+            raise ValueError("V2 requires ramp, shape and slow event-balanced losses together")
+        if float(model_config.get("ramp_auxiliary_loss_weight", 0.0)) != 0.0:
+            raise ValueError("V2 must replace, not stack, the globally averaged ramp loss")
+        if float(model_config.get("tail_multiscale_slow_loss_weight", 0.0)) != 0.0:
+            raise ValueError("V2 must replace, not stack, the globally averaged slow loss")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda" and not args.allow_cpu:
         raise RuntimeError("CUDA is required unless this is explicitly a CPU-only check")
@@ -114,6 +135,11 @@ def main() -> None:
         loss = model(fixed, timestep=torch.tensor([1, 2], device=device), noise=torch.randn(2, 24, int(model_config["sequence_length"]), device=device))
     if not torch.isfinite(loss):
         raise ValueError("nonfinite independent-tail preflight loss")
+    if event_balanced_v2:
+        for name in ("event_balanced_ramp", "event_balanced_shape", "event_balanced_slow"):
+            value = model.diffusion.last_loss_components[name]
+            if not torch.isfinite(value) or float(value) <= 0.0:
+                raise ValueError(f"V2 loss component is nonfinite or zero: {name}")
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
     gradients = {
@@ -200,6 +226,10 @@ def main() -> None:
     restored = torch.load(stream, map_location=device, weights_only=True)
     model.load_state_dict(restored, strict=True)
     # Full configured reverse chain; no reduced-step surrogate.
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize(device)
+    generation_started = time.perf_counter()
     with torch.no_grad():
         torch.manual_seed(424242)
         generated = model.generate(fixed, n_samples=1)
@@ -208,6 +238,9 @@ def main() -> None:
             altered[key] = torch.randn_like(fixed["residual_target"])
         torch.manual_seed(424242)
         regenerated = model.generate(altered, n_samples=1)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    generation_seconds = time.perf_counter() - generation_started
     if not torch.isfinite(generated).all() or not torch.equal(generated, regenerated):
         raise ValueError("generation is nonfinite or depends on future labels")
     report = {
@@ -235,15 +268,27 @@ def main() -> None:
         "loss": float(loss.detach().cpu()),
         "ramp_loss": float(model.diffusion.last_loss_components["ramp"].cpu()),
         "slow_projection_loss": float(model.diffusion.last_loss_components["tail_multiscale_slow"].cpu()),
+        "event_balanced_losses": {
+            name: float(learning[0][name])
+            for name in ("event_balanced_ramp", "event_balanced_shape", "event_balanced_slow")
+        },
         "event_labels_generation_condition": False,
         "causal_generation_invariance": "PASS",
         "synthetic_fixed_batch_learning": learning,
         "real_event_stratified_learning": real_learning,
         "event_sampler_audit": targets.audit,
         "final_event_quality": "NOT RUN",
-        "target_cuda_performance_probe": "NOT RUN",
+        "target_cuda_performance_probe": (
+            {
+                "status": "PASS",
+                "two_full_reverse_chains_seconds": generation_seconds,
+                "peak_memory_gb": torch.cuda.max_memory_allocated(device) / 1024 ** 3,
+            }
+            if device.type == "cuda"
+            else "NOT RUN"
+        ),
         "save_reload_generation": "PASS",
-        "launch_eligible": False,
+        "launch_eligible": device.type == "cuda",
         "formal_500_member_generation": "NOT RUN",
     }
     output = Path(args.output)

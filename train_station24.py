@@ -1652,6 +1652,9 @@ def main() -> None:
         f"correction_loss_weight={model.forecast_correction_loss_weight} "
         f"residual_scaling={residual_scale.get('method', 'per_station_std')} "
         f"ramp_aux_weight={model.diffusion.ramp_auxiliary_loss_weight} "
+        f"event_balanced_weights=({model.diffusion.event_balanced_ramp_loss_weight},"
+        f"{model.diffusion.event_balanced_shape_loss_weight},"
+        f"{model.diffusion.event_balanced_slow_loss_weight}) "
         f"common_event_weight={model.diffusion.wind_common_event_loss_weight} "
         f"event_weighting_method={event_weighting.get('method') if event_weighting else None} "
         f"event_replay_method={event_replay.get('method') if event_replay else None} "
@@ -2170,6 +2173,21 @@ def main() -> None:
         ),
         "tail_multiscale_slow_windows": list(
             model.diffusion.tail_multiscale_slow_windows
+        ),
+        "event_balanced_ramp_loss_weight": float(
+            model.diffusion.event_balanced_ramp_loss_weight
+        ),
+        "event_balanced_ramp_top_fraction": float(
+            model.diffusion.event_balanced_ramp_top_fraction
+        ),
+        "event_balanced_shape_loss_weight": float(
+            model.diffusion.event_balanced_shape_loss_weight
+        ),
+        "event_balanced_slow_loss_weight": float(
+            model.diffusion.event_balanced_slow_loss_weight
+        ),
+        "event_balanced_context_hours": int(
+            model.diffusion.event_balanced_context_hours
         ),
         "ramp_auxiliary_lags": list(model.diffusion.ramp_auxiliary_lags),
         "ramp_auxiliary_lag_weights": list(

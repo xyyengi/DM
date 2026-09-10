@@ -45,6 +45,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--energy-score-member-limit", type=int, default=80)
     parser.add_argument("--body-member-limit", type=int, default=None)
     parser.add_argument("--tail-member-limit", type=int, default=None)
+    parser.add_argument(
+        "--condition-variant",
+        default="independent_joint_tail_v1_mixture",
+    )
+    parser.add_argument(
+        "--family",
+        default="fixed_quota_independent_joint_tail_mixture",
+    )
     return parser.parse_args()
 
 
@@ -160,7 +168,11 @@ def main() -> None:
             "split", "generation_seed", "physical_projection", "architecture",
             "spatial_mode", "spatial_mix_levels", "parallel_spatial_fusion_levels",
             "parallel_spatial_adjacency_mode") if key in metadata[0]},
-        "condition_variant": "independent_joint_tail_v1_mixture",
+        **{key: metadata[1][key] for key in (
+            "parameter_count", "checkpoint_validation_objective",
+            "checkpoint_validation_mse", "checkpoint_validation_objective_type",
+            "checkpoint_epoch") if key in metadata[1]},
+        "condition_variant": str(args.condition_variant),
         "n_samples": total_members,
         "evaluation_member_count": total_members,
         "test_used": False,
@@ -168,7 +180,7 @@ def main() -> None:
         "future_actual_used_as_generation_condition": False,
         "reportable_as_causal_forecast": True,
 
-        "family": "fixed_quota_independent_joint_tail_mixture",
+        "family": str(args.family),
         "body_results": str(body),
         "tail_results": str(tail),
         "body_members": body_members,

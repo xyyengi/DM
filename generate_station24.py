@@ -959,7 +959,14 @@ def main() -> None:
            {"checkpoint_validation_mse": float(checkpoint["val_loss"])}),
         "checkpoint_validation_objective": float(checkpoint["val_loss"]),
         "checkpoint_validation_objective_type": (
-            "independent_joint_tail_epsilon_plus_ramp_and_slow_projection"
+            "independent_joint_tail_epsilon_plus_event_balanced_ramp_shape_and_slow"
+            if model.config.get("independent_joint_tail_training", False)
+            and max(
+                model.diffusion.event_balanced_ramp_loss_weight,
+                model.diffusion.event_balanced_shape_loss_weight,
+                model.diffusion.event_balanced_slow_loss_weight,
+            ) > 0.0
+            else "independent_joint_tail_epsilon_plus_ramp_and_slow_projection"
             if model.config.get("independent_joint_tail_training", False)
             else "h1_oracle_event_hypothesis_jstd_controllability"
             if model.use_jstd_event_hypothesis

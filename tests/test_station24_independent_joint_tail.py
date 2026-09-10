@@ -38,6 +38,10 @@ class IndependentJointTailTests(unittest.TestCase):
     @staticmethod
     def _batch(length=32):
         batch = 2
+        time_support = torch.zeros(batch, length)
+        time_support[0, 8:16] = 1.0
+        station_support = torch.zeros(batch, 24, length)
+        station_support[0, :13, 8:16] = 1.0
         return {
             "residual_target": torch.randn(batch, 24, length),
             "residual": torch.randn(batch, 24, length),
@@ -48,7 +52,20 @@ class IndependentJointTailTests(unittest.TestCase):
             "valid_mask": torch.ones(batch, 24, length),
             "recent_error": torch.randn(batch, 24, 24),
             "recent_error_mask": torch.ones(batch, 24, 1),
+            "jstd_event_active": torch.tensor([1.0, 0.0]),
+            "jstd_event_time_support": time_support,
+            "jstd_event_station_support": station_support,
+            "jstd_sample_weight": torch.ones(batch),
         }
+
+    def _v2_model(self):
+        model = self._model()
+        model.diffusion.ramp_auxiliary_loss_weight = 0.0
+        model.diffusion.tail_multiscale_slow_loss_weight = 0.0
+        model.diffusion.event_balanced_ramp_loss_weight = 0.18
+        model.diffusion.event_balanced_shape_loss_weight = 0.14
+        model.diffusion.event_balanced_slow_loss_weight = 0.10
+        return model
 
     def test_full_joint_model_has_no_legacy_tail_route(self):
         model = self._model()
@@ -138,6 +155,46 @@ class IndependentJointTailTests(unittest.TestCase):
             first = model(batch, timestep=torch.tensor([1, 2]), noise=noise)
             second = model(batch, timestep=torch.tensor([1, 2]), noise=changed)
         self.assertTrue(torch.allclose(first, second, atol=1e-6, rtol=0))
+
+    def test_v2_event_balanced_losses_are_finite_nonzero_and_backpropagate(self):
+        torch.manual_seed(14)
+        model = self._v2_model()
+        loss = model(
+            self._batch(),
+            timestep=torch.tensor([1, 2]),
+            noise=torch.randn(2, 24, 32),
+        )
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        for name in (
+            "event_balanced_ramp",
+            "event_balanced_shape",
+            "event_balanced_slow",
+        ):
+            value = model.diffusion.last_loss_components[name]
+            self.assertTrue(torch.isfinite(value))
+            self.assertGreater(float(value), 0.0)
+        self.assertTrue(all(
+            parameter.grad is not None and torch.isfinite(parameter.grad).all()
+            for parameter in model.parameters() if parameter.requires_grad
+        ))
+
+    def test_v2_requires_training_labels_but_generation_does_not(self):
+        model = self._v2_model().eval()
+        batch = self._batch()
+        missing = dict(batch)
+        del missing["jstd_event_time_support"]
+        with self.assertRaisesRegex(ValueError, "continuous JSTD targets"):
+            model(missing, timestep=torch.tensor([1, 2]), noise=torch.randn(2, 24, 32))
+        with torch.no_grad():
+            torch.manual_seed(15)
+            first = model.generate(batch, 1)
+            batch["jstd_event_active"] = 1.0 - batch["jstd_event_active"]
+            batch["jstd_event_time_support"] = 1.0 - batch["jstd_event_time_support"]
+            batch["jstd_event_station_support"] = 1.0 - batch["jstd_event_station_support"]
+            torch.manual_seed(15)
+            second = model.generate(batch, 1)
+        self.assertTrue(torch.equal(first, second))
 
 
 if __name__ == "__main__":

@@ -2013,6 +2013,21 @@ class StationConditionalResUNet1D(nn.Module):
             wind_capacity / wind_capacity.sum(),
             persistent=False,
         )
+        solar_mask = station_features[:, 1].float()
+        solar_capacity = capacities * solar_mask
+        if solar_capacity.sum() <= 0:
+            raise ValueError("at least one solar station is required")
+        self.register_buffer("solar_station_mask", solar_mask, persistent=False)
+        self.register_buffer(
+            "solar_capacity_weight",
+            solar_capacity / solar_capacity.sum(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "station_capacity_weight",
+            capacities / capacities.sum(),
+            persistent=False,
+        )
         self.use_retrieval_mismatch_expert = bool(
             config.get("use_retrieval_mismatch_expert", False)
         )
@@ -2886,6 +2901,11 @@ class StationGaussianDiffusion(nn.Module):
         jstd_outside_zero_loss_weight: float = 0.0,
         tail_multiscale_slow_loss_weight: float = 0.0,
         tail_multiscale_slow_windows: tuple[int, ...] = (12, 24),
+        event_balanced_ramp_loss_weight: float = 0.0,
+        event_balanced_ramp_top_fraction: float = 0.10,
+        event_balanced_shape_loss_weight: float = 0.0,
+        event_balanced_slow_loss_weight: float = 0.0,
+        event_balanced_context_hours: int = 6,
     ) -> None:
         super().__init__()
         self.denoiser = denoiser
@@ -2932,11 +2952,22 @@ class StationGaussianDiffusion(nn.Module):
         self.tail_multiscale_slow_windows = tuple(
             int(value) for value in tail_multiscale_slow_windows
         )
+        self.event_balanced_ramp_loss_weight = float(event_balanced_ramp_loss_weight)
+        self.event_balanced_ramp_top_fraction = float(event_balanced_ramp_top_fraction)
+        self.event_balanced_shape_loss_weight = float(event_balanced_shape_loss_weight)
+        self.event_balanced_slow_loss_weight = float(event_balanced_slow_loss_weight)
+        self.event_balanced_context_hours = int(event_balanced_context_hours)
         self.last_loss_components: dict[str, torch.Tensor] = {}
         if self.ramp_auxiliary_loss_weight < 0:
             raise ValueError("ramp auxiliary loss weight must be non-negative")
         if self.tail_multiscale_slow_loss_weight < 0:
             raise ValueError("tail multiscale slow loss weight must be non-negative")
+        if min(self.event_balanced_ramp_loss_weight, self.event_balanced_shape_loss_weight, self.event_balanced_slow_loss_weight) < 0:
+            raise ValueError("event-balanced loss weights must be non-negative")
+        if not 0.0 < self.event_balanced_ramp_top_fraction <= 0.5:
+            raise ValueError("event-balanced ramp top fraction must be in (0,0.5]")
+        if not 0 <= self.event_balanced_context_hours <= 24:
+            raise ValueError("event-balanced context hours must be in [0,24]")
         if (
             not self.tail_multiscale_slow_windows
             or any(window <= 1 for window in self.tail_multiscale_slow_windows)
@@ -3122,6 +3153,9 @@ class StationGaussianDiffusion(nn.Module):
             or self.jstd_decomposition_loss_weight > 0
             or self.jstd_structure_loss_weight > 0
             or self.tail_multiscale_slow_loss_weight > 0
+            or self.event_balanced_ramp_loss_weight > 0
+            or self.event_balanced_shape_loss_weight > 0
+            or self.event_balanced_slow_loss_weight > 0
         )
         if not needs_x0:
             self.last_loss_components = {
@@ -3408,6 +3442,139 @@ class StationGaussianDiffusion(nn.Module):
                 len(self.tail_multiscale_slow_windows)
             )
 
+        # V2 keeps one full joint denoiser and changes only how the target is
+        # seen during training.  Continuous event labels never enter generate().
+        event_balanced_ramp_loss = torch.zeros_like(slow_projection_loss)
+        event_balanced_shape_loss = torch.zeros_like(slow_projection_loss)
+        event_balanced_slow_loss = torch.zeros_like(slow_projection_loss)
+        uses_event_balanced = max(
+            self.event_balanced_ramp_loss_weight,
+            self.event_balanced_shape_loss_weight,
+            self.event_balanced_slow_loss_weight,
+        ) > 0.0
+        if uses_event_balanced:
+            if any(value is None for value in (
+                jstd_event_active,
+                jstd_event_time_support,
+                jstd_event_station_support,
+            )):
+                raise ValueError("event-balanced losses require continuous JSTD targets")
+            batch_size, _, length = clean.shape
+            if jstd_event_active.shape != (batch_size,):
+                raise ValueError("jstd_event_active must be [B]")
+            if jstd_event_time_support.shape != (batch_size, length):
+                raise ValueError("jstd_event_time_support must be [B,L]")
+            if jstd_event_station_support.shape != clean.shape:
+                raise ValueError("jstd_event_station_support must be [B,S,L]")
+            active = jstd_event_active.to(clean.dtype)
+            time_support = jstd_event_time_support.to(clean.dtype)
+            station_support = jstd_event_station_support.to(clean.dtype)
+            event_support = torch.maximum(
+                station_support, 0.25 * time_support[:, None, :]
+            ) * active[:, None, None]
+            if self.event_balanced_context_hours > 0:
+                radius = self.event_balanced_context_hours
+                event_context = F.max_pool1d(
+                    event_support,
+                    kernel_size=2 * radius + 1,
+                    stride=1,
+                    padding=radius,
+                )
+            else:
+                event_context = event_support
+
+            # For every station and issuance, retain the largest target ramps
+            # instead of averaging them with all ordinary pairs. Event context
+            # is unioned in so onset/recovery edges remain supervised.
+            if self.event_balanced_ramp_loss_weight > 0:
+                ramp_total = torch.zeros_like(event_balanced_ramp_loss)
+                for lag, lag_weight in zip(
+                    self.ramp_auxiliary_lags, self.ramp_auxiliary_lag_weights
+                ):
+                    predicted_delta = predicted_actual[:, :, lag:] - predicted_actual[:, :, :-lag]
+                    target_delta = target_actual[:, :, lag:] - target_actual[:, :, :-lag]
+                    pair_valid = valid_mask[:, :, lag:] * valid_mask[:, :, :-lag]
+                    magnitude = target_delta.detach().abs().masked_fill(
+                        pair_valid <= 0, float("-inf")
+                    )
+                    top_count = max(
+                        1,
+                        int(math.ceil(magnitude.shape[-1] * self.event_balanced_ramp_top_fraction)),
+                    )
+                    threshold = torch.topk(magnitude, k=top_count, dim=-1).values[..., -1:]
+                    extreme = (magnitude >= threshold).to(clean.dtype) * pair_valid
+                    local_event = torch.maximum(
+                        event_context[:, :, lag:], event_context[:, :, :-lag]
+                    ) * pair_valid
+                    focus = torch.maximum(extreme, local_event) * snr_weight
+                    error = F.smooth_l1_loss(
+                        predicted_delta, target_delta, reduction="none", beta=0.05
+                    )
+                    ramp_total = ramp_total + float(lag_weight) * (
+                        (error * focus).sum() / focus.sum().clamp(min=1.0)
+                    )
+                event_balanced_ramp_loss = ramp_total / float(lag_weight_sum)
+
+            # Half of this term is station-local depth/shape. The other half
+            # explicitly constrains wind, solar and same-member renewable sums.
+            if self.event_balanced_shape_loss_weight > 0:
+                support_weight = event_support * valid_mask * snr_weight
+                point_error = F.smooth_l1_loss(
+                    predicted_actual, target_actual, reduction="none", beta=0.05
+                )
+                station_component = (point_error * support_weight).sum() / (
+                    support_weight.sum().clamp(min=1.0)
+                )
+                system_components = []
+                for source_weight in (
+                    self.denoiser.wind_capacity_weight,
+                    self.denoiser.solar_capacity_weight,
+                    self.denoiser.station_capacity_weight,
+                ):
+                    weight = source_weight.to(clean.dtype)
+                    predicted_system = torch.einsum("s,bst->bt", weight, predicted_actual)
+                    target_system = torch.einsum("s,bst->bt", weight, target_actual)
+                    error = F.smooth_l1_loss(
+                        predicted_system, target_system, reduction="none", beta=0.05
+                    )
+                    system_weight = time_support * active[:, None] * snr_weight[:, 0]
+                    system_components.append(
+                        (error * system_weight).sum()
+                        / system_weight.sum().clamp(min=1.0)
+                    )
+                event_balanced_shape_loss = (
+                    0.5 * station_component
+                    + (0.5 / len(system_components)) * sum(system_components)
+                )
+
+            # The slow objective is restricted to the event plus its recovery
+            # context; it cannot be minimized by improving 168 ordinary hours.
+            if self.event_balanced_slow_loss_weight > 0:
+                slow_total = torch.zeros_like(event_balanced_slow_loss)
+                slow_weight = event_context * valid_mask * snr_weight
+                for window in self.tail_multiscale_slow_windows:
+                    left = window // 2
+                    right = window - 1 - left
+                    predicted_slow = F.avg_pool1d(
+                        F.pad(predicted_actual, (left, right), mode="replicate"),
+                        kernel_size=window,
+                        stride=1,
+                    )
+                    target_slow = F.avg_pool1d(
+                        F.pad(target_actual, (left, right), mode="replicate"),
+                        kernel_size=window,
+                        stride=1,
+                    )
+                    error = F.smooth_l1_loss(
+                        predicted_slow, target_slow, reduction="none", beta=0.05
+                    )
+                    slow_total = slow_total + (error * slow_weight).sum() / (
+                        slow_weight.sum().clamp(min=1.0)
+                    )
+                event_balanced_slow_loss = slow_total / float(
+                    len(self.tail_multiscale_slow_windows)
+                )
+
         common_event_loss = torch.zeros((), device=clean.device, dtype=clean.dtype)
         if self.wind_common_event_loss_weight > 0:
             wind_weight = self.denoiser.wind_capacity_weight.to(clean.dtype)
@@ -3553,6 +3720,9 @@ class StationGaussianDiffusion(nn.Module):
             epsilon_loss
             + self.ramp_auxiliary_loss_weight * ramp_loss
             + self.tail_multiscale_slow_loss_weight * slow_projection_loss
+            + self.event_balanced_ramp_loss_weight * event_balanced_ramp_loss
+            + self.event_balanced_shape_loss_weight * event_balanced_shape_loss
+            + self.event_balanced_slow_loss_weight * event_balanced_slow_loss
             + self.wind_common_event_loss_weight * common_event_loss
             + self.event_x0_magnitude_loss_weight * event_magnitude_loss
             + self.event_x0_timing_loss_weight * event_timing_loss
@@ -3567,6 +3737,9 @@ class StationGaussianDiffusion(nn.Module):
             "epsilon": epsilon_loss.detach(),
             "tail_multiscale_slow": slow_projection_loss.detach(),
             "ramp": ramp_loss.detach(),
+            "event_balanced_ramp": event_balanced_ramp_loss.detach(),
+            "event_balanced_shape": event_balanced_shape_loss.detach(),
+            "event_balanced_slow": event_balanced_slow_loss.detach(),
             "wind_common_event": common_event_loss.detach(),
             "event_magnitude": event_magnitude_loss.detach(),
             "event_timing": event_timing_loss.detach(),
@@ -4338,6 +4511,21 @@ class Station24DiffusionModel(nn.Module):
                 for value in self.config.get(
                     "tail_multiscale_slow_windows", [12, 24]
                 )
+            ),
+            event_balanced_ramp_loss_weight=float(
+                self.config.get("event_balanced_ramp_loss_weight", 0.0)
+            ),
+            event_balanced_ramp_top_fraction=float(
+                self.config.get("event_balanced_ramp_top_fraction", 0.10)
+            ),
+            event_balanced_shape_loss_weight=float(
+                self.config.get("event_balanced_shape_loss_weight", 0.0)
+            ),
+            event_balanced_slow_loss_weight=float(
+                self.config.get("event_balanced_slow_loss_weight", 0.0)
+            ),
+            event_balanced_context_hours=int(
+                self.config.get("event_balanced_context_hours", 6)
             ),
         )
         self.event_selector_loss_weight = float(
