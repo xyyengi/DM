@@ -427,12 +427,17 @@ def validate(
                     body_anchor_sum += float(body_anchor) * batch_size
                     body_anchor_count += batch_size
         else:
+            independent = bool(model.config.get("independent_joint_tail_training", False))
             loss = model(
                 batch,
                 timestep=timestep,
                 noise=noise,
-                include_auxiliary=False,
+                include_auxiliary=independent,
             )
+            if independent:
+                for name, value in model.last_loss_components.items():
+                    component_sums[name] = component_sums.get(name, 0.0) + value.detach() * batch_size
+                component_weight += batch_size
             total_loss += float(loss) * batch_size
             total_weight += batch_size
     if model.train_retrieval_mismatch_only:
@@ -533,7 +538,10 @@ def validate(
                 }
             )
         return objective, details
-    return total_loss / max(total_weight, 1.0), {}
+    return total_loss / max(total_weight, 1.0), {
+        f"val_component_{name}": float(value / max(component_weight, 1.0))
+        for name, value in component_sums.items()
+    }
 
 
 def save_checkpoint(
@@ -605,6 +613,12 @@ def save_checkpoint(
         "state_gate_values": model.state_gate_values,
         "wind_common_gate_value": model.wind_common_gate_value,
         "use_body_tail_experts": bool(model.use_body_tail_experts),
+        "independent_joint_tail_training": bool(
+            model.config.get("independent_joint_tail_training", False)
+        ),
+        "independent_tail_event_sampling_fraction": model.config.get(
+            "independent_tail_event_sampling_fraction"
+        ),
         "use_jstd_tail": bool(model.use_jstd_tail),
         "use_joint_multiresidual_tail": bool(model.use_joint_multiresidual_tail),
         "joint_multiresidual_tail_fraction": float(
@@ -854,16 +868,30 @@ def main() -> None:
     jstd_thresholds = None
     train_jstd_targets = None
     val_jstd_targets = None
+    independent_joint_tail = bool(
+        config["model"].get("independent_joint_tail_training", False)
+    )
     if bool(config["model"].get("use_jstd_tail", False)) or bool(
         config["model"].get("use_joint_multiresidual_tail", False)
-    ):
+    ) or independent_joint_tail:
         if event_replay is not None or event_weighting is not None:
             raise ValueError("JSTD V1 uses its own continuous targets, not legacy replay")
         jstd_thresholds = fit_station_jstd_event_thresholds(
             data_path, config["model"]
         )
         train_jstd_targets = build_station_jstd_target_arrays(
-            data_path, "train", jstd_thresholds
+            data_path,
+            "train",
+            jstd_thresholds,
+            event_sampling_target_fraction=(
+                float(
+                    config["model"].get(
+                        "independent_tail_event_sampling_fraction", 0.60
+                    )
+                )
+                if independent_joint_tail
+                else None
+            ),
         )
         val_jstd_targets = build_station_jstd_target_arrays(
             data_path, "val", jstd_thresholds
@@ -881,6 +909,12 @@ def main() -> None:
                     "training_actual_residual_used_to_construct_hypothesis": bool(
                         config["model"].get("use_jstd_event_hypothesis", False)
                         or config["model"].get("use_jstd_segment_prior", False)
+                    ),
+                    "independent_joint_tail_training": independent_joint_tail,
+                    "target_role": (
+                        "training_only_event_enriched_sampling_labels_never_generation_condition"
+                        if independent_joint_tail
+                        else "special_tail_supervision"
                     ),
                     "validation_actual_residual_role": (
                         "oracle_controllability_upper_bound_and_model_selection_only"
@@ -1440,6 +1474,51 @@ def main() -> None:
             json.dumps(initialization_manifest, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+    elif independent_joint_tail:
+        if args.initialize_checkpoint is None:
+            raise ValueError(
+                "independent joint tail training requires --initialize-checkpoint"
+            )
+        initialization_path = Path(args.initialize_checkpoint)
+        if not initialization_path.is_file():
+            raise FileNotFoundError(
+                f"initialization checkpoint not found: {initialization_path}"
+            )
+        initialization = torch.load(
+            initialization_path, map_location="cpu", weights_only=False
+        )
+        source_state = initialization.get("model_state_dict")
+        if not isinstance(source_state, Mapping):
+            raise ValueError("initialization checkpoint lacks model_state_dict")
+        target_state = model.state_dict()
+        compatible = {
+            key: value
+            for key, value in source_state.items()
+            if key in target_state and tuple(value.shape) == tuple(target_state[key].shape)
+        }
+        missing = sorted(set(target_state).difference(compatible))
+        if missing:
+            raise ValueError(
+                "independent tail initialization must load every shared Raw-body "
+                f"state tensor; missing={missing}"
+            )
+        model.load_state_dict(compatible, strict=True)
+        initialization_manifest = {
+            "method": "raw_body_initialization_then_full_independent_joint_tail_finetune",
+            "checkpoint": str(initialization_path),
+            "checkpoint_state_source": "raw",
+            "source_condition_variant": str(initialization.get("condition_variant")),
+            "source_epoch": int(initialization.get("epoch", -1)),
+            "body_checkpoint_preserved_as_separate_formal_baseline": True,
+            "new_model_is_a_full_trainable_independent_joint_wind_solar_diffusion_expert": True,
+            "legacy_body_tail_modules_not_loaded": True,
+            "event_labels_generation_condition": False,
+            "event_labels_training_role": "event_enriched_sampling_only",
+        }
+        (run_dir / "independent_joint_tail_initialization.json").write_text(
+            json.dumps(initialization_manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     elif args.initialize_checkpoint is not None:
         raise ValueError(
             "--initialize-checkpoint is reserved for parameter-isolated experts"
@@ -1458,7 +1537,11 @@ def main() -> None:
             raise ValueError(
                 "L1 isolates sampler Energy Score and must disable legacy x0 losses"
             )
-    elif not (model.use_jstd_tail or model.use_joint_multiresidual_tail) and (event_replay is None) != (configured_event_x0_weight <= 0.0):
+    elif not (
+        model.use_jstd_tail
+        or model.use_joint_multiresidual_tail
+        or independent_joint_tail
+    ) and (event_replay is None) != (configured_event_x0_weight <= 0.0):
         raise ValueError(
             "event replay and positive event x0 loss weights must be enabled together"
         )
@@ -1656,7 +1739,7 @@ def main() -> None:
         for batch_index, raw_batch in enumerate(train_loader, start=1):
             batch = move_batch(raw_batch, device)
             batch_size = batch["forecast"].shape[0]
-            if model.use_jstd_tail or model.use_joint_multiresidual_tail:
+            if model.use_jstd_tail or model.use_joint_multiresidual_tail or independent_joint_tail:
                 event_draws += int(batch["jstd_event_active"].sum().detach().cpu())
             elif event_replay is not None:
                 event_draws += int(batch["event_active"].sum().detach().cpu())
@@ -1666,7 +1749,7 @@ def main() -> None:
                     if model.train_tail_time_localizer_only
                     else model(batch)
                 )
-                if model.use_jstd_tail or model.use_joint_multiresidual_tail:
+                if model.use_jstd_tail or model.use_joint_multiresidual_tail or independent_joint_tail:
                     for name, value in model.last_loss_components.items():
                         contribution = value.detach() * batch_size
                         component_sums[name] = (
@@ -2081,6 +2164,12 @@ def main() -> None:
         ),
         "ramp_auxiliary_loss_weight": float(
             model.diffusion.ramp_auxiliary_loss_weight
+        ),
+        "tail_multiscale_slow_loss_weight": float(
+            model.diffusion.tail_multiscale_slow_loss_weight
+        ),
+        "tail_multiscale_slow_windows": list(
+            model.diffusion.tail_multiscale_slow_windows
         ),
         "ramp_auxiliary_lags": list(model.diffusion.ramp_auxiliary_lags),
         "ramp_auxiliary_lag_weights": list(

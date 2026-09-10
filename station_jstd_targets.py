@@ -184,6 +184,7 @@ def build_station_jstd_target_arrays(
     data_dir: str | Path,
     split: str,
     thresholds: Mapping[str, object],
+    event_sampling_target_fraction: float | None = None,
 ) -> JSTDTargetArrays:
     """Apply train-fitted thresholds to one split and retain actual duration."""
 
@@ -425,9 +426,32 @@ def build_station_jstd_target_arrays(
             )
 
     event_active = (time_support.max(axis=1) > 0).astype(np.float32)
-    # Moderate replay only changes how often event-bearing issuance windows are
-    # drawn. The per-sample inverse weight still calibrates issue-level gates.
-    sample_weights = 1.0 + 2.0 * event_active
+    # These weights are a *training sampler* choice, never a condition.  For
+    # an independent tail expert we explicitly set the observed event-window
+    # fraction; ordinary models retain the historical moderate 3:1 replay.
+    if event_sampling_target_fraction is None:
+        sample_weights = 1.0 + 2.0 * event_active
+        sampling_method = "legacy_moderate_event_replay_3_to_1"
+        achieved_fraction = None
+    else:
+        target_fraction = float(event_sampling_target_fraction)
+        if not 0.0 < target_fraction < 1.0:
+            raise ValueError("event_sampling_target_fraction must be in (0,1)")
+        positive_count = int(event_active.sum())
+        negative_count = int(sample_count - positive_count)
+        if positive_count == 0 or negative_count == 0:
+            raise ValueError(
+                "cannot set an event-enriched sampler without both event and non-event windows"
+            )
+        event_weight = (
+            target_fraction * float(negative_count)
+            / ((1.0 - target_fraction) * float(positive_count))
+        )
+        sample_weights = np.where(event_active > 0, event_weight, 1.0)
+        achieved_fraction = float(
+            sample_weights[event_active > 0].sum() / sample_weights.sum()
+        )
+        sampling_method = "explicit_event_window_fraction"
     durations = np.asarray(
         [row["actual_duration_hours"] for row in catalog], dtype=np.float64
     )
@@ -449,6 +473,9 @@ def build_station_jstd_target_arrays(
         "contains_sub_6h_events": bool(np.any(durations < 6)) if durations.size else False,
         "fixed_duration_event_classes": False,
         "future_actual_used_as_condition": False,
+        "sampling_method": sampling_method,
+        "event_sampling_target_fraction": event_sampling_target_fraction,
+        "event_sampling_achieved_fraction": achieved_fraction,
         "h1_event_hypothesis_dimension": 6,
         "h1_event_hypothesis_fields": [
             "active",

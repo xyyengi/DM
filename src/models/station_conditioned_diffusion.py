@@ -2884,6 +2884,8 @@ class StationGaussianDiffusion(nn.Module):
         jstd_issue_loss_weight: float = 0.0,
         jstd_structure_loss_weight: float = 0.0,
         jstd_outside_zero_loss_weight: float = 0.0,
+        tail_multiscale_slow_loss_weight: float = 0.0,
+        tail_multiscale_slow_windows: tuple[int, ...] = (12, 24),
     ) -> None:
         super().__init__()
         self.denoiser = denoiser
@@ -2924,9 +2926,22 @@ class StationGaussianDiffusion(nn.Module):
         self.jstd_outside_zero_loss_weight = float(
             jstd_outside_zero_loss_weight
         )
+        self.tail_multiscale_slow_loss_weight = float(
+            tail_multiscale_slow_loss_weight
+        )
+        self.tail_multiscale_slow_windows = tuple(
+            int(value) for value in tail_multiscale_slow_windows
+        )
         self.last_loss_components: dict[str, torch.Tensor] = {}
         if self.ramp_auxiliary_loss_weight < 0:
             raise ValueError("ramp auxiliary loss weight must be non-negative")
+        if self.tail_multiscale_slow_loss_weight < 0:
+            raise ValueError("tail multiscale slow loss weight must be non-negative")
+        if (
+            not self.tail_multiscale_slow_windows
+            or any(window <= 1 for window in self.tail_multiscale_slow_windows)
+        ):
+            raise ValueError("tail multiscale slow windows must contain values > 1")
         if self.wind_common_event_loss_weight < 0:
             raise ValueError("wind common event loss weight must be non-negative")
         if min(
@@ -3106,6 +3121,7 @@ class StationGaussianDiffusion(nn.Module):
             or self.event_x0_sync_loss_weight > 0
             or self.jstd_decomposition_loss_weight > 0
             or self.jstd_structure_loss_weight > 0
+            or self.tail_multiscale_slow_loss_weight > 0
         )
         if not needs_x0:
             self.last_loss_components = {
@@ -3352,6 +3368,46 @@ class StationGaussianDiffusion(nn.Module):
                 ramp_loss = ramp_loss + float(lag_weight) * current
             ramp_loss = ramp_loss / float(lag_weight_sum)
 
+        # The independent tail is a complete diffusion expert, rather than an
+        # additive slow/fast adapter.  These are output-space constraints only:
+        # 1/3/6 h ramp loss preserves fast changes above, while 12/24 h moving
+        # projections make sustained depth, duration, and recovery visible to
+        # the same denoiser.  They are not generation-time conditions.
+        slow_projection_loss = torch.zeros(
+            (), device=clean.device, dtype=clean.dtype
+        )
+        if self.tail_multiscale_slow_loss_weight > 0:
+            for window in self.tail_multiscale_slow_windows:
+                if window >= clean.shape[-1]:
+                    raise ValueError(
+                        f"tail multiscale slow window={window} exceeds sequence length"
+                    )
+                left = window // 2
+                right = window - 1 - left
+                predicted_slow = F.avg_pool1d(
+                    F.pad(predicted_actual * valid_mask, (left, right), mode="replicate"),
+                    kernel_size=window,
+                    stride=1,
+                )
+                target_slow = F.avg_pool1d(
+                    F.pad(target_actual * valid_mask, (left, right), mode="replicate"),
+                    kernel_size=window,
+                    stride=1,
+                )
+                support = F.avg_pool1d(
+                    F.pad(valid_mask, (left, right), mode="replicate"),
+                    kernel_size=window, stride=1,
+                ).clamp(min=1e-6)
+                error = F.smooth_l1_loss(
+                    predicted_slow / support, target_slow / support, reduction="none", beta=0.05
+                )
+                slow_projection_loss = slow_projection_loss + (
+                    error * valid_mask * snr_weight
+                ).sum() / (valid_mask * snr_weight).sum().clamp(min=1.0)
+            slow_projection_loss = slow_projection_loss / float(
+                len(self.tail_multiscale_slow_windows)
+            )
+
         common_event_loss = torch.zeros((), device=clean.device, dtype=clean.dtype)
         if self.wind_common_event_loss_weight > 0:
             wind_weight = self.denoiser.wind_capacity_weight.to(clean.dtype)
@@ -3496,6 +3552,7 @@ class StationGaussianDiffusion(nn.Module):
         total_loss = (
             epsilon_loss
             + self.ramp_auxiliary_loss_weight * ramp_loss
+            + self.tail_multiscale_slow_loss_weight * slow_projection_loss
             + self.wind_common_event_loss_weight * common_event_loss
             + self.event_x0_magnitude_loss_weight * event_magnitude_loss
             + self.event_x0_timing_loss_weight * event_timing_loss
@@ -3508,6 +3565,7 @@ class StationGaussianDiffusion(nn.Module):
         )
         self.last_loss_components = {
             "epsilon": epsilon_loss.detach(),
+            "tail_multiscale_slow": slow_projection_loss.detach(),
             "ramp": ramp_loss.detach(),
             "wind_common_event": common_event_loss.detach(),
             "event_magnitude": event_magnitude_loss.detach(),
@@ -4271,6 +4329,15 @@ class Station24DiffusionModel(nn.Module):
             ),
             jstd_outside_zero_loss_weight=float(
                 self.config.get("jstd_outside_zero_loss_weight", 0.0)
+            ),
+            tail_multiscale_slow_loss_weight=float(
+                self.config.get("tail_multiscale_slow_loss_weight", 0.0)
+            ),
+            tail_multiscale_slow_windows=tuple(
+                int(value)
+                for value in self.config.get(
+                    "tail_multiscale_slow_windows", [12, 24]
+                )
             ),
         )
         self.event_selector_loss_weight = float(

@@ -955,10 +955,13 @@ def main() -> None:
         "run_dir": str(run_dir),
         "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": int(checkpoint["epoch"]),
-        "checkpoint_validation_mse": float(checkpoint["val_loss"]),
+        **({} if model.config.get("independent_joint_tail_training", False) else
+           {"checkpoint_validation_mse": float(checkpoint["val_loss"])}),
         "checkpoint_validation_objective": float(checkpoint["val_loss"]),
         "checkpoint_validation_objective_type": (
-            "h1_oracle_event_hypothesis_jstd_controllability"
+            "independent_joint_tail_epsilon_plus_ramp_and_slow_projection"
+            if model.config.get("independent_joint_tail_training", False)
+            else "h1_oracle_event_hypothesis_jstd_controllability"
             if model.use_jstd_event_hypothesis
             else
             "causal_multiscale_segment_prior_plus_jstd_slow_fast_objectives"
