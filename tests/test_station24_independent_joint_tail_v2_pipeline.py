@@ -24,6 +24,14 @@ class IndependentJointTailV2PipelineTests(unittest.TestCase):
         self.assertIn("state=failed", script)
         self.assertIn("Monitor: tail -f", script)
 
+    def test_resume_never_retrains_or_regenerates(self):
+        script = Path("run_station24_independent_joint_tail_v2_resume.sh").read_text(encoding="utf-8")
+        self.assertNotIn("train_station24.py", script)
+        self.assertNotIn("generate_station24.py", script)
+        self.assertIn("postprocess_resume_", script)
+        self.assertIn("RESULT_SUMMARY.md", script)
+        self.assertIn("tar -czf", script)
+
 
 if __name__ == "__main__":
     unittest.main()

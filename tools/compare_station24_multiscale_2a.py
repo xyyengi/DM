@@ -65,6 +65,16 @@ def nested(metrics: dict, *keys: str) -> float:
     return float(value)
 
 
+def checkpoint_validation_objective(run: dict) -> float:
+    """Read compound objectives without eagerly requiring the legacy MSE key."""
+    value = run.get("checkpoint_validation_objective")
+    if value is None:
+        value = run.get("checkpoint_validation_mse")
+    if value is None:
+        raise ValueError("result metadata lacks a checkpoint validation objective")
+    return float(value)
+
+
 def load_results(
     paths: list[str] | tuple[str, ...],
     expected_baseline_levels: list[str],
@@ -153,12 +163,7 @@ def build_summary(results: dict[str, dict]) -> pd.DataFrame:
             "variant": variant,
             "label": LABELS[variant],
             "parameter_count": int(run["parameter_count"]),
-            "validation_objective": float(
-                run.get(
-                    "checkpoint_validation_objective",
-                    run["checkpoint_validation_mse"],
-                )
-            ),
+            "validation_objective": checkpoint_validation_objective(run),
             "validation_objective_type": str(
                 run.get("checkpoint_validation_objective_type", "legacy_unknown")
             ),
