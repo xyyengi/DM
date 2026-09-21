@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Sampling-only mechanism ablation. Reuses the audited V2 pipeline and changes only the declared factor.
+set -euo pipefail
+
+export CONFIG=configs/station24_independent_joint_tail_v2_sampling_only_168h.yaml
+export EXP_NAME=independent_joint_tail_v2_sampling_only_seed2027
+export RESULT_VARIANT=independent_joint_tail_v2_sampling_only_raw
+export CONDITION_VARIANT=independent_joint_tail_v2_sampling_only_mixture
+export RESULT_FAMILY=fixed_quota_independent_joint_tail_v2_sampling_only
+export CANDIDATE_LABEL="Independent sampling-only"
+export COMPARISON_SLUG=raw_body_vs_independent_sampling_only
+
+exec bash run_station24_independent_joint_tail_v2_pipeline.sh "$@"

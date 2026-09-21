@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export CONFIG=configs/station24_independent_joint_tail_v2_auxiliary_only_168h.yaml
+export EXP_NAME=independent_joint_tail_v2_auxiliary_only_seed2027
+export RESULT_VARIANT=independent_joint_tail_v2_auxiliary_only_raw
+export CONDITION_VARIANT=independent_joint_tail_v2_auxiliary_only_mixture
+export RESULT_FAMILY=fixed_quota_independent_joint_tail_v2_auxiliary_only
+export CANDIDATE_LABEL="Independent auxiliary-only"
+export COMPARISON_SLUG=raw_body_vs_independent_auxiliary_only
+exec bash run_station24_independent_joint_tail_v2_pipeline.sh "$@"
