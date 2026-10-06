@@ -1,0 +1,12 @@
+run_id,architecture,trainable_parameters,event_sampling_fraction,ramp_selector,lambda_ramp,lambda_shape,lambda_slow,status,direct_search_point,role,reason
+raw_body_tail,Raw historical-spatial body,NA,natural,NA,0,0,0,complete,no,body_reference,No separately trained external Tail
+independent_tail_v1,Full Independent Tail V1,772290,0.60,legacy_global,0.06,NA,0.08,complete,no,historical_reference,Different auxiliary definitions and V1 recipe
+full_v2,Full Independent Tail V2,772290,0.60,legacy_event_balanced,0.18,0.14,0.10,complete,no,extreme_capability_reference,Different architecture and parameter space
+sampling_only_fixed,Full Independent Tail V2,772290,0.60,legacy_event_balanced,0,0,0,complete,no,mechanism_reference,Shows event sampling without auxiliaries
+auxiliary_only_fixed,Full Independent Tail V2,772290,natural,legacy_event_balanced,0.18,0.14,0.10,complete,no,mechanism_reference,Sampling differs from locked search recipe
+lightweight_fair_control,Lightweight External Joint Tail,20588,0.60,legacy_event_balanced,0.18,0.14,0.10,complete,yes,current_control,Exact architecture sampler selector and objective family for proposed search
+lightweight_ramp_selection,Lightweight External Joint Tail,20588,0.60,source_direction_daylight_pooled_v1,0.18,0.14,0.10,complete,no,selector_ablation_reference,Ramp supervision set changed so it is not a lambda-only point
+joint_multiresidual_v1,Lightweight Joint Multiresidual Tail,20588,NA,legacy,0,0,NA,complete,no,historical_reference,Uses decomposition structure and outside-identity losses
+jstd_tail_v1,JSTD Tail,NA,NA,NA,0,0,0,complete,no,historical_reference,Different architecture and decomposition/mask/issue objectives
+protected_partial,Raw late-decoder Partial,30144,0.60,existing_recipe,0.18,0.14,0.10,preflight_STOP,no,gradient_scale_reference,No training or generated members; preservation route stopped
+

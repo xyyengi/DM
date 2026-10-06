@@ -955,11 +955,13 @@ def main() -> None:
         "run_dir": str(run_dir),
         "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": int(checkpoint["epoch"]),
-        **({} if model.config.get("independent_joint_tail_training", False) else
+        **({} if model.config.get("independent_joint_tail_training", False) or model.lightweight_v2 else
            {"checkpoint_validation_mse": float(checkpoint["val_loss"])}),
         "checkpoint_validation_objective": float(checkpoint["val_loss"]),
         "checkpoint_validation_objective_type": (
-            "independent_joint_tail_epsilon_plus_event_balanced_ramp_shape_and_slow"
+            "lightweight_joint_tail_v2_all_valid_epsilon_plus_event_balanced_ramp_shape_slow"
+            if model.lightweight_v2
+            else "independent_joint_tail_epsilon_plus_event_balanced_ramp_shape_and_slow"
             if model.config.get("independent_joint_tail_training", False)
             and max(
                 model.diffusion.event_balanced_ramp_loss_weight,

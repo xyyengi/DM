@@ -185,6 +185,7 @@ def build_station_jstd_target_arrays(
     split: str,
     thresholds: Mapping[str, object],
     event_sampling_target_fraction: float | None = None,
+    natural_sampling: bool = False,
 ) -> JSTDTargetArrays:
     """Apply train-fitted thresholds to one split and retain actual duration."""
 
@@ -429,7 +430,11 @@ def build_station_jstd_target_arrays(
     # These weights are a *training sampler* choice, never a condition.  For
     # an independent tail expert we explicitly set the observed event-window
     # fraction; ordinary models retain the historical moderate 3:1 replay.
-    if event_sampling_target_fraction is None:
+    if natural_sampling:
+        sample_weights = np.ones(sample_count, dtype=np.float64)
+        sampling_method = "natural_shuffle_without_replacement"
+        achieved_fraction = float(event_active.mean())
+    elif event_sampling_target_fraction is None:
         sample_weights = 1.0 + 2.0 * event_active
         sampling_method = "legacy_moderate_event_replay_3_to_1"
         achieved_fraction = None

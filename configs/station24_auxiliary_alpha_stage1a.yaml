@@ -1,0 +1,23 @@
+protocol_version: auxiliary_alpha_stage1a_frozen_20261006
+base_config: configs/station24_lightweight_joint_tail_v2_fair_168h.yaml
+architecture: lightweight_external_joint_tail
+current_control:
+  alpha: 1.0
+  weights: [0.180, 0.140, 0.100]
+  action: reuse_existing_run
+candidates:
+  - alpha: 0.65
+    weights: [0.117, 0.091, 0.065]
+  - alpha: 1.35
+    weights: [0.243, 0.189, 0.135]
+fixed:
+  event_sampling_fraction: 0.60
+  training_seed: 2027
+  validation_seed: 314159
+  generation_seed: 424242
+  body_members: 400
+  tail_members: 100
+  split: val
+test_locked: true
+stage1b_authorized: false
+

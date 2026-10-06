@@ -1,0 +1,5 @@
+scenario,existing_runs_reused,new_alpha_runs,new_relative_runs,new_seed_confirmation_runs,total_new_training_runs,estimated_training_gpu_hours,estimated_generation_gpu_hours,estimated_cpu_evaluation_hours,decision
+recommended_single_finalist,1,2,4,2,8,6.0,1.3-2.0,4-12,recommended
+two_indistinguishable_finalists,1,2,4,4,10,7.5,1.7-2.5,5-15,hard_cap_if_bootstrap_tie
+cost_only_12_run_case,1,2,4,6,12,9.0,2.0-3.0,6-18,not_planned
+
