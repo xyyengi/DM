@@ -1959,6 +1959,7 @@ class StationConditionalResUNet1D(nn.Module):
         self.use_joint_multiresidual_tail = bool(
             config.get("use_joint_multiresidual_tail", False)
         )
+        self.lightweight_v2 = config.get("joint_multiresidual_training_version", "legacy_v1") == "v2_fair_v1"
         if self.use_joint_multiresidual_tail and not self.use_body_tail_experts:
             raise ValueError("joint multiresidual tail requires body-tail interface")
         if self.use_jstd_tail and self.use_joint_multiresidual_tail:
@@ -2903,6 +2904,7 @@ class StationGaussianDiffusion(nn.Module):
         tail_multiscale_slow_windows: tuple[int, ...] = (12, 24),
         event_balanced_ramp_loss_weight: float = 0.0,
         event_balanced_ramp_top_fraction: float = 0.10,
+        event_balanced_ramp_selection_version: str = "legacy_abs_topk_v1",
         event_balanced_shape_loss_weight: float = 0.0,
         event_balanced_slow_loss_weight: float = 0.0,
         event_balanced_context_hours: int = 6,
@@ -2954,6 +2956,9 @@ class StationGaussianDiffusion(nn.Module):
         )
         self.event_balanced_ramp_loss_weight = float(event_balanced_ramp_loss_weight)
         self.event_balanced_ramp_top_fraction = float(event_balanced_ramp_top_fraction)
+        self.event_balanced_ramp_selection_version = str(
+            event_balanced_ramp_selection_version
+        )
         self.event_balanced_shape_loss_weight = float(event_balanced_shape_loss_weight)
         self.event_balanced_slow_loss_weight = float(event_balanced_slow_loss_weight)
         self.event_balanced_context_hours = int(event_balanced_context_hours)
@@ -2966,6 +2971,14 @@ class StationGaussianDiffusion(nn.Module):
             raise ValueError("event-balanced loss weights must be non-negative")
         if not 0.0 < self.event_balanced_ramp_top_fraction <= 0.5:
             raise ValueError("event-balanced ramp top fraction must be in (0,0.5]")
+        if self.event_balanced_ramp_selection_version not in {
+            "legacy_abs_topk_v1",
+            "source_direction_daylight_pooled_v1",
+        }:
+            raise ValueError(
+                "unknown event-balanced ramp selection version: "
+                f"{self.event_balanced_ramp_selection_version}"
+            )
         if not 0 <= self.event_balanced_context_hours <= 24:
             raise ValueError("event-balanced context hours must be in [0,24]")
         if (
@@ -3008,7 +3021,7 @@ class StationGaussianDiffusion(nn.Module):
                 and self.jstd_issue_loss_weight <= 0
             ):
                 raise ValueError("JSTD V1 requires the issue-gate loss")
-        if self.denoiser.use_joint_multiresidual_tail:
+        if self.denoiser.use_joint_multiresidual_tail and not self.denoiser.lightweight_v2:
             if min(
                 self.jstd_decomposition_loss_weight,
                 self.jstd_structure_loss_weight,
@@ -3056,6 +3069,7 @@ class StationGaussianDiffusion(nn.Module):
         calendar: torch.Tensor,
         lead: torch.Tensor,
         valid_mask: torch.Tensor,
+        daylight_mask: torch.Tensor | None = None,
         forecast_ramps: torch.Tensor | None = None,
         forecast_revision: torch.Tensor | None = None,
         revision_mask: torch.Tensor | None = None,
@@ -3186,7 +3200,7 @@ class StationGaussianDiffusion(nn.Module):
         jstd_issue_loss = torch.zeros_like(jstd_decomposition_loss)
         jstd_structure_loss = torch.zeros_like(jstd_decomposition_loss)
         jstd_outside_zero_loss = torch.zeros_like(jstd_decomposition_loss)
-        if self.denoiser.use_jstd_tail or self.denoiser.use_joint_multiresidual_tail:
+        if (self.denoiser.use_jstd_tail or self.denoiser.use_joint_multiresidual_tail) and not self.denoiser.lightweight_v2:
             if jstd_output is None:
                 raise RuntimeError("special-tail outputs are unavailable")
             tail_module = (
@@ -3218,6 +3232,15 @@ class StationGaussianDiffusion(nn.Module):
                 raise ValueError("jstd_event_time_support must be [B,L]")
             if jstd_event_station_support.shape != clean.shape:
                 raise ValueError("jstd_event_station_support must be [B,S,L]")
+            if (
+                self.event_balanced_ramp_selection_version
+                == "source_direction_daylight_pooled_v1"
+            ):
+                if daylight_mask is None or daylight_mask.shape != clean.shape:
+                    raise ValueError(
+                        "source/direction ramp selection requires daylight_mask [B,S,L]"
+                    )
+                daylight_mask = daylight_mask.to(clean.dtype)
             if self.denoiser.use_jstd_tail:
                 for target in (jstd_slow_target, jstd_fast_target, jstd_slow24_target):
                     if target.shape != clean.shape:
@@ -3494,25 +3517,120 @@ class StationGaussianDiffusion(nn.Module):
                     predicted_delta = predicted_actual[:, :, lag:] - predicted_actual[:, :, :-lag]
                     target_delta = target_actual[:, :, lag:] - target_actual[:, :, :-lag]
                     pair_valid = valid_mask[:, :, lag:] * valid_mask[:, :, :-lag]
-                    magnitude = target_delta.detach().abs().masked_fill(
-                        pair_valid <= 0, float("-inf")
-                    )
-                    top_count = max(
-                        1,
-                        int(math.ceil(magnitude.shape[-1] * self.event_balanced_ramp_top_fraction)),
-                    )
-                    threshold = torch.topk(magnitude, k=top_count, dim=-1).values[..., -1:]
-                    extreme = (magnitude >= threshold).to(clean.dtype) * pair_valid
                     local_event = torch.maximum(
                         event_context[:, :, lag:], event_context[:, :, :-lag]
                     ) * pair_valid
-                    focus = torch.maximum(extreme, local_event) * snr_weight
                     error = F.smooth_l1_loss(
                         predicted_delta, target_delta, reduction="none", beta=0.05
                     )
-                    ramp_total = ramp_total + float(lag_weight) * (
-                        (error * focus).sum() / focus.sum().clamp(min=1.0)
-                    )
+                    if (
+                        self.event_balanced_ramp_selection_version
+                        == "legacy_abs_topk_v1"
+                    ):
+                        magnitude = target_delta.detach().abs().masked_fill(
+                            pair_valid <= 0, float("-inf")
+                        )
+                        top_count = max(
+                            1,
+                            int(math.ceil(
+                                magnitude.shape[-1]
+                                * self.event_balanced_ramp_top_fraction
+                            )),
+                        )
+                        threshold = torch.topk(
+                            magnitude, k=top_count, dim=-1
+                        ).values[..., -1:]
+                        extreme = (
+                            (magnitude >= threshold).to(clean.dtype) * pair_valid
+                        )
+                        focus = torch.maximum(extreme, local_event) * snr_weight
+                        lag_loss = (error * focus).sum() / focus.sum().clamp(min=1.0)
+                    else:
+                        # This ablation changes selection only. Each source and
+                        # sign is selected independently within each issue;
+                        # solar pairs require both endpoints to be daylight.
+                        # Selected strata are pooled by their actual focus
+                        # weights, avoiding an implicit equal-stratum reweight.
+                        pooled_error_sum = torch.zeros_like(
+                            event_balanced_ramp_loss
+                        )
+                        pooled_focus_sum = torch.zeros_like(
+                            event_balanced_ramp_loss
+                        )
+                        selection_stats = {}
+                        for source_name, source_station_mask in (
+                            ("wind", self.denoiser.wind_station_mask),
+                            ("solar", self.denoiser.solar_station_mask),
+                        ):
+                            source_valid = pair_valid * source_station_mask.to(
+                                clean.dtype
+                            )[None, :, None]
+                            if source_name == "solar":
+                                source_valid = source_valid * (
+                                    daylight_mask[:, :, lag:]
+                                    * daylight_mask[:, :, :-lag]
+                                )
+                            for direction_name, direction_valid, magnitude in (
+                                ("positive", target_delta.detach() > 0, target_delta.detach()),
+                                ("negative", target_delta.detach() < 0, -target_delta.detach()),
+                            ):
+                                eligible = (source_valid > 0) & direction_valid
+                                # Pool stations and time within each issue, but
+                                # never pool different issues. This makes the
+                                # source split substantive while keeping the
+                                # selector invariant to batch composition.
+                                flat_eligible = eligible.flatten(1)
+                                flat_magnitude = magnitude.flatten(1)
+                                counts = flat_eligible.sum(dim=-1)
+                                top_counts = torch.ceil(
+                                    counts.to(clean.dtype)
+                                    * self.event_balanced_ramp_top_fraction
+                                ).to(torch.long)
+                                scores = flat_magnitude.masked_fill(
+                                    ~flat_eligible, float("-inf")
+                                )
+                                sorted_scores = torch.sort(
+                                    scores, dim=-1, descending=True
+                                ).values
+                                threshold_index = (top_counts - 1).clamp(
+                                    min=0, max=scores.shape[-1] - 1
+                                )
+                                threshold = torch.gather(
+                                    sorted_scores,
+                                    -1,
+                                    threshold_index.unsqueeze(-1),
+                                )
+                                extreme = (
+                                    (scores >= threshold)
+                                    & flat_eligible
+                                    & (counts > 0).unsqueeze(-1)
+                                ).reshape_as(eligible).to(clean.dtype)
+                                directed_event = local_event * eligible.to(clean.dtype)
+                                focus = torch.maximum(
+                                    extreme, directed_event
+                                ) * snr_weight
+                                pooled_error_sum = pooled_error_sum + (
+                                    error * focus
+                                ).sum()
+                                pooled_focus_sum = pooled_focus_sum + focus.sum()
+                                selection_stats[
+                                    f"{source_name}_{direction_name}"
+                                ] = {
+                                    "eligible": int(counts.sum().detach().cpu()),
+                                    "top": int(extreme.sum().detach().cpu()),
+                                    "event": int(
+                                        (directed_event > 0).sum().detach().cpu()
+                                    ),
+                                    "focus": int((focus > 0).sum().detach().cpu()),
+                                }
+                        lag_loss = pooled_error_sum / pooled_focus_sum.clamp(
+                            min=1.0
+                        )
+                        if getattr(self, "capture_ramp_selection_for_audit", False):
+                            if not hasattr(self, "last_ramp_selection_stats"):
+                                self.last_ramp_selection_stats = {}
+                            self.last_ramp_selection_stats[int(lag)] = selection_stats
+                    ramp_total = ramp_total + float(lag_weight) * lag_loss
                 event_balanced_ramp_loss = ramp_total / float(lag_weight_sum)
 
             # Half of this term is station-local depth/shape. The other half
@@ -3751,6 +3869,11 @@ class StationGaussianDiffusion(nn.Module):
             "jstd_outside_zero": jstd_outside_zero_loss.detach(),
             "total": total_loss.detach(),
         }
+        if getattr(self, "capture_loss_graph_for_audit", False):
+            self.audit_loss_tensors = {
+                "epsilon": epsilon_loss, "ramp": event_balanced_ramp_loss,
+                "shape": event_balanced_shape_loss, "slow": event_balanced_slow_loss,
+            }
         return total_loss
 
     def reverse_variance(self, timestep: torch.Tensor) -> torch.Tensor:
@@ -4114,6 +4237,8 @@ class Station24DiffusionModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = dict(config)
+        from station_lightweight_tail import validate_model_version
+        self.lightweight_v2 = validate_model_version(self.config)
         self.last_loss_components: dict[str, torch.Tensor] = {}
         self.use_body_tail_experts = bool(
             self.config.get("use_body_tail_experts", False)
@@ -4518,6 +4643,12 @@ class Station24DiffusionModel(nn.Module):
             event_balanced_ramp_top_fraction=float(
                 self.config.get("event_balanced_ramp_top_fraction", 0.10)
             ),
+            event_balanced_ramp_selection_version=str(
+                self.config.get(
+                    "event_balanced_ramp_selection_version",
+                    "legacy_abs_topk_v1",
+                )
+            ),
             event_balanced_shape_loss_weight=float(
                 self.config.get("event_balanced_shape_loss_weight", 0.0)
             ),
@@ -4582,6 +4713,19 @@ class Station24DiffusionModel(nn.Module):
                     "event transport Transformer requires discrete event memory"
                 )
             self.event_memory_selector = None
+
+        if self.lightweight_v2:
+            self.configure_body_tail_training()
+            self.train(True)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if getattr(self, "lightweight_v2", False):
+            # Freeze execution state as well as parameters, including both
+            # serialized aliases of the shared denoiser. Old modes unchanged.
+            super().train(False)
+            self.denoiser.joint_multiresidual_tail.train(mode)
+        return self
 
     @property
     def spatial_mode(self) -> str:
@@ -5542,6 +5686,9 @@ class Station24DiffusionModel(nn.Module):
     def tail_risk_probability(
         self, batch: Mapping[str, torch.Tensor]
     ) -> torch.Tensor:
+        if self.lightweight_v2:
+            # This artifact generates the tail-only pool, never a risk mixture.
+            return batch["forecast"].new_ones(batch["forecast"].shape[0])
         return torch.sigmoid(self.tail_risk_logits(batch))
 
     def tail_time_logits(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
@@ -5615,6 +5762,9 @@ class Station24DiffusionModel(nn.Module):
         self, batch: Mapping[str, torch.Tensor]
     ) -> torch.Tensor:
         """Select wind-event support for the specialized tail denoising loss."""
+
+        if self.lightweight_v2:
+            return torch.ones_like(batch["forecast"])
 
         if self.use_jstd_tail or self.use_joint_multiresidual_tail:
             support_key = (
@@ -5836,6 +5986,7 @@ class Station24DiffusionModel(nn.Module):
             batch["calendar"],
             batch["lead"],
             batch["valid_mask"],
+            daylight_mask=batch.get("daylight_mask"),
             forecast_ramps=batch.get("forecast_ramps"),
             forecast_revision=batch.get("forecast_revision"),
             revision_mask=batch.get("revision_mask"),

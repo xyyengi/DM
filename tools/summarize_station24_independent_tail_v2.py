@@ -34,6 +34,7 @@ def main() -> None:
     parser.add_argument("--event-dir", required=True)
     parser.add_argument("--joint-dir", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--candidate-label", default="Independent joint tail V2")
     args = parser.parse_args()
     baseline = json.loads((Path(args.baseline) / "metrics.json").read_text(encoding="utf-8"))
     candidate = json.loads((Path(args.candidate) / "metrics.json").read_text(encoding="utf-8"))
@@ -53,14 +54,14 @@ def main() -> None:
         old, new = get(baseline, *path), get(candidate, *path)
         rows.append((name, old, new, 100.0 * (new - old) / max(abs(old), 1e-12)))
     lines = [
-        "# Independent joint tail V2 result summary",
+        f"# {args.candidate_label} result summary",
         "",
         "The candidate is a fixed 400 Raw-body + 100 independent joint-tail ensemble. "
         "Wind and solar are generated jointly by the same denoiser; future actual/event labels are not generation conditions.",
         "",
         "## Ordinary and joint quality",
         "",
-        "| Metric | Raw baseline | V2 mixture | Relative change |",
+        f"| Metric | Raw baseline | {args.candidate_label} | Relative change |",
         "|---|---:|---:|---:|",
     ]
     lines.extend(f"| {name} | {old:.6f} | {new:.6f} | {delta:+.2f}% |" for name, old, new, delta in rows)

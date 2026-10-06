@@ -374,7 +374,7 @@ def validate(
             total_loss += float(loss) * validation_weight
             total_weight += validation_weight
             target = active
-            if model.use_jstd_event_hypothesis or model.use_jstd_segment_prior:
+            if model.use_jstd_event_hypothesis or model.use_jstd_segment_prior or model.lightweight_v2:
                 logits = None
             elif model.use_retrieval_mismatch_expert:
                 context, _ = model.encode_retrieval_memory(batch)
@@ -476,6 +476,8 @@ def validate(
             )
         elif model.use_jstd_segment_prior:
             metrics["val_jstd_segment_prior_included"] = 1.0
+        elif model.lightweight_v2:
+            metrics["val_lightweight_v2_objective"] = objective
         else:
             metrics["val_jstd_issue_bce"] = gate_error_sum / max(gate_samples, 1)
         return objective, metrics
@@ -768,6 +770,10 @@ def main() -> None:
     args = parse_args()
     config_path = Path(args.config)
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    import os as _ablation_env
+    if _ablation_env.environ.get("STATION24_ABLATION_KIND"):
+        from tools.check_station24_v2_ablation import validate as _validate_identity
+        _validate_identity(config, _ablation_env.environ["STATION24_ABLATION_KIND"])
     if config["model"].get("architecture") != "station24_resunet":
         raise ValueError("station trainer requires architecture=station24_resunet")
     train_config = config["train"]
@@ -812,6 +818,9 @@ def main() -> None:
     )
 
     scale_config = config["target"]["residual_scaling"]
+    # Check runtime-normalized values before any optimizer work, not only epoch 1.
+    if _ablation_env.environ.get("STATION24_ABLATION_KIND"):
+        _validate_identity(config, _ablation_env.environ["STATION24_ABLATION_KIND"], resolved=True)
     residual_scale = fit_station_residual_scale(
         data_path,
         epsilon=float(scale_config.get("epsilon", 1e-4)),
@@ -871,6 +880,10 @@ def main() -> None:
     independent_joint_tail = bool(
         config["model"].get("independent_joint_tail_training", False)
     )
+    from station_lightweight_tail import validate_model_version, validate_config
+    lightweight_v2 = validate_model_version(config["model"])
+    if lightweight_v2:
+        validate_config(config, resolved=True)
     if bool(config["model"].get("use_jstd_tail", False)) or bool(
         config["model"].get("use_joint_multiresidual_tail", False)
     ) or independent_joint_tail:
@@ -889,9 +902,10 @@ def main() -> None:
                         "independent_tail_event_sampling_fraction", 0.60
                     )
                 )
-                if independent_joint_tail
+                if (independent_joint_tail or lightweight_v2) and not config["model"].get("independent_tail_natural_sampling", False)
                 else None
             ),
+            natural_sampling=bool(config["model"].get("independent_tail_natural_sampling", False)),
         )
         val_jstd_targets = build_station_jstd_target_arrays(
             data_path, "val", jstd_thresholds
@@ -1871,6 +1885,14 @@ def main() -> None:
                 for name, total in component_sums.items()
             }
         )
+        if epoch == 1:
+            import os as _ablation_os
+            _kind = _ablation_os.environ.get("STATION24_ABLATION_KIND")
+            if _kind:
+                from tools.check_station24_v2_ablation import validate as validate_ablation, check_row
+                validate_ablation(config, _kind, resolved=True)
+                check_row(row, _kind)
+                print(f"ABLATION_FIRST_EPOCH_PASS kind={_kind}", flush=True)
         if model.train_sampler_energy_score_only:
             row.update(
                 {
@@ -2004,7 +2026,8 @@ def main() -> None:
                 else (
                 "Tail anchor + final-member Energy Score"
                 if model.train_sampler_energy_score_only
-                else "Fixed-noise epsilon MSE"
+                else "All-valid epsilon + V2 ramp/shape/slow"
+                if model.lightweight_v2 else "Fixed-noise epsilon MSE"
                 )
             )
         ),
@@ -2180,6 +2203,9 @@ def main() -> None:
         "event_balanced_ramp_top_fraction": float(
             model.diffusion.event_balanced_ramp_top_fraction
         ),
+        "event_balanced_ramp_selection_version": str(
+            model.diffusion.event_balanced_ramp_selection_version
+        ),
         "event_balanced_shape_loss_weight": float(
             model.diffusion.event_balanced_shape_loss_weight
         ),
@@ -2234,7 +2260,7 @@ def main() -> None:
         "best_epoch": best_epoch,
         "best_validation_objective": best_val,
         "best_fixed_noise_validation_mse": (
-            None if model.train_sampler_energy_score_only else best_val
+            None if model.train_sampler_energy_score_only or model.lightweight_v2 else best_val
         ),
         "training_seed": seed,
         "validation_seed": validation_seed,

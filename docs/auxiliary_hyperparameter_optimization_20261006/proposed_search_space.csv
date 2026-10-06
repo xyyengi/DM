@@ -1,0 +1,10 @@
+stage,candidate_id,alpha,base_lambda_ramp,base_lambda_shape,base_lambda_slow,effective_lambda_ramp,effective_lambda_shape,effective_lambda_slow,new_training,scientific_purpose
+1A,alpha_weak,0.65,0.18,0.14,0.10,0.117,0.091,0.065,yes,Test auxiliary-to-epsilon gradient ratio near 0.263
+1A,current_control,1.00,0.18,0.14,0.10,0.180,0.140,0.100,no,Reuse completed exact Lightweight fair control
+1A,alpha_strong,1.35,0.18,0.14,0.10,0.243,0.189,0.135,yes,Test auxiliary-to-epsilon gradient ratio near 0.545
+1B,shape_relief,alpha_star,0.20,0.10,0.11,alpha_star*0.20,alpha_star*0.10,alpha_star*0.11,yes,Reduce epsilon-shape conflict while preserving ramp and slow
+1B,ramp_emphasis,alpha_star,0.22,0.09,0.10,alpha_star*0.22,alpha_star*0.09,alpha_star*0.10,yes,Test whether more ramp and less shape improves short changes without width inflation
+1B,slow_restraint,alpha_star,0.20,0.13,0.08,alpha_star*0.20,alpha_star*0.13,alpha_star*0.08,yes,Test whether nonweak event slow gradient is excessive
+1B,balanced_low_shape,alpha_star,0.17,0.12,0.12,alpha_star*0.17,alpha_star*0.12,alpha_star*0.12,yes,Test lower shape with balanced persistent-event support
+constraint,bounded_domain,NA,0.14-0.22,0.08-0.14,0.08-0.12,NA,NA,NA,no,Base-weight sum constrained to 0.40-0.44 and current control included
+

@@ -3,6 +3,10 @@
 Before changing or launching a deep-learning experiment, read
 `docs/deep_learning_experiment_checks.md` and follow its evidence gates.
 These rules apply to any assistant or human preparing Station-24 experiments.
+For every formal Station-24 run, also read and follow
+`docs/station24_pipeline_contract.md`. A formal launcher must cover preflight,
+training, generation, any member merge, complete evaluation, plots, summary, and
+archive; it must also provide an idempotent post-training finalize path.
 
 For local CPU checks on this Windows workspace, reuse the isolated Conda
 environment `dm_preflight` at
@@ -26,3 +30,4 @@ replaces the target-server CUDA/AMP gate.
   and insufficient evidence. No universal impossibility claim from one failed run.
 - Do not launch paid training merely because this document exists. The experiment
   manifest must enumerate passed checks, unresolved issues, and launch eligibility.
+

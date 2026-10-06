@@ -1490,6 +1490,13 @@ class StationForecastDataset(Dataset):
             raise ValueError("recent_error_hours must be between 1 and 168")
         self.state_thresholds = None
         self.state_daylight = None
+        self.ramp_selection_uses_daylight = (
+            self.condition_config.get(
+                "event_balanced_ramp_selection_version",
+                "legacy_abs_topk_v1",
+            )
+            == "source_direction_daylight_pooled_v1"
+        )
         self.state_ramp_lags = tuple(
             int(value)
             for value in self.condition_config.get("state_ramp_lags", [3, 6])
@@ -1501,6 +1508,8 @@ class StationForecastDataset(Dataset):
             self.state_thresholds = validate_station_state_thresholds(state_thresholds)
             if tuple(self.state_thresholds["ramp_lags"]) != self.state_ramp_lags:
                 raise ValueError("state config ramp lags do not match fitted thresholds")
+            self.state_daylight, _ = build_station_daylight_mask(self.data_dir, split)
+        elif self.ramp_selection_uses_daylight:
             self.state_daylight, _ = build_station_daylight_mask(self.data_dir, split)
         issue_frame = pd.read_csv(self.data_dir / f"{split}_issue_dates.csv")
         if len(issue_frame) != len(self.forecast):
@@ -1608,6 +1617,11 @@ class StationForecastDataset(Dataset):
         valid_mask = 1.0 - np.asarray(
             self.fill_mask[index], dtype=np.float32
         ).T.copy()
+        daylight_mask = (
+            np.asarray(self.state_daylight[index], dtype=np.float32).T.copy()
+            if self.state_daylight is not None
+            else np.ones_like(valid_mask, dtype=np.float32)
+        )
         forecast_ramps = np.zeros(
             (EXPECTED_STATIONS, len(self.ramp_lags), EXPECTED_HOURS),
             dtype=np.float32,
@@ -1783,6 +1797,7 @@ class StationForecastDataset(Dataset):
                 np.asarray(self.lead_mark[index], dtype=np.float32).T.copy()
             ),
             "valid_mask": torch.from_numpy(valid_mask),
+            "daylight_mask": torch.from_numpy(daylight_mask),
             "forecast_ramps": torch.from_numpy(forecast_ramps),
             "forecast_revision": torch.from_numpy(forecast_revision),
             "revision_mask": torch.from_numpy(revision_mask),
@@ -2007,7 +2022,10 @@ def get_station_dataloader(
     split_offset = {"train": 0, "val": 10_000, "test": 20_000}[split]
     generator.manual_seed(int(seed) + split_offset)
     sampler = None
-    if split == "train" and jstd_targets is not None:
+    if split == "train" and jstd_targets is not None and not (
+        condition_config.get("independent_tail_natural_sampling", False)
+        if condition_config is not None else False
+    ):
         sampler = WeightedRandomSampler(
             torch.as_tensor(jstd_targets.sample_weights, dtype=torch.double),
             num_samples=len(dataset),
