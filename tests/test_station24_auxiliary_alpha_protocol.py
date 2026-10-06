@@ -10,6 +10,7 @@ from tools.evaluate_station24_auxiliary_alpha_stage1a import (
     _pairwise_body_winner,
     _pareto_frontier,
     ci_of_paired,
+    classify_extreme_family,
     correlations_from_moments,
     json_default,
     moments_by_issue,
@@ -61,6 +62,38 @@ class AuxiliaryAlphaProtocolTests(unittest.TestCase):
         )
         self.assertEqual(set(frontier), {"alpha_0.65", "alpha_1.00"})
 
+    def test_extreme_degradation_prevents_body_only_dominance(self):
+        bootstrap = pairwise_rows({"renewable_crps": (-0.2, -0.01)})
+        decisions = {
+            "alpha_0.65": {"persistent": "stable_degradation", "ramp": "control"},
+            "alpha_1.00": {"persistent": "control", "ramp": "control"},
+        }
+        frontier = _pareto_frontier(
+            ["alpha_0.65", "alpha_1.00"], bootstrap, decisions
+        )
+        self.assertEqual(set(frontier), {"alpha_0.65", "alpha_1.00"})
+
+    def test_mixed_extreme_evidence_is_not_silently_indistinguishable(self):
+        bootstrap = pairwise_rows({"renewable_crps": (-0.2, -0.01)})
+        decisions = {
+            "alpha_0.65": {
+                "persistent": "control", "ramp": "mixed_or_insufficient_evidence"
+            },
+            "alpha_1.00": {"persistent": "control", "ramp": "control"},
+        }
+        frontier = _pareto_frontier(
+            ["alpha_0.65", "alpha_1.00"], bootstrap, decisions
+        )
+        self.assertEqual(set(frontier), {"alpha_0.65", "alpha_1.00"})
+
+    def test_extreme_family_three_state_and_mixed_classification(self):
+        self.assertEqual(classify_extreme_family(True, 1, 0), "stable_improvement")
+        self.assertEqual(classify_extreme_family(False, 0, 0), "indistinguishable")
+        self.assertEqual(classify_extreme_family(False, 0, 2), "stable_degradation")
+        self.assertEqual(
+            classify_extreme_family(False, 3, 2), "mixed_directional_evidence"
+        )
+
     def test_nested_numpy_decision_evidence_is_json_serializable(self):
         payload = {
             "guardrail": {
@@ -111,6 +144,16 @@ class AuxiliaryAlphaProtocolTests(unittest.TestCase):
         )
         self.assertIn("evaluate_station24_auxiliary_alpha_stage1a.py", launcher)
         self.assertIn("stage1a_spatial_bootstrap_v2", launcher)
+        self.assertNotIn("train_station24.py", launcher)
+        self.assertNotIn("generate_station24.py", launcher)
+
+    def test_decision_reaudit_launcher_is_evaluation_only(self):
+        root = Path(__file__).resolve().parents[1]
+        launcher = (
+            root / "run_station24_auxiliary_alpha_stage1a_decision_reaudit.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("evaluate_station24_auxiliary_alpha_stage1a.py", launcher)
+        self.assertIn("stage1a_decision_state_v3", launcher)
         self.assertNotIn("train_station24.py", launcher)
         self.assertNotIn("generate_station24.py", launcher)
 

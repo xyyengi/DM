@@ -563,6 +563,18 @@ def calibration_status(label, bootstrap):
     return "indistinguishable"
 
 
+def classify_extreme_family(passed, significant_good, significant_bad,
+                            hard_degradation=False):
+    """Map evidence to the frozen three-state scale without hiding mixed CIs."""
+    if passed:
+        return "stable_improvement"
+    if hard_degradation or (significant_bad > 0 and significant_good == 0):
+        return "stable_degradation"
+    if significant_good == 0 and significant_bad == 0:
+        return "indistinguishable"
+    return "mixed_directional_evidence"
+
+
 def persistent_status(label, eventwise, bootstrap):
     if label == "alpha_1.00":
         return "control", {}
@@ -604,11 +616,17 @@ def persistent_status(label, eventwise, bootstrap):
     any_hit = int(current.any_hit.astype(str).str.lower().eq("true").sum()) if current.any_hit.dtype == object else int(current.any_hit.sum())
     strict_hits = int(strict_current.any_hit.astype(str).str.lower().eq("true").sum()) if strict_current.any_hit.dtype == object else int(strict_current.any_hit.sum())
     strict_ref = int(strict_control.any_hit.astype(str).str.lower().eq("true").sum()) if strict_control.any_hit.dtype == object else int(strict_control.any_hit.sum())
+    control_any_hit = (int(control.any_hit.astype(str).str.lower().eq("true").sum())
+                       if control.any_hit.dtype == object else int(control.any_hit.sum()))
     passed = any_hit == 4 and strict_hits >= strict_ref and sum(point.values()) >= 2 and significant_good >= 1 and significant_bad == 0 and per_event_nonworse >= 3 and loo_good >= 3
     evidence = {"primary_any_hit": any_hit, "strict_any_hit": strict_hits, "point_improvements": sum(point.values()),
                 "significant_improvements": significant_good, "significant_degradations": significant_bad,
                 "events_nonworse": per_event_nonworse, "leave_one_out_improved": loo_good}
-    return ("stable_improvement" if passed else "not_stable_improvement"), evidence
+    status = classify_extreme_family(
+        passed, significant_good, significant_bad,
+        hard_degradation=(any_hit < control_any_hit or strict_hits < strict_ref),
+    )
+    return status, evidence
 
 
 def ramp_status(label, ramp_mean, bootstrap):
@@ -647,9 +665,36 @@ def ramp_status(label, ramp_mean, bootstrap):
             non_event_bad += bad_lags >= 2
     passed_strata = [(s, d) for s, d, passed in strata_pass if passed]
     passed = len(passed_strata) >= 3 and significant_sources == {"wind", "solar"} and {d for _, d in passed_strata} == {"positive", "negative"} and non_event_bad < 3
+    significant_good = 0
+    significant_bad = 0
+    missing_primary_ci = 0
+    for source in ("wind", "solar"):
+        for direction in ("positive", "negative"):
+            for window in ("event", "non_event"):
+                for lag in (1, 3, 6):
+                    for metric in ("q95_distance", "q99_distance"):
+                        item = ci_lookup(
+                            bootstrap, label, "alpha_1.00", "ramp", metric,
+                            source=source, direction=direction, window=window,
+                            lag_h=lag,
+                        )
+                        if item is None:
+                            missing_primary_ci += 1
+                            continue
+                        significant_good += float(item.ci_high) < 0
+                        significant_bad += float(item.ci_low) > 0
     evidence = {"event_strata_passed": len(passed_strata), "significant_sources": sorted(significant_sources),
-                "directions_passed": sorted({d for _, d in passed_strata}), "non_event_bad_strata": non_event_bad}
-    return ("stable_improvement" if passed else "not_stable_improvement"), evidence
+                "directions_passed": sorted({d for _, d in passed_strata}), "non_event_bad_strata": non_event_bad,
+                "significant_improvements": int(significant_good),
+                "significant_degradations": int(significant_bad),
+                "missing_primary_ci": int(missing_primary_ci)}
+    if passed:
+        status = "stable_improvement"
+    elif missing_primary_ci:
+        status = "mixed_or_insufficient_evidence"
+    else:
+        status = classify_extreme_family(False, significant_good, significant_bad)
+    return status, evidence
 
 
 def _pairwise_body_winner(pool, bootstrap):
@@ -701,9 +746,10 @@ def _pairwise_loss_ci(left, right, metric, bootstrap):
 
 
 def _extreme_level(status):
-    return {"stable_degradation": 0, "not_stable_improvement": 1,
-            "indistinguishable": 1, "control": 1,
-            "stable_improvement": 2}[status]
+    return {"stable_degradation": 0, "indistinguishable": 1,
+            "control": 1, "stable_improvement": 2,
+            "mixed_directional_evidence": None,
+            "mixed_or_insufficient_evidence": None}[status]
 
 
 def _pareto_frontier(pool, bootstrap, decisions):
@@ -722,9 +768,15 @@ def _pareto_frontier(pool, bootstrap, decisions):
             body_cis = [_pairwise_loss_ci(other, label, metric, bootstrap)
                         for metric in PRIMARY_BODY]
             body_no_worse = all(low <= 0 for low, _ in body_cis)
-            extreme_no_worse = all(a >= b for a, b in zip(extreme[other], extreme[label]))
+            comparable = all(a is not None and b is not None
+                             for a, b in zip(extreme[other], extreme[label]))
+            extreme_no_worse = comparable and all(
+                a >= b for a, b in zip(extreme[other], extreme[label])
+            )
             strictly_better = (any(high < 0 for _, high in body_cis)
-                               or any(a > b for a, b in zip(extreme[other], extreme[label])))
+                               or (comparable and any(
+                                   a > b for a, b in zip(extreme[other], extreme[label])
+                               )))
             if body_no_worse and extreme_no_worse and strictly_better:
                 dominated = True
                 break
@@ -752,6 +804,7 @@ def choose_alpha(body_mean, lead_mean, bootstrap, eventwise, ramp_mean):
         # Frozen protocol falls back to current control; this should only occur if reused artifacts fail.
         selected = "alpha_1.00"
         reason = "no new candidate passed all preregistered gates; retain current control"
+        selection_status = "RETAIN_CONTROL_NO_ELIGIBLE_CANDIDATE"
     else:
         frontier = _pareto_frontier(eligible, bootstrap, decisions)
         for label in decisions:
@@ -763,26 +816,43 @@ def choose_alpha(body_mean, lead_mean, bootstrap, eventwise, ramp_mean):
             selected = both[0]
             reason = ("unique Pareto candidate with stable improvement in both "
                       "Persistent and Ramp/local-trajectory families")
-            return selected, reason, decisions
+            return selected, reason, decisions, "SELECTED_ALPHA_STAR"
         pool = both if both else frontier
         if len(pool) == 1:
             selected = pool[0]
             reason = "unique eligible candidate remaining on the frozen Pareto frontier"
-            return selected, reason, decisions
+            return selected, reason, decisions, "SELECTED_ALPHA_STAR"
+        extremes_indistinguishable = all(
+            decisions[label][family] in ("control", "indistinguishable")
+            for label in pool for family in ("persistent", "ramp")
+        )
+        if not extremes_indistinguishable:
+            # The frozen protocol only authorizes the Body tie-break when the
+            # Extreme families are genuinely indistinguishable. A Body-vs-
+            # Extreme trade-off has no preregistered scalar tie-break, so fail
+            # closed and keep the current control operationally unchanged.
+            selected = "alpha_1.00"
+            reason = (
+                "frozen protocol does not uniquely resolve the Body-versus-Extreme "
+                "trade-off on the Pareto frontier; retain current control and "
+                "block Stage 1B pending protocol governance"
+            )
+            return selected, reason, decisions, "BLOCKED_PROTOCOL_AMBIGUITY"
         # A statistically resolved Body winner must not subsequently be
         # overwritten by the closeness-to-control fallback.
         selected, decisive_metric = _pairwise_body_winner(pool, bootstrap)
         if selected is not None:
             reason = ("Pareto/gates passed; frozen lexicographic Body tie-break "
                       f"was resolved by {decisive_metric}")
-            return selected, reason, decisions
+            return selected, reason, decisions, "SELECTED_ALPHA_STAR"
         # Only a complete paired-CI tie reaches the closeness fallback.
         values = {label: decisions[label]["alpha"] for label in pool}
         selected = min(pool,
                        key=lambda label: (abs(values[label] - 1.0), values[label] > 1.0, values[label]))
         reason = ("Pareto/gates passed and preregistered Body comparisons were "
                   "indistinguishable; closest-to-control fallback applied")
-    return selected, reason, decisions
+        selection_status = "SELECTED_ALPHA_STAR"
+    return selected, reason, decisions, selection_status
 
 
 def sha(path):
@@ -899,10 +969,16 @@ def main():
         extreme = pd.concat([extreme, *recovery_rows], ignore_index=True, sort=False)
     extreme.to_csv(args.output_dir / "alpha_extreme_metrics.csv", index=False)
 
-    selected, reason, decisions = choose_alpha(body_mean, lead_mean, bootstrap, eventwise, ramp_mean)
+    selected, reason, decisions, selection_status = choose_alpha(
+        body_mean, lead_mean, bootstrap, eventwise, ramp_mean
+    )
     selected_alpha = float(selected.split("_")[1])
     selected_payload = {"selected_alpha": selected_alpha, "selected_label": selected,
                         "weights": dict(zip(("ramp", "shape", "slow"), WEIGHTS[selected_alpha])),
+                        "selection_status": selection_status,
+                        "alpha_star_frozen": selection_status == "SELECTED_ALPHA_STAR",
+                        "retained_control_alpha": 1.00,
+                        "stage1b_launch_eligible": selection_status == "SELECTED_ALPHA_STAR",
                         "reason": reason, "decisions": decisions, "stage1b_started": False,
                         "test_used": False, "multi_seed_started": False}
     (args.output_dir / "selected_alpha.json").write_text(
@@ -917,7 +993,9 @@ def main():
         row.update({"lambda_ramp": WEIGHTS[alpha][0], "lambda_shape": WEIGHTS[alpha][1], "lambda_slow": WEIGHTS[alpha][2],
                     "body_guardrail": decisions[label]["body_guardrail"], "calibration_status": decisions[label]["calibration"],
                     "persistent_status": decisions[label]["persistent"], "ramp_status": decisions[label]["ramp"],
-                    "selected": alpha == selected_alpha})
+                    "operational_control": alpha == selected_alpha,
+                    "alpha_star_selected": (selection_status == "SELECTED_ALPHA_STAR"
+                                            and alpha == selected_alpha)})
         summary_rows.append(row)
     pd.DataFrame(summary_rows).to_csv(args.output_dir / "alpha_summary.csv", index=False)
 
@@ -971,9 +1049,10 @@ def main():
     integrity = {"status": "PASS" if body_equal_pass and generation_pass and generation_pairing_pass and spatial_bootstrap_finite else "FAIL",
                  "body400_equal": body_equal, "generation": generation_audit,
                  "generation_pairing_pass": generation_pairing_pass,
-                 "evaluation_semantics_version": "stage1a_spatial_bootstrap_v2",
+                 "evaluation_semantics_version": "stage1a_decision_state_v3",
                  "spatial_bootstrap_method": "paired_7day_blocks_recomputed_from_additive_station_moments",
                  "spatial_bootstrap_all_finite": spatial_bootstrap_finite,
+                 "selection_status": selection_status,
                  "validation_issue_count": int(body_issue.issue.nunique()), "generation_seed": 424242,
                  "bootstrap_repetitions": 10000, "bootstrap_seed": 20261006, "test_used": False,
                  "runs": {}, "frozen_protocol_hashes": {}}
@@ -1080,18 +1159,37 @@ def main():
         )
     lines += [
         "", "No mathematical knee and no arbitrary weighted performance score were used. Dominance "
-        "uses paired Body CIs plus the two preregistered Extreme stability levels.", "",
+        "uses paired Body CIs plus the preregistered Extreme stability states. Mixed directional "
+        "evidence is kept incomparable instead of being relabeled as indistinguishable.", "",
         "## F. Frozen Stage 1A decision", "",
-        f"Selected alpha*: **{selected_alpha:.2f}**.", "", reason, "",
-        "This is the unique alpha passed to Stage 1B under the frozen protocol; it is not yet a claim "
-        "that the current deployable control has been replaced. Final replacement still requires the "
-        "later preregistered seed confirmation.", "",
+        f"Decision status: **{selection_status}**.", "", reason, "",
+    ]
+    if selection_status == "SELECTED_ALPHA_STAR":
+        lines += [
+            f"Selected alpha*: **{selected_alpha:.2f}**.", "",
+            "This is the unique alpha passed to Stage 1B under the frozen protocol; it is not yet a "
+            "claim that the current deployable control has been replaced. Final replacement still "
+            "requires the later preregistered seed confirmation.", "",
+        ]
+    else:
+        lines += [
+            "Selected alpha*: **NOT SELECTED**.", "",
+            "Operational control retained: **alpha=1.00 (0.18/0.14/0.10)**. This is a fail-closed "
+            "protocol result, not a post-hoc claim that alpha=1.00 is theoretically optimal. "
+            "Stage 1B is not launch-eligible until the frozen-protocol ambiguity is governed before "
+            "any additional result is observed.", "",
+        ]
+    lines += [
         "## Mandatory stop", "",
         "Stage 1B: **NOT RUN**. Test: **NOT RUN**. Additional alpha points: **NOT RUN**. "
         "Multi-seed confirmation: **NOT RUN**.", "",
     ]
     (args.output_dir / "ALPHA_SENSITIVITY_REPORT.md").write_text("\n".join(lines), encoding="utf-8")
-    print(f"AUXILIARY_ALPHA_SELECTION_COMPLETE alpha={selected_alpha:.2f} output={args.output_dir}")
+    print(
+        "AUXILIARY_ALPHA_SELECTION_COMPLETE "
+        f"status={selection_status} operational_alpha={selected_alpha:.2f} "
+        f"output={args.output_dir}"
+    )
 
 
 if __name__ == "__main__":
