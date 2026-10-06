@@ -233,6 +233,54 @@ def ci_of_paired(left, right, indices):
     return float(delta.mean()), float(np.quantile(draws, .025)), float(np.quantile(draws, .975))
 
 
+def ci_of_sparse_paired(left, right, repetitions=10000, block=7,
+                        seed=20261006):
+    """Paired block bootstrap conditional on a draw containing event evidence.
+
+    Event-window issue summaries are intentionally NaN for issues without that
+    event stratum.  We keep those issues missing, draw the original issue
+    timeline in paired 7-day blocks, and accept a draw only when it contains at
+    least one finite paired event summary.  This preserves 10,000 nonempty
+    paired draws without treating non-events as zeros.
+    """
+    delta = np.asarray(left, float) - np.asarray(right, float)
+    finite = np.isfinite(delta)
+    if not np.any(finite):
+        raise ValueError("sparse paired bootstrap has no finite paired issues")
+    n = len(delta)
+    if n < block:
+        raise ValueError("fewer issues than sparse bootstrap block")
+    rng = np.random.default_rng(seed)
+    starts = np.arange(n - block + 1)
+    block_count = math.ceil(n / block)
+    offsets = np.arange(block)
+    draws = np.empty(repetitions, dtype=np.float64)
+    accepted = 0
+    attempts = 0
+    max_attempts = repetitions * 100
+    while accepted < repetitions and attempts < max_attempts:
+        chosen = rng.choice(starts, size=block_count, replace=True)
+        indices = (chosen[:, None] + offsets).reshape(-1)[:n]
+        selected = delta[indices]
+        selected = selected[np.isfinite(selected)]
+        attempts += 1
+        if not len(selected):
+            continue
+        draws[accepted] = selected.mean()
+        accepted += 1
+    if accepted != repetitions:
+        raise ValueError(
+            f"sparse paired bootstrap accepted only {accepted}/{repetitions} draws"
+        )
+    return (
+        float(delta[finite].mean()),
+        float(np.quantile(draws, .025)),
+        float(np.quantile(draws, .975)),
+        int(finite.sum()),
+        int(attempts),
+    )
+
+
 def body_bootstrap(body_issue, lead_issue, labels, indices, spatial_draws):
     rows = []
     for candidate in labels:
@@ -398,13 +446,35 @@ def ramp_bootstrap(ramp_issue, indices):
             candidate_group = candidate_group.sort_values("issue")
             reference = reference.sort_values("issue")
             for metric in metrics:
-                if candidate_group[metric].isna().any() or reference[metric].isna().any():
-                    continue
-                mean, low, high = ci_of_paired(candidate_group[metric], reference[metric], indices)
+                paired_finite = (
+                    candidate_group[metric].notna().to_numpy()
+                    & reference[metric].notna().to_numpy()
+                )
+                if keys[2] == "event":
+                    mean, low, high, paired_issue_count, attempts = ci_of_sparse_paired(
+                        candidate_group[metric], reference[metric],
+                        repetitions=len(indices),
+                    )
+                    bootstrap_population = "paired_event_issues_conditioned_nonempty"
+                else:
+                    if not np.all(paired_finite):
+                        raise ValueError(
+                            "unexpected missing non-event ramp metric: "
+                            f"{candidate}, {keys}, {metric}"
+                        )
+                    mean, low, high = ci_of_paired(
+                        candidate_group[metric], reference[metric], indices
+                    )
+                    paired_issue_count = int(paired_finite.sum())
+                    attempts = len(indices)
+                    bootstrap_population = "all_validation_issues"
                 rows.append({"family": "ramp", "candidate": candidate, "reference": "alpha_1.00",
                              "source": keys[0], "direction": keys[1], "window": keys[2], "lag_h": keys[3],
                              "metric": metric, "difference": mean, "ci_low": low, "ci_high": high,
-                             "repetitions": len(indices), "bootstrap_seed": 20261006})
+                             "repetitions": len(indices), "bootstrap_seed": 20261006,
+                             "paired_issue_count": paired_issue_count,
+                             "bootstrap_attempts": attempts,
+                             "bootstrap_population": bootstrap_population})
     return rows
 
 
@@ -1049,7 +1119,7 @@ def main():
     integrity = {"status": "PASS" if body_equal_pass and generation_pass and generation_pairing_pass and spatial_bootstrap_finite else "FAIL",
                  "body400_equal": body_equal, "generation": generation_audit,
                  "generation_pairing_pass": generation_pairing_pass,
-                 "evaluation_semantics_version": "stage1a_decision_state_v3",
+                 "evaluation_semantics_version": "stage1a_decision_state_v4_event_ramp_bootstrap",
                  "spatial_bootstrap_method": "paired_7day_blocks_recomputed_from_additive_station_moments",
                  "spatial_bootstrap_all_finite": spatial_bootstrap_finite,
                  "selection_status": selection_status,
@@ -1104,6 +1174,8 @@ def main():
         "- Spatial/correlation CIs are recomputed from concatenated paired 7-day bootstrap blocks; "
         "undefined per-issue correlations are never averaged or silently converted into a failed gate.",
         f"- All recomputed spatial point estimates and bootstrap draws finite: **{spatial_bootstrap_finite}**.",
+        "- Event-window Ramp CIs use paired 7-day moving blocks conditional on a draw containing "
+        "at least one valid paired event issue; non-event issues remain missing rather than becoming zeros.",
         f"- Frozen protocol unchanged from launch through selection: **{integrity['protocol_unchanged_during_run']}**.",
         "- Each new run separately passed target CUDA/AMP, 20,588-trainable-parameter, Raw-state hash and post-training integrity gates.", "",
         "## B. Ordinary 168 h Body quality", "",

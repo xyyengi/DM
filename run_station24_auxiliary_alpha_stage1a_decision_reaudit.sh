@@ -18,7 +18,7 @@ CONTROL_ROOT=${CONTROL_ROOT:-outputs_shandong/station24/lightweight_joint_tail_v
 CONTROL_RESULT=${CONTROL_RESULT:-$CONTROL_ROOT/mixture_body400_tail100_n500}
 CONTROL_RUN=${CONTROL_RUN:-$CONTROL_ROOT/20260923_194315_lightweight_joint_tail_v2_fair_20260923_194256_seed2027}
 CONTROL_POST=${CONTROL_POST:-$CONTROL_ROOT/postprocess_20260924_152622}
-OUTPUT="$ROOT/selection_decision_state_v3_${JOB}"
+OUTPUT="$ROOT/selection_decision_state_v4_${JOB}"
 PHASE=initializing
 
 mkdir -p logs/station24
@@ -76,21 +76,23 @@ import sys
 integrity = json.load(open(sys.argv[1], encoding="utf-8"))
 decision = json.load(open(sys.argv[2], encoding="utf-8"))
 assert integrity["status"] == "PASS", integrity
-assert integrity["evaluation_semantics_version"] == "stage1a_decision_state_v3", integrity
+assert integrity["evaluation_semantics_version"] == "stage1a_decision_state_v4_event_ramp_bootstrap", integrity
 assert integrity["spatial_bootstrap_all_finite"] is True, integrity
 assert decision["stage1b_started"] is False, decision
 assert decision["test_used"] is False, decision
 assert decision["multi_seed_started"] is False, decision
+for label in ("alpha_0.65", "alpha_1.35"):
+    assert decision["decisions"][label]["ramp_evidence"]["missing_primary_ci"] == 0, decision
 if decision["selection_status"] != "SELECTED_ALPHA_STAR":
     assert decision["stage1b_launch_eligible"] is False, decision
-print("STAGE1A_DECISION_STATE_V3_INTEGRITY_PASS", decision["selection_status"])
+print("STAGE1A_DECISION_STATE_V4_INTEGRITY_PASS", decision["selection_status"])
 PY
 
-printf '%s\n' "$OUTPUT" > "$ROOT/selection_decision_state_v3_dir.txt"
+printf '%s\n' "$OUTPUT" > "$ROOT/selection_decision_state_v4_dir.txt"
 PHASE=reports_archive
 write_status running
-ARCHIVE="${ROOT}_selection_decision_state_v3_${JOB}.tar.gz"
-tar -czf "$ARCHIVE" -C "$ROOT" "$(basename "$OUTPUT")" selection_decision_state_v3_dir.txt
+ARCHIVE="${ROOT}_selection_decision_state_v4_${JOB}.tar.gz"
+tar -czf "$ARCHIVE" -C "$ROOT" "$(basename "$OUTPUT")" selection_decision_state_v4_dir.txt
 test -s "$ARCHIVE"
 
 PHASE=complete
