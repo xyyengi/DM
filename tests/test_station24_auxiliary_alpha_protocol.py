@@ -9,7 +9,11 @@ from tools.evaluate_station24_auxiliary_alpha_stage1a import (
     PRIMARY_BODY,
     _pairwise_body_winner,
     _pareto_frontier,
+    ci_of_paired,
+    correlations_from_moments,
     json_default,
+    moments_by_issue,
+    spatial_rmse_from_correlations,
 )
 
 
@@ -69,6 +73,46 @@ class AuxiliaryAlphaProtocolTests(unittest.TestCase):
         self.assertIs(restored["guardrail"]["passed"], True)
         self.assertEqual(restored["guardrail"]["count"], 3)
         self.assertEqual(restored["guardrail"]["difference"], 0.125)
+
+    def test_spatial_bootstrap_recomputes_after_combining_issue_blocks(self):
+        # The solar station is constant in issue 0, so its per-issue
+        # correlations are undefined. Every paired draw below contains issue 1;
+        # recomputing after concatenation must yield finite spatial metrics.
+        actual = np.array([
+            [[0., 0., 0.], [1., 2., 0.], [2., 4., 0.]],
+            [[3., 6., 1.], [4., 8., 2.], [5., 10., 3.]],
+        ])
+        generated = np.array([
+            [[0., 0.1, 0.], [1.1, 1.9, 0.1], [1.9, 4.2, 0.]],
+            [[3.1, 5.8, 1.2], [3.8, 8.1, 1.8], [5.2, 9.9, 3.2]],
+        ])
+        draws = np.array([[0, 1], [1, 0], [1, 1]], dtype=np.int64)
+        actual_corr = correlations_from_moments(moments_by_issue(actual), draws)
+        generated_corr = correlations_from_moments(moments_by_issue(generated), draws)
+        metrics = spatial_rmse_from_correlations(
+            actual_corr, generated_corr, np.array(["wind", "wind", "solar"])
+        )
+        self.assertTrue(all(np.all(np.isfinite(value)) for value in metrics.values()))
+        for draw_index, draw in enumerate(draws):
+            actual_direct = np.corrcoef(actual[draw].reshape(-1, 3), rowvar=False)
+            generated_direct = np.corrcoef(generated[draw].reshape(-1, 3), rowvar=False)
+            np.testing.assert_allclose(actual_corr[draw_index], actual_direct, atol=1e-12)
+            np.testing.assert_allclose(generated_corr[draw_index], generated_direct, atol=1e-12)
+
+    def test_nonfinite_primary_bootstrap_input_fails_closed(self):
+        indices = np.array([[0, 1], [1, 0]], dtype=np.int64)
+        with self.assertRaisesRegex(ValueError, "nonfinite"):
+            ci_of_paired([1.0, np.nan], [1.0, 2.0], indices)
+
+    def test_reselect_launcher_is_evaluation_only(self):
+        root = Path(__file__).resolve().parents[1]
+        launcher = (root / "run_station24_auxiliary_alpha_stage1a_reselect.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("evaluate_station24_auxiliary_alpha_stage1a.py", launcher)
+        self.assertIn("stage1a_spatial_bootstrap_v2", launcher)
+        self.assertNotIn("train_station24.py", launcher)
+        self.assertNotIn("generate_station24.py", launcher)
 
     def test_formal_launcher_is_stage1a_only_and_has_complete_lifecycle(self):
         root = Path(__file__).resolve().parents[1]
