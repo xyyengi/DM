@@ -10,10 +10,12 @@ from tools.evaluate_station24_auxiliary_alpha_stage1a import (
     _pairwise_body_winner,
     _pareto_frontier,
     ci_of_paired,
+    ci_of_sparse_paired,
     classify_extreme_family,
     correlations_from_moments,
     json_default,
     moments_by_issue,
+    ramp_bootstrap,
     spatial_rmse_from_correlations,
 )
 
@@ -137,6 +139,52 @@ class AuxiliaryAlphaProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "nonfinite"):
             ci_of_paired([1.0, np.nan], [1.0, 2.0], indices)
 
+    def test_sparse_event_bootstrap_keeps_missing_issues_out_of_the_mean(self):
+        left = [np.nan, 4.0, np.nan, 8.0, np.nan, np.nan, np.nan, 10.0]
+        right = [np.nan, 3.0, np.nan, 6.0, np.nan, np.nan, np.nan, 7.0]
+        result_a = ci_of_sparse_paired(
+            left, right, repetitions=250, block=3, seed=20261006
+        )
+        result_b = ci_of_sparse_paired(
+            left, right, repetitions=250, block=3, seed=20261006
+        )
+        self.assertEqual(result_a, result_b)
+        mean, low, high, paired_count, attempts = result_a
+        self.assertAlmostEqual(mean, 2.0)
+        self.assertEqual(paired_count, 3)
+        self.assertGreaterEqual(attempts, 250)
+        self.assertTrue(np.isfinite([low, high]).all())
+
+    def test_ramp_bootstrap_emits_event_ci_rows_with_sparse_issues(self):
+        rows = []
+        values = {
+            "alpha_1.00": [np.nan, 1.0, np.nan, 2.0, np.nan, 3.0, np.nan, 4.0],
+            "alpha_0.65": [np.nan, 1.1, np.nan, 1.8, np.nan, 3.2, np.nan, 3.7],
+            "alpha_1.35": [np.nan, 1.2, np.nan, 2.1, np.nan, 3.3, np.nan, 4.1],
+        }
+        metrics = (
+            "std_distance", "q95_distance", "q99_distance",
+            "ramp_mae", "ramp_coverage_error",
+        )
+        for label, series in values.items():
+            for issue, value in enumerate(series):
+                row = {
+                    "label": label, "issue": issue, "source": "wind",
+                    "direction": "positive", "window": "event", "lag_h": 1,
+                }
+                row.update({metric: value for metric in metrics})
+                rows.append(row)
+        indices = np.tile(np.arange(8), (40, 1))
+        output = pd.DataFrame(ramp_bootstrap(pd.DataFrame(rows), indices))
+        self.assertEqual(len(output), 10)
+        self.assertTrue(output.ci_low.notna().all())
+        self.assertTrue(output.ci_high.notna().all())
+        self.assertTrue(
+            output.bootstrap_population.eq(
+                "paired_event_issues_conditioned_nonempty"
+            ).all()
+        )
+
     def test_reselect_launcher_is_evaluation_only(self):
         root = Path(__file__).resolve().parents[1]
         launcher = (root / "run_station24_auxiliary_alpha_stage1a_reselect.sh").read_text(
@@ -153,7 +201,7 @@ class AuxiliaryAlphaProtocolTests(unittest.TestCase):
             root / "run_station24_auxiliary_alpha_stage1a_decision_reaudit.sh"
         ).read_text(encoding="utf-8")
         self.assertIn("evaluate_station24_auxiliary_alpha_stage1a.py", launcher)
-        self.assertIn("stage1a_decision_state_v3", launcher)
+        self.assertIn("stage1a_decision_state_v4", launcher)
         self.assertNotIn("train_station24.py", launcher)
         self.assertNotIn("generate_station24.py", launcher)
 
