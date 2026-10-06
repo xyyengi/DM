@@ -18,6 +18,15 @@ from station_evaluation import energy_score, spatial_correlation_metrics, tempor
 from station_jstd_targets import build_station_jstd_target_arrays
 
 
+def json_default(value):
+    """Convert NumPy scalar evidence without changing the frozen decisions."""
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
+
+
 ALPHAS = (0.65, 1.00, 1.35)
 WEIGHTS = {0.65: (0.117, 0.091, 0.065), 1.00: (0.180, 0.140, 0.100), 1.35: (0.243, 0.189, 0.135)}
 PRIMARY_BODY = (
@@ -790,7 +799,10 @@ def main():
                         "weights": dict(zip(("ramp", "shape", "slow"), WEIGHTS[selected_alpha])),
                         "reason": reason, "decisions": decisions, "stage1b_started": False,
                         "test_used": False, "multi_seed_started": False}
-    (args.output_dir / "selected_alpha.json").write_text(json.dumps(selected_payload, indent=2), encoding="utf-8")
+    (args.output_dir / "selected_alpha.json").write_text(
+        json.dumps(selected_payload, indent=2, default=json_default),
+        encoding="utf-8",
+    )
 
     summary_rows = []
     for alpha in ALPHAS:
@@ -869,7 +881,10 @@ def main():
         integrity["status"] = "FAIL"
     for alpha, root in alpha_roots.items():
         integrity["runs"][f"alpha_{alpha:.2f}"]["training_integrity"] = json.loads((root / "alpha_run_integrity.json").read_text(encoding="utf-8"))
-    (args.output_dir / "alpha_integrity_audit.json").write_text(json.dumps(integrity, indent=2), encoding="utf-8")
+    (args.output_dir / "alpha_integrity_audit.json").write_text(
+        json.dumps(integrity, indent=2, default=json_default),
+        encoding="utf-8",
+    )
     if integrity["status"] != "PASS":
         raise RuntimeError("Stage 1A integrity gate failed")
 

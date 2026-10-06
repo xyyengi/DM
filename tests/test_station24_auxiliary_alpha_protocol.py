@@ -1,12 +1,15 @@
+import json
 import unittest
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from tools.evaluate_station24_auxiliary_alpha_stage1a import (
     PRIMARY_BODY,
     _pairwise_body_winner,
     _pareto_frontier,
+    json_default,
 )
 
 
@@ -53,6 +56,19 @@ class AuxiliaryAlphaProtocolTests(unittest.TestCase):
             ["alpha_0.65", "alpha_1.00"], bootstrap, self.decisions
         )
         self.assertEqual(set(frontier), {"alpha_0.65", "alpha_1.00"})
+
+    def test_nested_numpy_decision_evidence_is_json_serializable(self):
+        payload = {
+            "guardrail": {
+                "passed": np.bool_(True),
+                "count": np.int64(3),
+                "difference": np.float64(0.125),
+            }
+        }
+        restored = json.loads(json.dumps(payload, default=json_default))
+        self.assertIs(restored["guardrail"]["passed"], True)
+        self.assertEqual(restored["guardrail"]["count"], 3)
+        self.assertEqual(restored["guardrail"]["difference"], 0.125)
 
     def test_formal_launcher_is_stage1a_only_and_has_complete_lifecycle(self):
         root = Path(__file__).resolve().parents[1]
