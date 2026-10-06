@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from station_dataset import build_station_daylight_mask
-from station_evaluation import energy_score, spatial_correlation_metrics, temporal_metrics
+from station_evaluation import energy_score, temporal_metrics
 from station_jstd_targets import build_station_jstd_target_arrays
 
 
@@ -34,6 +34,8 @@ PRIMARY_BODY = (
     "coverage_error_90", "interval_width_90", "interval_score_90",
     "spatial_rmse", "wind_solar_rmse",
 )
+SPATIAL_BODY = ("spatial_rmse", "wind_solar_rmse")
+POINTWISE_BODY = tuple(metric for metric in PRIMARY_BODY if metric not in SPATIAL_BODY)
 STRUCTURE_BODY = (
     "wind_acf_error_24", "wind_acf_error_48",
     "solar_acf_error_24", "solar_acf_error_48",
@@ -101,6 +103,68 @@ def source_aggregate(values, indices, capacities):
     return np.sum(values[..., indices] * capacities[indices], axis=-1)
 
 
+def moments_by_issue(values):
+    """Return additive station moments, keeping issue as the resampling unit."""
+    values = np.asarray(values)
+    issue_count, station_count = values.shape[0], values.shape[-1]
+    count = np.empty(issue_count, dtype=np.int64)
+    total = np.empty((issue_count, station_count), dtype=np.float64)
+    cross = np.empty((issue_count, station_count, station_count), dtype=np.float64)
+    for issue in range(issue_count):
+        flat = np.asarray(values[issue], dtype=np.float64).reshape(-1, station_count)
+        if not np.all(np.isfinite(flat)):
+            raise ValueError(f"nonfinite values in spatial issue {issue}")
+        count[issue] = flat.shape[0]
+        total[issue] = flat.sum(axis=0)
+        cross[issue] = flat.T @ flat
+    return {"count": count, "sum": total, "cross": cross}
+
+
+def correlations_from_moments(moments, draw_indices):
+    """Recompute correlations after each paired block-bootstrap draw."""
+    draw_indices = np.asarray(draw_indices, dtype=np.int64)
+    count = moments["count"][draw_indices].sum(axis=1).astype(np.float64)
+    total = moments["sum"][draw_indices].sum(axis=1)
+    cross = moments["cross"][draw_indices].sum(axis=1)
+    centered = cross - np.einsum("bi,bj->bij", total, total) / count[:, None, None]
+    variance = np.diagonal(centered, axis1=1, axis2=2)
+    denominator = np.sqrt(np.maximum(variance[:, :, None] * variance[:, None, :], 0.0))
+    correlation = np.full_like(centered, np.nan)
+    np.divide(centered, denominator, out=correlation, where=denominator > 1e-12)
+    return correlation
+
+
+def spatial_rmse_from_correlations(actual, generated, station_types):
+    difference = generated - actual
+    station_count = difference.shape[-1]
+    masks = {
+        "spatial_rmse": np.triu(np.ones((station_count, station_count), dtype=bool), k=1),
+        "wind_wind_rmse": np.triu(np.equal.outer(station_types, "wind"), k=1),
+        "solar_solar_rmse": np.triu(np.equal.outer(station_types, "solar"), k=1),
+        "wind_solar_rmse": np.triu(np.not_equal.outer(station_types, station_types), k=1),
+    }
+    output = {}
+    for name, pair_mask in masks.items():
+        selected = difference[:, pair_mask]
+        finite = np.isfinite(selected)
+        if not np.all(finite):
+            bad_draws = np.flatnonzero(~np.all(finite, axis=1))
+            raise ValueError(
+                f"nonfinite station-pair correlations for {name} in "
+                f"{len(bad_draws)} bootstrap/full draws"
+            )
+        output[name] = np.sqrt(np.mean(selected * selected, axis=1))
+    return output
+
+
+def spatial_metrics_for_draws(result, actual_moments, draw_indices, station_types):
+    samples, _ = result_arrays(result)
+    generated_moments = moments_by_issue(samples)
+    actual_corr = correlations_from_moments(actual_moments, draw_indices)
+    generated_corr = correlations_from_moments(generated_moments, draw_indices)
+    return spatial_rmse_from_correlations(actual_corr, generated_corr, station_types)
+
+
 def body_issue_rows(label, alpha, result, stations, adjacency, daylight):
     samples, actual = result_arrays(result)
     station_types = stations.data_type.to_numpy(str)
@@ -120,7 +184,6 @@ def body_issue_rows(label, alpha, result, stations, adjacency, daylight):
         renewable = np.asarray(renewable_samples[issue])
         renewable_y = np.asarray(renewable_actual[issue])
         coverage, width, interval_score = interval_bundle(renewable, renewable_y)
-        spatial = spatial_correlation_metrics(current[None], truth[None], adjacency, station_types)
         temporal = temporal_metrics(current[None], truth[None], station_types)
         row = {
             "alpha": alpha, "label": label, "issue": issue,
@@ -130,10 +193,6 @@ def body_issue_rows(label, alpha, result, stations, adjacency, daylight):
             "energy_score": energy_score(current[None, energy_indices], truth[None]),
             "coverage_90": coverage, "coverage_error_90": abs(coverage - .90),
             "interval_width_90": width, "interval_score_90": interval_score,
-            "spatial_rmse": spatial["spatial_corr_rmse_all_pairs"],
-            "wind_wind_rmse": spatial["spatial_corr_rmse_wind_wind"],
-            "solar_solar_rmse": spatial["spatial_corr_rmse_solar_solar"],
-            "wind_solar_rmse": spatial["spatial_corr_rmse_wind_solar"],
             "wind_acf_error_24": temporal["wind_acf_abs_error_lag24"],
             "wind_acf_error_48": temporal["wind_acf_abs_error_lag48"],
             "solar_acf_error_24": temporal["solar_acf_abs_error_lag24"],
@@ -168,22 +227,36 @@ def moving_block_indices(n, repetitions=10000, block=7, seed=20261006):
 
 def ci_of_paired(left, right, indices):
     delta = np.asarray(left, float) - np.asarray(right, float)
+    if not np.all(np.isfinite(delta)):
+        raise ValueError("paired bootstrap received nonfinite issue-level differences")
     draws = delta[indices].mean(axis=1)
     return float(delta.mean()), float(np.quantile(draws, .025)), float(np.quantile(draws, .975))
 
 
-def body_bootstrap(body_issue, lead_issue, labels, indices):
+def body_bootstrap(body_issue, lead_issue, labels, indices, spatial_draws):
     rows = []
     for candidate in labels:
         if candidate in ("raw", "alpha_1.00"):
             continue
         for reference in ("raw", "alpha_1.00"):
-            for metric in PRIMARY_BODY + STRUCTURE_BODY:
+            for metric in POINTWISE_BODY + STRUCTURE_BODY:
                 left = body_issue.loc[body_issue.label.eq(candidate)].sort_values("issue")[metric]
                 right = body_issue.loc[body_issue.label.eq(reference)].sort_values("issue")[metric]
                 mean, low, high = ci_of_paired(left, right, indices)
                 rows.append({"family": "body", "candidate": candidate, "reference": reference,
                              "metric": metric, "difference": mean, "ci_low": low, "ci_high": high,
+                             "repetitions": len(indices), "bootstrap_seed": 20261006})
+            for metric in SPATIAL_BODY:
+                candidate_values = spatial_draws[candidate][metric]
+                reference_values = spatial_draws[reference][metric]
+                delta = candidate_values[1:] - reference_values[1:]
+                if not np.all(np.isfinite(delta)):
+                    raise ValueError(f"nonfinite spatial bootstrap difference: {candidate}, {reference}, {metric}")
+                rows.append({"family": "body", "candidate": candidate, "reference": reference,
+                             "metric": metric,
+                             "difference": float(candidate_values[0] - reference_values[0]),
+                             "ci_low": float(np.quantile(delta, .025)),
+                             "ci_high": float(np.quantile(delta, .975)),
                              "repetitions": len(indices), "bootstrap_seed": 20261006})
         if candidate != "alpha_1.00":
             for lead_day in range(1, 8):
@@ -205,9 +278,19 @@ def body_bootstrap(body_issue, lead_issue, labels, indices):
     for i, candidate in enumerate(alpha_labels):
         for reference in alpha_labels[i + 1:]:
             for metric in PRIMARY_BODY:
-                left = body_issue.loc[body_issue.label.eq(candidate)].sort_values("issue")[metric]
-                right = body_issue.loc[body_issue.label.eq(reference)].sort_values("issue")[metric]
-                mean, low, high = ci_of_paired(left, right, indices)
+                if metric in SPATIAL_BODY:
+                    candidate_values = spatial_draws[candidate][metric]
+                    reference_values = spatial_draws[reference][metric]
+                    delta = candidate_values[1:] - reference_values[1:]
+                    if not np.all(np.isfinite(delta)):
+                        raise ValueError(f"nonfinite pairwise spatial difference: {candidate}, {reference}, {metric}")
+                    mean, low, high = (float(candidate_values[0] - reference_values[0]),
+                                       float(np.quantile(delta, .025)),
+                                       float(np.quantile(delta, .975)))
+                else:
+                    left = body_issue.loc[body_issue.label.eq(candidate)].sort_values("issue")[metric]
+                    right = body_issue.loc[body_issue.label.eq(reference)].sort_values("issue")[metric]
+                    mean, low, high = ci_of_paired(left, right, indices)
                 rows.append({"family": "body_pairwise", "candidate": candidate, "reference": reference,
                              "metric": metric, "difference": mean, "ci_low": low, "ci_high": high,
                              "repetitions": len(indices), "bootstrap_seed": 20261006})
@@ -710,6 +793,7 @@ def main():
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=False)
     stations = pd.read_csv(args.data_path / "station_order.csv").sort_values("channel_index").reset_index(drop=True)
+    station_types = stations.data_type.to_numpy(str)
     adjacency = np.load(args.data_path / "station_adjacency.npy")
     daylight, _ = build_station_daylight_mask(args.data_path, "val")
     alpha_roots = {0.65: args.alpha065_root, 1.35: args.alpha135_root}
@@ -750,10 +834,32 @@ def main():
     lead_issue = pd.DataFrame(lead_rows)
     body_mean = body_issue.groupby(["alpha", "label"], dropna=False, as_index=False).mean(numeric_only=True).drop(columns="issue")
     lead_mean = lead_issue.groupby(["alpha", "label", "lead_day"], dropna=False, as_index=False).mean(numeric_only=True).drop(columns="issue")
+    # Spatial correlations are nonlinear aggregate statistics.  They must be
+    # recomputed after concatenating the resampled 7-day issue blocks, not
+    # averaged from per-issue correlations (which may be undefined for a
+    # constant station within one issue).
+    indices = moving_block_indices(body_issue.issue.nunique())
+    _, raw_actual = result_arrays(results["raw"])
+    actual_moments = moments_by_issue(raw_actual)
+    full_and_bootstrap = np.vstack(
+        [np.arange(body_issue.issue.nunique(), dtype=np.int64)[None, :], indices]
+    )
+    spatial_draws = {}
+    for label, result in results.items():
+        metrics = spatial_metrics_for_draws(
+            result, actual_moments, full_and_bootstrap, station_types
+        )
+        # Index 0 is the full-validation point estimate. Remaining entries are
+        # paired moving-block bootstrap draws. Keeping both prevents the
+        # bootstrap mean from being mislabeled as the observed difference.
+        spatial_draws[label] = metrics
+        for name, values in metrics.items():
+            body_mean.loc[body_mean.label.eq(label), name] = float(values[0])
     body_mean.to_csv(args.output_dir / "alpha_body_metrics.csv", index=False)
     lead_mean.to_csv(args.output_dir / "alpha_lead_day_metrics.csv", index=False)
-    indices = moving_block_indices(body_issue.issue.nunique())
-    bootstrap_rows = body_bootstrap(body_issue, lead_issue, list(results), indices)
+    bootstrap_rows = body_bootstrap(
+        body_issue, lead_issue, list(results), indices, spatial_draws
+    )
 
     masks = event_masks(args.data_path, args.control_run)
     ramp_rows = []
@@ -857,9 +963,17 @@ def main():
         all(generation_audit[label][key] == control_generation[key] for key in pairing_keys)
         for label in ("alpha_0.65", "alpha_1.35")
     )
-    integrity = {"status": "PASS" if body_equal_pass and generation_pass and generation_pairing_pass else "FAIL",
+    spatial_bootstrap_finite = all(
+        np.all(np.isfinite(values))
+        for label_metrics in spatial_draws.values()
+        for values in label_metrics.values()
+    )
+    integrity = {"status": "PASS" if body_equal_pass and generation_pass and generation_pairing_pass and spatial_bootstrap_finite else "FAIL",
                  "body400_equal": body_equal, "generation": generation_audit,
                  "generation_pairing_pass": generation_pairing_pass,
+                 "evaluation_semantics_version": "stage1a_spatial_bootstrap_v2",
+                 "spatial_bootstrap_method": "paired_7day_blocks_recomputed_from_additive_station_moments",
+                 "spatial_bootstrap_all_finite": spatial_bootstrap_finite,
                  "validation_issue_count": int(body_issue.issue.nunique()), "generation_seed": 424242,
                  "bootstrap_repetitions": 10000, "bootstrap_seed": 20261006, "test_used": False,
                  "runs": {}, "frozen_protocol_hashes": {}}
@@ -908,6 +1022,9 @@ def main():
         f"- Integrity gate: **{integrity['status']}**.",
         f"- Raw Body 400 exact equality across all five member arrays: **{body_equal_pass}**.",
         f"- Validation split / 500 members / generation seed 424242 / test lock: **{generation_pass}**.",
+        "- Spatial/correlation CIs are recomputed from concatenated paired 7-day bootstrap blocks; "
+        "undefined per-issue correlations are never averaged or silently converted into a failed gate.",
+        f"- All recomputed spatial point estimates and bootstrap draws finite: **{spatial_bootstrap_finite}**.",
         f"- Frozen protocol unchanged from launch through selection: **{integrity['protocol_unchanged_during_run']}**.",
         "- Each new run separately passed target CUDA/AMP, 20,588-trainable-parameter, Raw-state hash and post-training integrity gates.", "",
         "## B. Ordinary 168 h Body quality", "",
