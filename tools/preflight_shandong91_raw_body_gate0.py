@@ -57,7 +57,7 @@ def main() -> None:
         raise RuntimeError("--device cuda requested but torch.cuda.is_available() is false")
     if args.amp and args.device != "cuda":
         raise ValueError("--amp requires --device cuda")
-    device = torch.device(args.device)
+    device = torch.device("cuda:0" if args.device == "cuda" else "cpu")
     dtype = torch.float32
     amp_enabled = bool(args.amp)
     if device.type == "cuda":
