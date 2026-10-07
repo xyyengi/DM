@@ -1,0 +1,258 @@
+{
+  "all_checks_passed": true,
+  "checks": [
+    {
+      "number": 1,
+      "name": "NaN / Inf",
+      "passed": true,
+      "detail": "stored invalid positions use neutral 0 with valid_mask=0"
+    },
+    {
+      "number": 2,
+      "name": "node order",
+      "passed": true,
+      "detail": "node_order.csv is exactly node_id 1..91"
+    },
+    {
+      "number": 3,
+      "name": "91 nodes / 140 lines",
+      "passed": true,
+      "detail": "binary adjacency symmetric; 140 audited edges"
+    },
+    {
+      "number": 4,
+      "name": "MW residual relation",
+      "passed": true,
+      "detail": "max error=0"
+    },
+    {
+      "number": 5,
+      "name": "normalized residual relation",
+      "passed": true,
+      "detail": "max error=0"
+    },
+    {
+      "number": 6,
+      "name": "MW-normalized-MW roundtrip",
+      "passed": true,
+      "detail": "max error=0.000513511 MW"
+    },
+    {
+      "number": 7,
+      "name": "invalid excluded from scale",
+      "passed": true,
+      "detail": "q99.5 computed after valid-mask selection"
+    },
+    {
+      "number": 8,
+      "name": "load scales train only",
+      "passed": true,
+      "detail": "validation/test excluded"
+    },
+    {
+      "number": 9,
+      "name": "renewable scales",
+      "passed": true,
+      "detail": "actual and forecast share unit-detail capacity"
+    },
+    {
+      "number": 10,
+      "name": "B conflict metadata",
+      "passed": true,
+      "detail": "both alternate capacities retained"
+    },
+    {
+      "number": 11,
+      "name": "no normalized clipping",
+      "passed": true,
+      "detail": "direct division only; normalized values may be outside [0,1]"
+    },
+    {
+      "number": 12,
+      "name": "15min to hourly rule",
+      "passed": true,
+      "detail": "4/4, 3/4, 2/4 mean valid; <=1/4 invalid"
+    },
+    {
+      "number": 13,
+      "name": "168h continuity",
+      "passed": true,
+      "detail": "all windows contain 168 consecutive hourly targets"
+    },
+    {
+      "number": 14,
+      "name": "split target overlap",
+      "passed": true,
+      "detail": "overlap target timestamps=0"
+    },
+    {
+      "number": 15,
+      "name": "type supervision ratios",
+      "passed": true,
+      "detail": "per-type rates saved in quality report"
+    },
+    {
+      "number": 16,
+      "name": "A/B/D/E mask correspondence",
+      "passed": true,
+      "detail": "D series=10, E disabled=7"
+    },
+    {
+      "number": 17,
+      "name": "E channels excluded from supervision",
+      "passed": true,
+      "detail": "7 severe E channels have channel_train_mask=0"
+    },
+    {
+      "number": 18,
+      "name": "absent resources excluded",
+      "passed": true,
+      "detail": "node_type_mask gates effective supervision"
+    },
+    {
+      "number": 19,
+      "name": "stitched forecast order",
+      "passed": true,
+      "detail": "ordered by target timestamp; not true 7-day issue-time forecast"
+    },
+    {
+      "number": 20,
+      "name": "output shapes and metadata",
+      "passed": true,
+      "detail": "hourly shape=(8760, 91, 3); manifest records all npy shapes"
+    }
+  ],
+  "effective_supervision_by_type": {
+    "wind_actual": {
+      "valid_supervision_points": 507511,
+      "possible_points": 508080,
+      "ratio": 0.9988800976224217
+    },
+    "wind_forecast": {
+      "valid_supervision_points": 503066,
+      "possible_points": 508080,
+      "ratio": 0.9901314753582113
+    },
+    "wind_residual": {
+      "valid_supervision_points": 502581,
+      "possible_points": 508080,
+      "ratio": 0.9891769012753897
+    },
+    "solar_actual": {
+      "valid_supervision_points": 481767,
+      "possible_points": 481800,
+      "ratio": 0.9999315068493151
+    },
+    "solar_forecast": {
+      "valid_supervision_points": 481625,
+      "possible_points": 481800,
+      "ratio": 0.9996367787463678
+    },
+    "solar_residual": {
+      "valid_supervision_points": 481621,
+      "possible_points": 481800,
+      "ratio": 0.9996284765462847
+    },
+    "load_actual": {
+      "valid_supervision_points": 674520,
+      "possible_points": 674520,
+      "ratio": 1.0
+    },
+    "load_forecast": {
+      "valid_supervision_points": 674520,
+      "possible_points": 674520,
+      "ratio": 1.0
+    },
+    "load_residual": {
+      "valid_supervision_points": 674520,
+      "possible_points": 674520,
+      "ratio": 1.0
+    }
+  },
+  "hourly_value_ranges": {
+    "wind": {
+      "actual_mw": {
+        "min": -25.24250030517578,
+        "max": 3826.98388671875,
+        "mean": 136.66368103027344
+      },
+      "forecast_mw": {
+        "min": -99.0,
+        "max": 3837.18994140625,
+        "mean": 154.73883056640625
+      },
+      "actual_normalized": {
+        "min": -0.019258704036474228,
+        "max": 1.491897463798523,
+        "mean": 0.23736007511615753
+      },
+      "forecast_normalized": {
+        "min": -2.0625,
+        "max": 1.4958641529083252,
+        "mean": 0.2608887553215027
+      },
+      "scale": {
+        "min": 48.0,
+        "max": 2583.65,
+        "mean": 526.2364406779661
+      }
+    },
+    "solar": {
+      "actual_mw": {
+        "min": -2.8475000858306885,
+        "max": 1749.885009765625,
+        "mean": 66.40865325927734
+      },
+      "forecast_mw": {
+        "min": -198.0,
+        "max": 1713.68505859375,
+        "mean": 84.36457824707031
+      },
+      "actual_normalized": {
+        "min": -0.03836734592914581,
+        "max": 1.4244900941848755,
+        "mean": 0.1158696785569191
+      },
+      "forecast_normalized": {
+        "min": -0.8812925815582275,
+        "max": 1.4977431297302246,
+        "mean": 0.14615599811077118
+      },
+      "scale": {
+        "min": 30.646,
+        "max": 3042.38,
+        "mean": 554.0450327868851
+      }
+    },
+    "load": {
+      "actual_mw": {
+        "min": 321.8770446777344,
+        "max": 9303.4970703125,
+        "mean": 1056.2664794921875
+      },
+      "forecast_mw": {
+        "min": 322.13201904296875,
+        "max": 9127.0927734375,
+        "mean": 1058.810791015625
+      },
+      "actual_normalized": {
+        "min": 0.4234292805194855,
+        "max": 1.0707030296325684,
+        "mean": 0.6753906607627869
+      },
+      "forecast_normalized": {
+        "min": 0.423764705657959,
+        "max": 1.0504013299942017,
+        "mean": 0.6770176291465759
+      },
+      "scale": {
+        "min": 760.1671135344383,
+        "max": 8689.147969025349,
+        "mean": 1563.9339450704274
+      }
+    }
+  },
+  "roundtrip_max_abs_error_mw": 0.0005135105529916473,
+  "mw_residual_max_abs_error": 0.0,
+  "normalized_residual_max_abs_error": 0.0
+}

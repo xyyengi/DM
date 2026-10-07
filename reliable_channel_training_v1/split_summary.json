@@ -1,0 +1,218 @@
+{
+  "train": {
+    "split_start": "2025-01-01T00:00:00+08:00",
+    "split_end": "2025-10-31T23:00:00+08:00",
+    "samples": 298,
+    "first_window_start": "2025-01-01T00:00:00+08:00",
+    "last_window_start": "2025-10-25T00:00:00+08:00",
+    "array_shapes": {
+      "actual": [
+        298,
+        168,
+        91,
+        3
+      ],
+      "forecast": [
+        298,
+        168,
+        91,
+        3
+      ],
+      "residual": [
+        298,
+        168,
+        91,
+        3
+      ],
+      "actual_mw": [
+        298,
+        168,
+        91,
+        3
+      ],
+      "forecast_mw": [
+        298,
+        168,
+        91,
+        3
+      ],
+      "residual_mw": [
+        298,
+        168,
+        91,
+        3
+      ],
+      "actual_valid_mask": [
+        298,
+        168,
+        91,
+        3
+      ],
+      "forecast_valid_mask": [
+        298,
+        168,
+        91,
+        3
+      ],
+      "residual_valid_mask": [
+        298,
+        168,
+        91,
+        3
+      ],
+      "time_mark": [
+        298,
+        168,
+        8
+      ],
+      "window_position": [
+        298,
+        168
+      ]
+    }
+  },
+  "validation": {
+    "split_start": "2025-11-01T00:00:00+08:00",
+    "split_end": "2025-11-30T23:00:00+08:00",
+    "samples": 24,
+    "first_window_start": "2025-11-01T00:00:00+08:00",
+    "last_window_start": "2025-11-24T00:00:00+08:00",
+    "array_shapes": {
+      "actual": [
+        24,
+        168,
+        91,
+        3
+      ],
+      "forecast": [
+        24,
+        168,
+        91,
+        3
+      ],
+      "residual": [
+        24,
+        168,
+        91,
+        3
+      ],
+      "actual_mw": [
+        24,
+        168,
+        91,
+        3
+      ],
+      "forecast_mw": [
+        24,
+        168,
+        91,
+        3
+      ],
+      "residual_mw": [
+        24,
+        168,
+        91,
+        3
+      ],
+      "actual_valid_mask": [
+        24,
+        168,
+        91,
+        3
+      ],
+      "forecast_valid_mask": [
+        24,
+        168,
+        91,
+        3
+      ],
+      "residual_valid_mask": [
+        24,
+        168,
+        91,
+        3
+      ],
+      "time_mark": [
+        24,
+        168,
+        8
+      ],
+      "window_position": [
+        24,
+        168
+      ]
+    }
+  },
+  "test": {
+    "split_start": "2025-12-01T00:00:00+08:00",
+    "split_end": "2025-12-31T23:00:00+08:00",
+    "samples": 25,
+    "first_window_start": "2025-12-01T00:00:00+08:00",
+    "last_window_start": "2025-12-25T00:00:00+08:00",
+    "array_shapes": {
+      "actual": [
+        25,
+        168,
+        91,
+        3
+      ],
+      "forecast": [
+        25,
+        168,
+        91,
+        3
+      ],
+      "residual": [
+        25,
+        168,
+        91,
+        3
+      ],
+      "actual_mw": [
+        25,
+        168,
+        91,
+        3
+      ],
+      "forecast_mw": [
+        25,
+        168,
+        91,
+        3
+      ],
+      "residual_mw": [
+        25,
+        168,
+        91,
+        3
+      ],
+      "actual_valid_mask": [
+        25,
+        168,
+        91,
+        3
+      ],
+      "forecast_valid_mask": [
+        25,
+        168,
+        91,
+        3
+      ],
+      "residual_valid_mask": [
+        25,
+        168,
+        91,
+        3
+      ],
+      "time_mark": [
+        25,
+        168,
+        8
+      ],
+      "window_position": [
+        25,
+        168
+      ]
+    }
+  }
+}

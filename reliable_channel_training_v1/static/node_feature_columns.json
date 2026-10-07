@@ -1,0 +1,12 @@
+[
+  "node_id_div_91",
+  "wind_capacity_mw",
+  "solar_capacity_mw",
+  "load_train_q99.5_mw",
+  "has_wind",
+  "has_solar",
+  "has_load",
+  "train_wind",
+  "train_solar",
+  "train_load"
+]

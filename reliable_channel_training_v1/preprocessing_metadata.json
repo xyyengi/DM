@@ -1,0 +1,292 @@
+{
+  "version": "reliable_channel_training_v1",
+  "purpose": "91-node wind/solar/load reliable-channel training input for 168h joint scenario generation",
+  "raw_sources_modified": false,
+  "channel_order": [
+    "Wind",
+    "Solar",
+    "Load"
+  ],
+  "dynamic_shape_order": [
+    "time",
+    "node",
+    "channel"
+  ],
+  "timezone": "Asia/Shanghai",
+  "neutral_fill_value": 0.0,
+  "neutral_fill_requires_valid_mask": true,
+  "short_gap_threshold_15min_points": 4,
+  "short_gap_rule_note": "Project data-quality rule for internal gaps <=1 hour; not an optimized model hyperparameter.",
+  "D_pollution_source": "existing raw_excel_anomaly_trace.csv only; no expanded anomaly search",
+  "capacity_rule": "unit-detail summed capacity; B alternate parameter-table values retained",
+  "load_scale_rule": "q99.5 of cleaned valid 15-minute actual values in training period only",
+  "residual_definition": "actual - forecast",
+  "residual_valid_rule": "actual_valid & forecast_valid",
+  "hourly_aggregation": {
+    "4_of_4": "mean of 4 valid values, hour valid",
+    "3_of_4": "mean of 3 valid values, hour valid",
+    "2_of_4": "mean of 2 valid values, hour valid and low confidence",
+    "0_or_1_of_4": "neutral storage value with hour valid_mask=0"
+  },
+  "forecast_condition_semantics": "168h condition stitched from rolling forecasts by target timestamp; not a true once-issued 7-day-ahead forecast",
+  "window_position_semantics": "0..167 position inside the constructed window; not forecast lead time",
+  "splits": {
+    "train": {
+      "split_start": "2025-01-01T00:00:00+08:00",
+      "split_end": "2025-10-31T23:00:00+08:00",
+      "samples": 298,
+      "first_window_start": "2025-01-01T00:00:00+08:00",
+      "last_window_start": "2025-10-25T00:00:00+08:00",
+      "array_shapes": {
+        "actual": [
+          298,
+          168,
+          91,
+          3
+        ],
+        "forecast": [
+          298,
+          168,
+          91,
+          3
+        ],
+        "residual": [
+          298,
+          168,
+          91,
+          3
+        ],
+        "actual_mw": [
+          298,
+          168,
+          91,
+          3
+        ],
+        "forecast_mw": [
+          298,
+          168,
+          91,
+          3
+        ],
+        "residual_mw": [
+          298,
+          168,
+          91,
+          3
+        ],
+        "actual_valid_mask": [
+          298,
+          168,
+          91,
+          3
+        ],
+        "forecast_valid_mask": [
+          298,
+          168,
+          91,
+          3
+        ],
+        "residual_valid_mask": [
+          298,
+          168,
+          91,
+          3
+        ],
+        "time_mark": [
+          298,
+          168,
+          8
+        ],
+        "window_position": [
+          298,
+          168
+        ]
+      }
+    },
+    "validation": {
+      "split_start": "2025-11-01T00:00:00+08:00",
+      "split_end": "2025-11-30T23:00:00+08:00",
+      "samples": 24,
+      "first_window_start": "2025-11-01T00:00:00+08:00",
+      "last_window_start": "2025-11-24T00:00:00+08:00",
+      "array_shapes": {
+        "actual": [
+          24,
+          168,
+          91,
+          3
+        ],
+        "forecast": [
+          24,
+          168,
+          91,
+          3
+        ],
+        "residual": [
+          24,
+          168,
+          91,
+          3
+        ],
+        "actual_mw": [
+          24,
+          168,
+          91,
+          3
+        ],
+        "forecast_mw": [
+          24,
+          168,
+          91,
+          3
+        ],
+        "residual_mw": [
+          24,
+          168,
+          91,
+          3
+        ],
+        "actual_valid_mask": [
+          24,
+          168,
+          91,
+          3
+        ],
+        "forecast_valid_mask": [
+          24,
+          168,
+          91,
+          3
+        ],
+        "residual_valid_mask": [
+          24,
+          168,
+          91,
+          3
+        ],
+        "time_mark": [
+          24,
+          168,
+          8
+        ],
+        "window_position": [
+          24,
+          168
+        ]
+      }
+    },
+    "test": {
+      "split_start": "2025-12-01T00:00:00+08:00",
+      "split_end": "2025-12-31T23:00:00+08:00",
+      "samples": 25,
+      "first_window_start": "2025-12-01T00:00:00+08:00",
+      "last_window_start": "2025-12-25T00:00:00+08:00",
+      "array_shapes": {
+        "actual": [
+          25,
+          168,
+          91,
+          3
+        ],
+        "forecast": [
+          25,
+          168,
+          91,
+          3
+        ],
+        "residual": [
+          25,
+          168,
+          91,
+          3
+        ],
+        "actual_mw": [
+          25,
+          168,
+          91,
+          3
+        ],
+        "forecast_mw": [
+          25,
+          168,
+          91,
+          3
+        ],
+        "residual_mw": [
+          25,
+          168,
+          91,
+          3
+        ],
+        "actual_valid_mask": [
+          25,
+          168,
+          91,
+          3
+        ],
+        "forecast_valid_mask": [
+          25,
+          168,
+          91,
+          3
+        ],
+        "residual_valid_mask": [
+          25,
+          168,
+          91,
+          3
+        ],
+        "time_mark": [
+          25,
+          168,
+          8
+        ],
+        "window_position": [
+          25,
+          168
+        ]
+      }
+    }
+  },
+  "imputation_method_codes": {
+    "0": "invalid_or_resource_absent",
+    "1": "original_valid_observation",
+    "2": "linear_time_interpolation_internal_gap_le_4_points"
+  },
+  "anomaly_invalidation_counts": {
+    "actual": 24531,
+    "forecast": 47379
+  },
+  "severe_E_channel_train_disabled": [
+    {
+      "data_type": "solar",
+      "node_id": 40
+    },
+    {
+      "data_type": "solar",
+      "node_id": 54
+    },
+    {
+      "data_type": "solar",
+      "node_id": 56
+    },
+    {
+      "data_type": "solar",
+      "node_id": 58
+    },
+    {
+      "data_type": "solar",
+      "node_id": 60
+    },
+    {
+      "data_type": "solar",
+      "node_id": 67
+    },
+    {
+      "data_type": "wind",
+      "node_id": 63
+    }
+  ],
+  "solar81_policy": "retain valid observations; 27.5h long gap remains invalid",
+  "model_loss_rule": "effective_mask = valid_mask * channel_train_mask * node_type_mask"
+}

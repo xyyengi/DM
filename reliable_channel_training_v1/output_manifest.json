@@ -1,0 +1,657 @@
+{
+  "15min/actual_mw.npy": {
+    "shape": [
+      35040,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 38263680,
+    "sha256": "9f9eb82467a6d36949f679e6d28bb202bbe3a9e12cf4725efb19fb4f89edc403"
+  },
+  "15min/forecast_mw.npy": {
+    "shape": [
+      35040,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 38263680,
+    "sha256": "032045453b897415241ca93d59d7b8079daca745fe273acd4e35562aaa74c0a4"
+  },
+  "15min/residual_mw.npy": {
+    "shape": [
+      35040,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 38263680,
+    "sha256": "66291fac278aff985dbec4bb0a06cc6d54ec0dfdf1609430784b01c4c523b14f"
+  },
+  "15min/actual_valid_mask.npy": {
+    "shape": [
+      35040,
+      91,
+      3
+    ],
+    "dtype": "bool",
+    "bytes": 9565920,
+    "sha256": "19346261c0bdfbc15dc28e218d8e473726b074d6c782430078757d3e09ad94ef"
+  },
+  "15min/forecast_valid_mask.npy": {
+    "shape": [
+      35040,
+      91,
+      3
+    ],
+    "dtype": "bool",
+    "bytes": 9565920,
+    "sha256": "937f3dceced2138a30b34d5d166b3a1ae32869e8dca4df805b60f11303a9ef76"
+  },
+  "15min/residual_valid_mask.npy": {
+    "shape": [
+      35040,
+      91,
+      3
+    ],
+    "dtype": "bool",
+    "bytes": 9565920,
+    "sha256": "0018893b7a66221c6d8e58e9ccf115344ea0c25e9ef3ca0b5cd51e698b40bbf6"
+  },
+  "15min/actual_imputation_method.npy": {
+    "shape": [
+      35040,
+      91,
+      3
+    ],
+    "dtype": "uint8",
+    "bytes": 9565920,
+    "sha256": "8090a5fdf3c87bb0b41a770789589a9cbdbee33341370bea04f5eecf0b3185e3"
+  },
+  "15min/forecast_imputation_method.npy": {
+    "shape": [
+      35040,
+      91,
+      3
+    ],
+    "dtype": "uint8",
+    "bytes": 9565920,
+    "sha256": "610df5b1f57d21ae0b12da0ba34a5b3ba38108649ea15710c0889c7e4b5d4bac"
+  },
+  "15min/actual_normalized.npy": {
+    "shape": [
+      35040,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 38263680,
+    "sha256": "efe5d1265e801aee792e4f0f611f6233ddd7be5581bc9ca598bdd6810bd1c720"
+  },
+  "15min/forecast_normalized.npy": {
+    "shape": [
+      35040,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 38263680,
+    "sha256": "4fb6ba171dff5b207973edbacdc70778b6312114f9de7fac0fa86b8d6f25dcde"
+  },
+  "15min/residual_normalized.npy": {
+    "shape": [
+      35040,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 38263680,
+    "sha256": "46262c25a65cb60997306c5c1b6c746f8e55cdf8292fb8fa428e0778c6ddeb5e"
+  },
+  "hourly/actual_mw.npy": {
+    "shape": [
+      8760,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 9565920,
+    "sha256": "8e2e51f0b1c7cd495c41f06cafc12d101c0dd8cb5af98f1843be7b5c08866ab7"
+  },
+  "hourly/forecast_mw.npy": {
+    "shape": [
+      8760,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 9565920,
+    "sha256": "c0383438132e1787a02825193d3a34dae04fc53cb686bf4880bf1b971e34c03b"
+  },
+  "hourly/residual_mw.npy": {
+    "shape": [
+      8760,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 9565920,
+    "sha256": "8cf76de68e9c9978829754371326ce966e5547e612dda8fe035a53f968a461c1"
+  },
+  "hourly/actual_valid_mask.npy": {
+    "shape": [
+      8760,
+      91,
+      3
+    ],
+    "dtype": "bool",
+    "bytes": 2391480,
+    "sha256": "518b6534173b1bd36c856ca762e3ac41f67769514560cf466e8c3e383cbcaf32"
+  },
+  "hourly/forecast_valid_mask.npy": {
+    "shape": [
+      8760,
+      91,
+      3
+    ],
+    "dtype": "bool",
+    "bytes": 2391480,
+    "sha256": "ca3debfeab0047628cbe54619e092739b16e1afcdb5626be8759aae72df1a14d"
+  },
+  "hourly/residual_valid_mask.npy": {
+    "shape": [
+      8760,
+      91,
+      3
+    ],
+    "dtype": "bool",
+    "bytes": 2391480,
+    "sha256": "85761203eeaf71e1cb6ed516249e3838f64209377170c43e9b4515ef3621a269"
+  },
+  "hourly/actual_valid_15min_count.npy": {
+    "shape": [
+      8760,
+      91,
+      3
+    ],
+    "dtype": "uint8",
+    "bytes": 2391480,
+    "sha256": "c3a3b44c420e8a208d3ec1a3ad067bd13dcdf2abca78afbf7f8fc8bb14e27c7d"
+  },
+  "hourly/forecast_valid_15min_count.npy": {
+    "shape": [
+      8760,
+      91,
+      3
+    ],
+    "dtype": "uint8",
+    "bytes": 2391480,
+    "sha256": "577da1fff3aef1dc51e69eb089542a5b1f6de8e80890457aaacc878bc8af77e9"
+  },
+  "hourly/actual_normalized.npy": {
+    "shape": [
+      8760,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 9565920,
+    "sha256": "ed7731208e52e84a5471d1487edcef31be1f936c4e8814f0b06822bd9d2d9e3a"
+  },
+  "hourly/forecast_normalized.npy": {
+    "shape": [
+      8760,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 9565920,
+    "sha256": "ca8c16bda3acfd311f495d4c9f201436bd43e499b0f97e0e8b8e5816eed0a2f6"
+  },
+  "hourly/residual_normalized.npy": {
+    "shape": [
+      8760,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 9565920,
+    "sha256": "5303413c245257224c2df80ab0bab69cacb849ab9f5d91880eecfc48e16176a7"
+  },
+  "windows168/train/actual.npy": {
+    "shape": [
+      298,
+      168,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 54669888,
+    "sha256": "419bd2b2b5c8017a2cdebeeafcdc5ea4eed819a4f61fe9c3e742223c1aa5897c"
+  },
+  "windows168/train/forecast.npy": {
+    "shape": [
+      298,
+      168,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 54669888,
+    "sha256": "4b1e63c9c8bb98e032335f23349f84bebfc1279bb61e2178b2ea9ff2bef63812"
+  },
+  "windows168/train/residual.npy": {
+    "shape": [
+      298,
+      168,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 54669888,
+    "sha256": "825f01395d3a8d1d2ee1d11ca25da2b107d94d9cb533116bb5d07789f22a5436"
+  },
+  "windows168/train/actual_mw.npy": {
+    "shape": [
+      298,
+      168,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 54669888,
+    "sha256": "54d866df1beddfaeb9c175c3d62772aa485f218485692758039233172587220a"
+  },
+  "windows168/train/forecast_mw.npy": {
+    "shape": [
+      298,
+      168,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 54669888,
+    "sha256": "e9c478e187db24336059964693ba60843d3beebf267366d50fa5521991e33807"
+  },
+  "windows168/train/residual_mw.npy": {
+    "shape": [
+      298,
+      168,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 54669888,
+    "sha256": "057007b3871a500584030694e56ef9f6589c4f6deb5e14c383806b688807f5c4"
+  },
+  "windows168/train/actual_valid_mask.npy": {
+    "shape": [
+      298,
+      168,
+      91,
+      3
+    ],
+    "dtype": "bool",
+    "bytes": 13667472,
+    "sha256": "d920f50c18c2de8bbce1e56b597ea23a723a28442ec8518943aa75460fd0d0c7"
+  },
+  "windows168/train/forecast_valid_mask.npy": {
+    "shape": [
+      298,
+      168,
+      91,
+      3
+    ],
+    "dtype": "bool",
+    "bytes": 13667472,
+    "sha256": "61afe90edcf03b666a8ec09c885343e453086285850c61915480ca8a2bb5b68c"
+  },
+  "windows168/train/residual_valid_mask.npy": {
+    "shape": [
+      298,
+      168,
+      91,
+      3
+    ],
+    "dtype": "bool",
+    "bytes": 13667472,
+    "sha256": "ae0193e902802f4121bae4424aa3c514701be43f9a711add4f4f3c60b9e365f4"
+  },
+  "windows168/train/time_mark.npy": {
+    "shape": [
+      298,
+      168,
+      8
+    ],
+    "dtype": "float32",
+    "bytes": 1602048,
+    "sha256": "67e7ddf06c76905a6aab2b3f97b80867fad183d845ee50c9ad07cb77f74aa6ec"
+  },
+  "windows168/train/window_position.npy": {
+    "shape": [
+      298,
+      168
+    ],
+    "dtype": "int16",
+    "bytes": 100128,
+    "sha256": "4baed36d97c89e41cfa55deae89161c4a50810b030d97d033cf70d510f1b5538"
+  },
+  "windows168/validation/actual.npy": {
+    "shape": [
+      24,
+      168,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 4402944,
+    "sha256": "f6d3c42751e330cf4005905397a7ee7b64098110794a2354028c2b36c0b1b343"
+  },
+  "windows168/validation/forecast.npy": {
+    "shape": [
+      24,
+      168,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 4402944,
+    "sha256": "32ef3eb64d28e71513f482e12616ce6a7ea32a66663ef29fa103edcc9078b5fb"
+  },
+  "windows168/validation/residual.npy": {
+    "shape": [
+      24,
+      168,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 4402944,
+    "sha256": "404f96c747eb9d1ece13d1772ae7745013f9c1430de712d949fca5b0fdb1c1c6"
+  },
+  "windows168/validation/actual_mw.npy": {
+    "shape": [
+      24,
+      168,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 4402944,
+    "sha256": "3da831b460919afbfa687867ba77c9be008cc3b73203fde9bd86171063a7aa45"
+  },
+  "windows168/validation/forecast_mw.npy": {
+    "shape": [
+      24,
+      168,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 4402944,
+    "sha256": "7172dbd54de58dc002d7dedd693d47bec26ce3fe17e80eb33058ac3d6c755c1c"
+  },
+  "windows168/validation/residual_mw.npy": {
+    "shape": [
+      24,
+      168,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 4402944,
+    "sha256": "e9924f4fcb5e5586914d49f034b579a36feea04c666a04bb1be3d2bebccf7ca4"
+  },
+  "windows168/validation/actual_valid_mask.npy": {
+    "shape": [
+      24,
+      168,
+      91,
+      3
+    ],
+    "dtype": "bool",
+    "bytes": 1100736,
+    "sha256": "28c845367ce92ad1a26974be97dc50d05ed61a1542e94cb086958db0dcd27ec4"
+  },
+  "windows168/validation/forecast_valid_mask.npy": {
+    "shape": [
+      24,
+      168,
+      91,
+      3
+    ],
+    "dtype": "bool",
+    "bytes": 1100736,
+    "sha256": "0fc5313d7e281c41487b2eb93ddf2fce420b0d787c162ffe423dca3ba82bd815"
+  },
+  "windows168/validation/residual_valid_mask.npy": {
+    "shape": [
+      24,
+      168,
+      91,
+      3
+    ],
+    "dtype": "bool",
+    "bytes": 1100736,
+    "sha256": "1c3d17c7dd5d2135e484fabf36e77a9016ecb0acd72f5d872bb7b73d11cf1aaf"
+  },
+  "windows168/validation/time_mark.npy": {
+    "shape": [
+      24,
+      168,
+      8
+    ],
+    "dtype": "float32",
+    "bytes": 129024,
+    "sha256": "ef448a94c324ae22258f5daa37c78729882c28348d96f57fc1dcbed0b4140964"
+  },
+  "windows168/validation/window_position.npy": {
+    "shape": [
+      24,
+      168
+    ],
+    "dtype": "int16",
+    "bytes": 8064,
+    "sha256": "2cefd483030dfa02035cd49fe939eb6001f6d094a80c0cafab63798dbdeacfa9"
+  },
+  "windows168/test/actual.npy": {
+    "shape": [
+      25,
+      168,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 4586400,
+    "sha256": "7069202a38ee5f1ed489510bfb4f52360d898d7bf451d723ff8727a1cbe4fecb"
+  },
+  "windows168/test/forecast.npy": {
+    "shape": [
+      25,
+      168,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 4586400,
+    "sha256": "41561096064987ed7faa3afea2faa315972e85d79ca7f964e1f03905ee611c45"
+  },
+  "windows168/test/residual.npy": {
+    "shape": [
+      25,
+      168,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 4586400,
+    "sha256": "62f012d9134fcb639cd69be7b0146d4bbf5b98665725f600b64d2649bcde9b13"
+  },
+  "windows168/test/actual_mw.npy": {
+    "shape": [
+      25,
+      168,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 4586400,
+    "sha256": "ad7ca0207eb96dad4499d0e399aa930ff69307b4176a9b6f0bbadd97f5a39413"
+  },
+  "windows168/test/forecast_mw.npy": {
+    "shape": [
+      25,
+      168,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 4586400,
+    "sha256": "73c33ba40e8ff6050f96aab1d04244ca2d0582e91c65bb88d34ddf13605c2e79"
+  },
+  "windows168/test/residual_mw.npy": {
+    "shape": [
+      25,
+      168,
+      91,
+      3
+    ],
+    "dtype": "float32",
+    "bytes": 4586400,
+    "sha256": "4e6dd155ed88d8b9873d95d242fd5aa2744d1524538091600f6d02b358c815a1"
+  },
+  "windows168/test/actual_valid_mask.npy": {
+    "shape": [
+      25,
+      168,
+      91,
+      3
+    ],
+    "dtype": "bool",
+    "bytes": 1146600,
+    "sha256": "8c4e9e408cf8625d476b481c064e0ba8a5436cd2534fc11f33a68d5c9843a76a"
+  },
+  "windows168/test/forecast_valid_mask.npy": {
+    "shape": [
+      25,
+      168,
+      91,
+      3
+    ],
+    "dtype": "bool",
+    "bytes": 1146600,
+    "sha256": "02ffd8865c2deb880525bcd236e1ae9f109fe7a4bc44c912f688ebe5ab5f4b3b"
+  },
+  "windows168/test/residual_valid_mask.npy": {
+    "shape": [
+      25,
+      168,
+      91,
+      3
+    ],
+    "dtype": "bool",
+    "bytes": 1146600,
+    "sha256": "daca2a4d3484ebdd231a841b296f2f730f5d35ea5dc1dd0b96a23bb3fba4a3ae"
+  },
+  "windows168/test/time_mark.npy": {
+    "shape": [
+      25,
+      168,
+      8
+    ],
+    "dtype": "float32",
+    "bytes": 134400,
+    "sha256": "1f568c7cbb0682b46929773720c95a0fd976f185e02ed8f25560ee131e2b5688"
+  },
+  "windows168/test/window_position.npy": {
+    "shape": [
+      25,
+      168
+    ],
+    "dtype": "int16",
+    "bytes": 8400,
+    "sha256": "3889e303e60fec2db8f5f5d70031085b38aec53b60070f2d5163e1d9e92586be"
+  },
+  "static/channel_train_mask.npy": {
+    "shape": [
+      91,
+      3
+    ],
+    "dtype": "bool",
+    "bytes": 273,
+    "sha256": "68423a157322dfa584b325f64d2bcebfb9e15a6f8c996be06735481d2481f3d5"
+  },
+  "static/node_features.npy": {
+    "shape": [
+      91,
+      10
+    ],
+    "dtype": "float32",
+    "bytes": 3640,
+    "sha256": "7b9f98b4087865314a55320e607ccbad35ef5962405551482ad1950d6ebf5e19"
+  },
+  "static/adjacency_binary_no_self_loop.npy": {
+    "shape": [
+      91,
+      91
+    ],
+    "dtype": "uint8",
+    "bytes": 8281,
+    "sha256": "3565051053881e8fb9acee0c64b1d88d52ecb05cd91361eb93324ee05746d4a8"
+  },
+  "static/adjacency_binary_with_self_loop.npy": {
+    "shape": [
+      91,
+      91
+    ],
+    "dtype": "uint8",
+    "bytes": 8281,
+    "sha256": "34c48e9facb9fae9affd5d661980f0412973988e4a75178872d99cdc7474da6f"
+  },
+  "static/edge_features.npy": {
+    "shape": [
+      140,
+      8
+    ],
+    "dtype": "float32",
+    "bytes": 4480,
+    "sha256": "78ad7d08b8c36a27adc856b1187781549cb23cf8db17a1788e14fa74b1c0549e"
+  },
+  "static/edge_index.npy": {
+    "shape": [
+      2,
+      140
+    ],
+    "dtype": "int64",
+    "bytes": 2240,
+    "sha256": "569ebca8c034907261a2daee62fd51fafbb29174ae9fc0c9ec112eda55a9b4a3"
+  },
+  "static/line_reactance_actual.npy": {
+    "shape": [
+      91,
+      91
+    ],
+    "dtype": "float32",
+    "bytes": 33124,
+    "sha256": "3a587ebe6fd778d41bdf00e47d8e57baa9553f7642c35149e43825daf9235bd2"
+  },
+  "static/line_thermal_limit_mw.npy": {
+    "shape": [
+      91,
+      91
+    ],
+    "dtype": "float32",
+    "bytes": 33124,
+    "sha256": "1f0b03de762ae56dbc749b52c564fbbdfd25ac1f60cd2a83908c31df9a9087b0"
+  },
+  "static/node_type_mask.npy": {
+    "shape": [
+      91,
+      3
+    ],
+    "dtype": "uint8",
+    "bytes": 273,
+    "sha256": "0c9c714b9751d070af0ca30f3a67086d9d5161915284230e057e018324066416"
+  }
+}
