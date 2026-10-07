@@ -1,0 +1,29 @@
+experiment:
+  name: shandong91_reliable_channel_168h
+  family: shandong91
+  mode: dry_run_only
+data:
+  data_path: ./reliable_channel_training_v1
+  splits: [train, validation, test]
+  sequence_length: 168
+  node_count: 91
+  channel_order: [Wind, Solar, Load]
+  residual_definition: actual_minus_forecast
+  use_published_normalization: true
+  neutral_fill_value: 0.0
+  graph_inputs_loaded: true
+model_adapter:
+  input_shape: [batch, 168, 91, 3]
+  flattened_feature_count: 273
+  output_shape: [batch, 168, 91, 3]
+loss:
+  reduction: masked_elementwise_mean
+  effective_mask: residual_valid_mask*channel_train_mask*node_type_mask
+outputs:
+  checkpoints: checkpoints/shandong91/reliable_channel_168h
+  logs: logs/shandong91/reliable_channel_168h
+  results: results/shandong91/reliable_channel_168h
+launch:
+  formal_training_enabled: false
+  cuda_amp_gate: NOT_RUN
+

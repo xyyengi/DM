@@ -1,0 +1,341 @@
+{
+  "status": "PASS",
+  "scope": "CPU-only Gate 0; one optimizer step; no smoke/formal training; no generation",
+  "device": "cpu",
+  "cuda_amp": "NOT RUN",
+  "formal_training": "NOT RUN",
+  "smoke_training": "NOT RUN",
+  "generation": "NOT RUN",
+  "architecture": "shandong91_heterogeneous_raw_body_v1_no_lead",
+  "checks": {
+    "explicit_resource_type_encoding": {
+      "status": "PASS",
+      "detail": [
+        "has_wind",
+        "has_solar",
+        "has_load"
+      ]
+    },
+    "legacy_lead_branch_disabled": {
+      "status": "PASS",
+      "detail": {
+        "config": false,
+        "forward_arguments": [
+          "self",
+          "noisy_residual",
+          "timestep",
+          "forecast",
+          "forecast_valid_mask",
+          "calendar"
+        ]
+      }
+    },
+    "tail_aux_event_partial_disabled": {
+      "status": "PASS",
+      "detail": "all forbidden switches false"
+    },
+    "forward_shape": {
+      "status": "PASS",
+      "detail": [
+        1,
+        168,
+        91,
+        3
+      ]
+    },
+    "nan_inf": {
+      "status": "PASS",
+      "detail": {
+        "prediction": true,
+        "loss": true
+      }
+    },
+    "backward": {
+      "status": "PASS",
+      "detail": {
+        "finite": true,
+        "l2_norm": 2.2508846601886234,
+        "nonzero_elements": 677958,
+        "tensor_count": 121
+      }
+    },
+    "overall_gradient_finite_nonzero": {
+      "status": "PASS",
+      "detail": {
+        "finite": true,
+        "l2_norm": 2.2508846601886234,
+        "nonzero_elements": 677958,
+        "tensor_count": 121
+      }
+    },
+    "wind_gradient_finite_nonzero": {
+      "status": "PASS",
+      "detail": {
+        "finite": true,
+        "l2_norm": 4.015636383460865,
+        "nonzero_elements": 677892,
+        "tensor_count": 121,
+        "core_backbone_l2_norm": 1.0016142498100145,
+        "loss": 1.1282168626785278
+      }
+    },
+    "solar_gradient_finite_nonzero": {
+      "status": "PASS",
+      "detail": {
+        "finite": true,
+        "l2_norm": 4.010989532907857,
+        "nonzero_elements": 677892,
+        "tensor_count": 121,
+        "core_backbone_l2_norm": 1.0766838309090543,
+        "loss": 1.0018723011016846
+      }
+    },
+    "load_gradient_finite_nonzero": {
+      "status": "PASS",
+      "detail": {
+        "finite": true,
+        "l2_norm": 3.632351918043302,
+        "nonzero_elements": 677892,
+        "tensor_count": 121,
+        "core_backbone_l2_norm": 1.0124935171941531,
+        "loss": 1.1249874830245972
+      }
+    },
+    "mask_invariance": {
+      "status": "PASS",
+      "detail": {
+        "original": 1.0882188081741333,
+        "changed": 1.0882188081741333,
+        "absolute_delta": 0.0
+      }
+    },
+    "optimizer_core_update": {
+      "status": "PASS",
+      "detail": {
+        "max_abs_delta": 0.00010000169277191162,
+        "l2_norm": 0.005542161909121128,
+        "finite": true
+      }
+    },
+    "checkpoint_save_reload": {
+      "status": "PASS",
+      "detail": {
+        "max_abs_output_delta": 0.0,
+        "strict": true,
+        "checkpoint_sha256": "8ee792489b4a854f3d4cbecd985f841377bc0668485e2aa7f230f0bdaf40309b"
+      }
+    },
+    "tensor_device_dtype_shape": {
+      "status": "PASS",
+      "detail": {
+        "actual": {
+          "shape": [
+            1,
+            168,
+            91,
+            3
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu",
+          "finite": true
+        },
+        "forecast": {
+          "shape": [
+            1,
+            168,
+            91,
+            3
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu",
+          "finite": true
+        },
+        "residual": {
+          "shape": [
+            1,
+            168,
+            91,
+            3
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu",
+          "finite": true
+        },
+        "actual_valid_mask": {
+          "shape": [
+            1,
+            168,
+            91,
+            3
+          ],
+          "dtype": "torch.bool",
+          "device": "cpu",
+          "finite": true
+        },
+        "forecast_valid_mask": {
+          "shape": [
+            1,
+            168,
+            91,
+            3
+          ],
+          "dtype": "torch.bool",
+          "device": "cpu",
+          "finite": true
+        },
+        "residual_valid_mask": {
+          "shape": [
+            1,
+            168,
+            91,
+            3
+          ],
+          "dtype": "torch.bool",
+          "device": "cpu",
+          "finite": true
+        },
+        "time_mark": {
+          "shape": [
+            1,
+            168,
+            8
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu",
+          "finite": true
+        },
+        "effective_mask": {
+          "shape": [
+            1,
+            168,
+            91,
+            3
+          ],
+          "dtype": "torch.bool",
+          "device": "cpu",
+          "finite": true
+        },
+        "adjacency": {
+          "shape": [
+            91,
+            91
+          ],
+          "dtype": "torch.bool",
+          "device": "cpu",
+          "finite": true
+        },
+        "node_features": {
+          "shape": [
+            91,
+            10
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu",
+          "finite": true
+        },
+        "prediction": {
+          "shape": [
+            1,
+            168,
+            91,
+            3
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu",
+          "finite": true
+        },
+        "noise": {
+          "shape": [
+            1,
+            168,
+            91,
+            3
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu",
+          "finite": true
+        }
+      }
+    },
+    "no_24_node_shape_residue": {
+      "status": "PASS",
+      "detail": {
+        "model_node_count": 91,
+        "adjacency_shape": [
+          91,
+          91
+        ],
+        "node_embedding_rows": 91,
+        "output_resources": 3,
+        "legacy_24_in_new_model_state_shapes": []
+      }
+    }
+  },
+  "resource_gradients": {
+    "Wind": {
+      "finite": true,
+      "l2_norm": 4.015636383460865,
+      "nonzero_elements": 677892,
+      "tensor_count": 121,
+      "core_backbone_l2_norm": 1.0016142498100145,
+      "loss": 1.1282168626785278
+    },
+    "Solar": {
+      "finite": true,
+      "l2_norm": 4.010989532907857,
+      "nonzero_elements": 677892,
+      "tensor_count": 121,
+      "core_backbone_l2_norm": 1.0766838309090543,
+      "loss": 1.0018723011016846
+    },
+    "Load": {
+      "finite": true,
+      "l2_norm": 3.632351918043302,
+      "nonzero_elements": 677892,
+      "tensor_count": 121,
+      "core_backbone_l2_norm": 1.0124935171941531,
+      "loss": 1.1249874830245972
+    }
+  },
+  "resource_supervision_and_loss": {
+    "Wind": {
+      "valid_elements": 9653,
+      "valid_share": 0.3033054735122227,
+      "unweighted_masked_loss": 1.1255985024085777,
+      "elementwise_objective_contribution": 0.3414001867576824,
+      "objective_contribution_share": 0.3137238432135724
+    },
+    "Solar": {
+      "valid_elements": 9237,
+      "valid_share": 0.29023439954753977,
+      "unweighted_masked_loss": 1.0055105951269352,
+      "elementwise_objective_contribution": 0.29183376381535536,
+      "objective_contribution_share": 0.26817562940766326
+    },
+    "Load": {
+      "valid_elements": 12936,
+      "valid_share": 0.40646012694023753,
+      "unweighted_masked_loss": 1.1193837087391776,
+      "elementwise_objective_contribution": 0.45498484434895997,
+      "objective_contribution_share": 0.41810051520094177
+    }
+  },
+  "objective_diagnostic": {
+    "elementwise_masked_mean": 1.0882188081741333,
+    "resource_wise_balanced_mean_diagnostic_only": 1.0834976020915634,
+    "absolute_difference": 0.004721206082569873,
+    "relative_difference": 0.004338471313955089,
+    "formal_objective_changed": false,
+    "largest_valid_count_resource": "Load"
+  },
+  "hardcoded_24_audit": {
+    "model_node_count": 91,
+    "adjacency_shape": [
+      91,
+      91
+    ],
+    "node_embedding_rows": 91,
+    "output_resources": 3,
+    "legacy_24_in_new_model_state_shapes": []
+  }
+}
