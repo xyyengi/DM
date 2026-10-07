@@ -1,0 +1,14 @@
+{
+  "base_epsilon_changed": false,
+  "auxiliary_coefficients": {
+    "ramp": 0.18,
+    "shape": 0.14,
+    "slow": 0.1
+  },
+  "event_sampling_fraction": 0.6,
+  "trainable_parameters": 20588,
+  "optimizer_steps": 0,
+  "checkpoint_writes": 0,
+  "control_candidate_state_hash_equal": true,
+  "cuda_amp": "NOT RUN"
+}

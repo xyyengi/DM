@@ -1,0 +1,13 @@
+{
+  "source_and_formal_files": [
+    "src/models/station_conditioned_diffusion.py",
+    "station_lightweight_tail.py",
+    "configs/station24_lightweight_joint_tail_aux_timestep_compensation_168h.yaml",
+    "tools/audit_station24_aux_timestep_compensation.py",
+    "run_station24_lightweight_joint_tail_aux_timestep_compensation_formal.sh"
+  ],
+  "tests": [
+    "tests/test_station24_aux_timestep_compensation.py"
+  ],
+  "diagnostic_output": "analysis_auxiliary_timestep_compensation_preflight_20261007_v3"
+}
