@@ -270,3 +270,55 @@ class Shandong91MaskedDiffusion(nn.Module):
         weight = mask.to(element_loss.dtype)
         return (element_loss * weight).sum() / weight.sum().clamp_min(1.0)
 
+    @torch.no_grad()
+    def sample_ddim(
+        self,
+        forecast: torch.Tensor,
+        forecast_valid_mask: torch.Tensor,
+        calendar: torch.Tensor,
+        generation_mask: torch.Tensor,
+        *,
+        inference_steps: int,
+        initial_noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Deterministic DDIM sampling under the training epsilon convention.
+
+        Invalid, nonexistent, and training-disabled channels are projected to a
+        zero residual after every reverse step.  The returned layout is always
+        ``[B,T,N,3]``.
+        """
+        if generation_mask.shape != forecast.shape:
+            raise ValueError("generation_mask must match [B,T,N,3] forecast")
+        if inference_steps < 2 or inference_steps > self.alpha_hat.numel():
+            raise ValueError("inference_steps must be in [2, diffusion_steps]")
+        mask = generation_mask.bool()
+        current = (
+            torch.randn_like(forecast) if initial_noise is None else initial_noise.clone()
+        )
+        if current.shape != forecast.shape:
+            raise ValueError("initial_noise must match forecast")
+        current.masked_fill_(~mask, 0.0)
+        indices = torch.linspace(
+            self.alpha_hat.numel() - 1, 0, inference_steps,
+            device=forecast.device, dtype=torch.float64,
+        ).round().long().unique_consecutive()
+        batch = forecast.shape[0]
+        for position, timestep_value in enumerate(indices):
+            timestep = torch.full(
+                (batch,), int(timestep_value), device=forecast.device, dtype=torch.long
+            )
+            epsilon = self.denoiser(
+                current, timestep, forecast, forecast_valid_mask, calendar
+            )
+            alpha = self.alpha_hat[timestep_value].to(current.dtype)
+            predicted_clean = (
+                current - (1.0 - alpha).sqrt() * epsilon
+            ) / alpha.sqrt().clamp_min(1e-12)
+            if position + 1 == len(indices):
+                current = predicted_clean
+            else:
+                next_alpha = self.alpha_hat[indices[position + 1]].to(current.dtype)
+                current = next_alpha.sqrt() * predicted_clean + (1.0 - next_alpha).sqrt() * epsilon
+            current.masked_fill_(~mask, 0.0)
+        return current.contiguous()
+
