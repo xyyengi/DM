@@ -6,9 +6,16 @@ from src.models.shandong91_conditioned_diffusion import (
     Shandong91HeterogeneousRawBody,
     Shandong91MaskedDiffusion,
 )
+from train_shandong91 import restore_rng, rng_state
 
 
 class FormalPackageTests(unittest.TestCase):
+    def test_rng_state_round_trip_uses_cpu_byte_tensor(self):
+        state = rng_state()
+        self.assertEqual(state["torch"].device.type, "cpu")
+        self.assertEqual(state["torch"].dtype, torch.uint8)
+        restore_rng(state)
+
     def test_ddim_shape_sign_and_inactive_policy(self):
         torch.manual_seed(3)
         config = {

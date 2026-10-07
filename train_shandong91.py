@@ -11,6 +11,10 @@ import subprocess
 import time
 from typing import Any, Mapping
 
+# Required by CUDA >= 10.2 for deterministic CuBLAS operations.  It must be
+# present before the first CUDA BLAS call in this process.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -39,8 +43,10 @@ def rng_state() -> dict[str, Any]:
 
 
 def restore_rng(state: Mapping[str, Any]) -> None:
-    random.setstate(state["python"]); np.random.set_state(state["numpy"]); torch.set_rng_state(state["torch"])
-    if state.get("cuda") is not None and torch.cuda.is_available(): torch.cuda.set_rng_state_all(state["cuda"])
+    random.setstate(state["python"]); np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"].cpu())
+    if state.get("cuda") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([value.cpu() for value in state["cuda"]])
 
 
 def move_batch(batch: Mapping[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
@@ -78,7 +84,9 @@ def checkpoint_document(model, optimizer, scaler, epoch, global_step, best_val, 
 
 
 def load_checkpoint(path, model, optimizer, scaler, config, loader_generator, device):
-    saved = torch.load(path, map_location=device, weights_only=False)
+    # RNG states must remain CPU ByteTensors. Model/optimizer loaders copy their
+    # own tensors to the destination parameter devices.
+    saved = torch.load(path, map_location="cpu", weights_only=False)
     if saved.get("model_identifier") != MODEL_ID or saved.get("config_snapshot", {}).get("model") != config.get("model"):
         raise ValueError("resume checkpoint model/config is incompatible")
     model.load_state_dict(saved["model_state_dict"], strict=True)
@@ -86,7 +94,7 @@ def load_checkpoint(path, model, optimizer, scaler, config, loader_generator, de
     scaler.load_state_dict(saved["amp_scaler_state_dict"])
     if saved.get("scheduler_state_dict") is not None:
         raise ValueError("v1 config declares scheduler=none")
-    restore_rng(saved["rng_state"]); loader_generator.set_state(saved["train_loader_generator_state"])
+    restore_rng(saved["rng_state"]); loader_generator.set_state(saved["train_loader_generator_state"].cpu())
     return saved
 
 

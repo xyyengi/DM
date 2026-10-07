@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 CONFIG="${CONFIG:-configs/shandong91/raw_body_heterogeneous_formal_v1.yaml}"
 OUTPUT_ROOT="${OUTPUT_ROOT:?set OUTPUT_ROOT to a new formal run directory}"
