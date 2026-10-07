@@ -5,6 +5,7 @@ import yaml
 
 VERSION = "v2_fair_v1"
 RAMP_SELECTION_VERSION = "source_direction_daylight_pooled_v1"
+AUX_TIMESTEP_COMPENSATION_VERSION = "clipped_sqrt_snr_mean1_v1"
 FROZEN_AUXILIARY_ALPHAS = {
     0.65: (0.117, 0.091, 0.065),
     1.00: (0.180, 0.140, 0.100),
@@ -29,7 +30,11 @@ ADDITIONS = {
 }
 
 
-def expected_config(ramp_selection=False, auxiliary_alpha=1.0):
+def expected_config(
+    ramp_selection=False,
+    auxiliary_alpha=1.0,
+    auxiliary_timestep_compensation=False,
+):
     auxiliary_alpha = float(auxiliary_alpha)
     if auxiliary_alpha not in FROZEN_AUXILIARY_ALPHAS:
         raise ValueError(
@@ -70,6 +75,21 @@ def expected_config(ramp_selection=False, auxiliary_alpha=1.0):
         )
         value["model"]["event_balanced_ramp_selection_version"] = (
             RAMP_SELECTION_VERSION
+        )
+    if auxiliary_timestep_compensation:
+        value["experiment"].update(
+            name="station24_lightweight_joint_tail_aux_timestep_compensation_168h",
+            variant="geo_history_actual_lightweight_joint_tail_aux_timestep_compensation",
+            description=(
+                "Lightweight Tail with fixed clipped mean-one inverse-Jacobian "
+                "compensation on ramp/shape/slow only"
+            ),
+        )
+        value["model"].update(
+            auxiliary_timestep_compensation=True,
+            auxiliary_timestep_compensation_version=(
+                AUX_TIMESTEP_COMPENSATION_VERSION
+            ),
         )
     return value
 
@@ -114,8 +134,17 @@ def validate_config(config, resolved=False):
     auxiliary_alpha = float(
         config["model"].get("auxiliary_strength_alpha", 1.0)
     )
+    auxiliary_timestep_compensation = bool(
+        config["model"].get("auxiliary_timestep_compensation", False)
+    )
+    if auxiliary_timestep_compensation and config["model"].get(
+        "auxiliary_timestep_compensation_version"
+    ) != AUX_TIMESTEP_COMPENSATION_VERSION:
+        raise ValueError("unknown auxiliary timestep compensation recipe")
     expected = expected_config(
-        ramp_selection=ramp_selection, auxiliary_alpha=auxiliary_alpha
+        ramp_selection=ramp_selection,
+        auxiliary_alpha=auxiliary_alpha,
+        auxiliary_timestep_compensation=auxiliary_timestep_compensation,
     )
     actual = deepcopy(config)
     if resolved:

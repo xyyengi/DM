@@ -2908,6 +2908,8 @@ class StationGaussianDiffusion(nn.Module):
         event_balanced_shape_loss_weight: float = 0.0,
         event_balanced_slow_loss_weight: float = 0.0,
         event_balanced_context_hours: int = 6,
+        auxiliary_timestep_compensation: bool = False,
+        auxiliary_timestep_compensation_version: str = "off",
     ) -> None:
         super().__init__()
         self.denoiser = denoiser
@@ -2962,6 +2964,26 @@ class StationGaussianDiffusion(nn.Module):
         self.event_balanced_shape_loss_weight = float(event_balanced_shape_loss_weight)
         self.event_balanced_slow_loss_weight = float(event_balanced_slow_loss_weight)
         self.event_balanced_context_hours = int(event_balanced_context_hours)
+        self.auxiliary_timestep_compensation = bool(
+            auxiliary_timestep_compensation
+        )
+        self.auxiliary_timestep_compensation_version = str(
+            auxiliary_timestep_compensation_version
+        )
+        if self.auxiliary_timestep_compensation:
+            if self.auxiliary_timestep_compensation_version != "clipped_sqrt_snr_mean1_v1":
+                raise ValueError("unknown auxiliary timestep compensation version")
+        elif self.auxiliary_timestep_compensation_version not in {"off", "legacy_off"}:
+            raise ValueError("compensation version requires the compensation switch")
+        # Fixed mechanism choice, not a sweep interface.  persistent=False keeps
+        # historical checkpoint state dictionaries byte-for-byte compatible.
+        auxiliary_schedule = torch.sqrt(
+            alpha_hat / (1.0 - alpha_hat).clamp(min=1e-12)
+        ).clamp(min=0.25, max=2.0)
+        auxiliary_schedule = auxiliary_schedule / auxiliary_schedule.mean()
+        self.register_buffer(
+            "auxiliary_timestep_weight", auxiliary_schedule, persistent=False
+        )
         self.last_loss_components: dict[str, torch.Tensor] = {}
         if self.ramp_auxiliary_loss_weight < 0:
             raise ValueError("ramp auxiliary loss weight must be non-negative")
@@ -3193,6 +3215,11 @@ class StationGaussianDiffusion(nn.Module):
         snr_weight = torch.sqrt(
             alpha_hat / (1.0 - alpha_hat).clamp(min=1e-6)
         ).clamp(max=1.0)
+        auxiliary_timestep_weight = None
+        if self.auxiliary_timestep_compensation:
+            auxiliary_timestep_weight = self.auxiliary_timestep_weight[
+                timestep.long()
+            ].to(dtype=clean.dtype).view(-1, 1, 1)
         jstd_decomposition_loss = torch.zeros(
             (), device=clean.device, dtype=clean.dtype
         )
@@ -3544,7 +3571,10 @@ class StationGaussianDiffusion(nn.Module):
                             (magnitude >= threshold).to(clean.dtype) * pair_valid
                         )
                         focus = torch.maximum(extreme, local_event) * snr_weight
-                        lag_loss = (error * focus).sum() / focus.sum().clamp(min=1.0)
+                        weighted_error = error * focus
+                        if auxiliary_timestep_weight is not None:
+                            weighted_error = weighted_error * auxiliary_timestep_weight
+                        lag_loss = weighted_error.sum() / focus.sum().clamp(min=1.0)
                     else:
                         # This ablation changes selection only. Each source and
                         # sign is selected independently within each issue;
@@ -3609,9 +3639,12 @@ class StationGaussianDiffusion(nn.Module):
                                 focus = torch.maximum(
                                     extreme, directed_event
                                 ) * snr_weight
-                                pooled_error_sum = pooled_error_sum + (
-                                    error * focus
-                                ).sum()
+                                weighted_error = error * focus
+                                if auxiliary_timestep_weight is not None:
+                                    weighted_error = (
+                                        weighted_error * auxiliary_timestep_weight
+                                    )
+                                pooled_error_sum = pooled_error_sum + weighted_error.sum()
                                 pooled_focus_sum = pooled_focus_sum + focus.sum()
                                 selection_stats[
                                     f"{source_name}_{direction_name}"
@@ -3640,7 +3673,10 @@ class StationGaussianDiffusion(nn.Module):
                 point_error = F.smooth_l1_loss(
                     predicted_actual, target_actual, reduction="none", beta=0.05
                 )
-                station_component = (point_error * support_weight).sum() / (
+                station_error = point_error * support_weight
+                if auxiliary_timestep_weight is not None:
+                    station_error = station_error * auxiliary_timestep_weight
+                station_component = station_error.sum() / (
                     support_weight.sum().clamp(min=1.0)
                 )
                 system_components = []
@@ -3656,8 +3692,13 @@ class StationGaussianDiffusion(nn.Module):
                         predicted_system, target_system, reduction="none", beta=0.05
                     )
                     system_weight = time_support * active[:, None] * snr_weight[:, 0]
+                    system_error = error * system_weight
+                    if auxiliary_timestep_weight is not None:
+                        system_error = (
+                            system_error * auxiliary_timestep_weight[:, 0]
+                        )
                     system_components.append(
-                        (error * system_weight).sum()
+                        system_error.sum()
                         / system_weight.sum().clamp(min=1.0)
                     )
                 event_balanced_shape_loss = (
@@ -3686,7 +3727,10 @@ class StationGaussianDiffusion(nn.Module):
                     error = F.smooth_l1_loss(
                         predicted_slow, target_slow, reduction="none", beta=0.05
                     )
-                    slow_total = slow_total + (error * slow_weight).sum() / (
+                    slow_error = error * slow_weight
+                    if auxiliary_timestep_weight is not None:
+                        slow_error = slow_error * auxiliary_timestep_weight
+                    slow_total = slow_total + slow_error.sum() / (
                         slow_weight.sum().clamp(min=1.0)
                     )
                 event_balanced_slow_loss = slow_total / float(
@@ -4657,6 +4701,14 @@ class Station24DiffusionModel(nn.Module):
             ),
             event_balanced_context_hours=int(
                 self.config.get("event_balanced_context_hours", 6)
+            ),
+            auxiliary_timestep_compensation=bool(
+                self.config.get("auxiliary_timestep_compensation", False)
+            ),
+            auxiliary_timestep_compensation_version=str(
+                self.config.get(
+                    "auxiliary_timestep_compensation_version", "off"
+                )
             ),
         )
         self.event_selector_loss_weight = float(

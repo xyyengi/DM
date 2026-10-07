@@ -1,0 +1,24 @@
+--- control
++++ candidate
+@@ -1,8 +1,9 @@
+ experiment:
+-  name: station24_lightweight_joint_tail_v2_fair_168h
++  name: station24_lightweight_joint_tail_aux_timestep_compensation_168h
+   family: station24_independent_joint_wind_solar_tail
+-  variant: geo_history_actual_lightweight_joint_tail_v2_fair
+-  description: Existing frozen-Raw JMRT network with the unchanged V2 objective
++  variant: geo_history_actual_lightweight_joint_tail_aux_timestep_compensation
++  description: Lightweight Tail with fixed clipped mean-one inverse-Jacobian compensation
++    on ramp/shape/slow only
+ data:
+   data_path: ./diffusion_input_station
+   station_count: 24
+@@ -147,6 +148,8 @@
+   jstd_mask_loss_weight: 0.0
+   jstd_issue_loss_weight: 0.0
+   jstd_outside_zero_loss_weight: 0.0
++  auxiliary_timestep_compensation: true
++  auxiliary_timestep_compensation_version: clipped_sqrt_snr_mean1_v1
+ train:
+   batch_size: 8
+   gradient_accumulation_steps: 2

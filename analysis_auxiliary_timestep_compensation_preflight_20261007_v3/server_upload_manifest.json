@@ -1,0 +1,19 @@
+{
+  "required": [
+    "src/models/station_conditioned_diffusion.py",
+    "station_lightweight_tail.py",
+    "configs/station24_lightweight_joint_tail_aux_timestep_compensation_168h.yaml",
+    "tools/audit_station24_aux_timestep_compensation.py",
+    "run_station24_lightweight_joint_tail_aux_timestep_compensation_formal.sh"
+  ],
+  "prerequisite_already_on_server": [
+    "run_station24_lightweight_joint_tail_finalize.sh"
+  ],
+  "sha256": {
+    "src/models/station_conditioned_diffusion.py": "d40d8ecc421c514f5526a286a3a4366dfd3d06cbe72871013fa997b57f4ad4c1",
+    "station_lightweight_tail.py": "8bef927f624e43cd982f8614617b80c6abbb5c311eee68adcd077ad63664bcb9",
+    "configs/station24_lightweight_joint_tail_aux_timestep_compensation_168h.yaml": "9549b9106683ac429d2bde22c5cd5f5e47e7f0bb0d1105b0a753fcaa6e31d752",
+    "tools/audit_station24_aux_timestep_compensation.py": "3000ecaf2b7d61764615c9ee2aec886ce61a51edb643933765819512b935b4e7",
+    "run_station24_lightweight_joint_tail_aux_timestep_compensation_formal.sh": "1da43cc722c0ba1ded84ef98ca71ef0c660321f87dee6c4551c41c0de94b7a6d"
+  }
+}
