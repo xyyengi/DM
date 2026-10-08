@@ -46,6 +46,8 @@ training:
   learning_rate: 0.0001
   scheduler: none
   mixed_precision: true
+  amp_overflow_policy: retry_same_batch_halving_scale
+  amp_overflow_max_attempts: 4
   seed: 2027
   validation_seed: 314159
   checkpoint_every: 1
@@ -54,3 +56,8 @@ sampling:
   method: ddim_eta0
   inference_steps: 50
   inactive_policy: zero_residual_retain_forecast_for_train_disabled_neutralize_nonexistent_or_invalid
+generation:
+  split: test
+  n_samples: 100
+  seed: 424242
+  member_chunk: 5

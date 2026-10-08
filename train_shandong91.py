@@ -105,6 +105,7 @@ def epoch_pass(model, loader, device, *, optimizer=None, scaler=None, amp=False,
     totals = {"overall": 0.0, **{name: 0.0 for name in CHANNELS}}
     counts = {"overall": 0, **{name: 0 for name in CHANNELS}}
     steps = 0
+    overflow_retries = 0
     context = torch.enable_grad if training else torch.no_grad
     with context():
         for batch_index, raw in enumerate(loader):
@@ -112,22 +113,40 @@ def epoch_pass(model, loader, device, *, optimizer=None, scaler=None, amp=False,
             batch = move_batch(raw, device); mask = batch["effective_mask"].bool()
             timestep = torch.randint(0, model.alpha_hat.numel(), (batch["residual"].shape[0],), device=device)
             noise = torch.randn_like(batch["residual"])
-            if training: optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
-                _, element_loss = model.prediction_and_error(batch, timestep, noise)
-                loss = model.masked_loss(element_loss, mask)
-            if not torch.isfinite(loss): raise FloatingPointError("non-finite masked diffusion loss")
-            if training:
+            max_attempts = 4 if training and amp else 1
+            for attempt in range(max_attempts):
+                if training: optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
+                    _, element_loss = model.prediction_and_error(batch, timestep, noise)
+                    loss = model.masked_loss(element_loss, mask)
+                if not torch.isfinite(loss): raise FloatingPointError("non-finite masked diffusion loss")
+                if not training: break
                 scaler.scale(loss).backward(); scaler.unscale_(optimizer)
                 gradients = [p.grad for p in model.parameters() if p.grad is not None]
-                if not gradients or not all(torch.isfinite(g).all() for g in gradients):
-                    raise FloatingPointError("missing or non-finite gradient")
-                scaler.step(optimizer); scaler.update(); steps += 1
+                gradients_finite = bool(gradients) and all(torch.isfinite(g).all() for g in gradients)
+                if gradients_finite:
+                    scaler.step(optimizer); scaler.update(); steps += 1
+                    break
+                if not amp or attempt + 1 >= max_attempts:
+                    raise FloatingPointError(
+                        f"persistent missing/non-finite gradient after {attempt + 1} attempts"
+                    )
+                old_scale = float(scaler.get_scale())
+                new_scale = max(old_scale / 2.0, 1.0)
+                scaler.update(new_scale=new_scale)
+                overflow_retries += 1
+                print(json.dumps({
+                    "event": "amp_overflow_retry", "batch_index": batch_index,
+                    "attempt": attempt + 1, "old_scale": old_scale,
+                    "new_scale": new_scale,
+                }), flush=True)
             total_count = int(mask.sum()); totals["overall"] += float((element_loss.detach() * mask).sum()); counts["overall"] += total_count
             for channel, name in enumerate(CHANNELS):
                 current = mask[..., channel]; totals[name] += float((element_loss[..., channel].detach() * current).sum()); counts[name] += int(current.sum())
     if counts["overall"] == 0: raise RuntimeError("loader produced no supervised elements")
-    return {name: totals[name] / max(counts[name], 1) for name in totals}, steps
+    metrics = {name: totals[name] / max(counts[name], 1) for name in totals}
+    metrics["amp_overflow_retries"] = overflow_retries
+    return metrics, steps
 
 
 def git_value(*args: str) -> str:
@@ -163,6 +182,8 @@ def main() -> None:
     if output.exists() and not args.resume: raise FileExistsError(f"refusing to overwrite output: {output}")
     output.mkdir(parents=True, exist_ok=bool(args.resume))
     if config["training"]["scheduler"] != "none": raise ValueError("only audited scheduler=none is allowed")
+    if config["training"].get("amp_overflow_policy") != "retry_same_batch_halving_scale" or int(config["training"].get("amp_overflow_max_attempts", 0)) != 4:
+        raise ValueError("formal v1 requires the audited four-attempt AMP overflow retry policy")
     if config["loss"]["formal_objective"] != "elementwise_effective_masked_mean": raise ValueError("formal objective changed")
     if args.device == "cuda" and not torch.cuda.is_available(): raise RuntimeError("CUDA is required but unavailable")
     tracked_status = subprocess.check_output(
