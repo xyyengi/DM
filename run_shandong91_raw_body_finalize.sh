@@ -3,15 +3,15 @@ set -Eeuo pipefail
 ROOT=${1:?'usage: run_shandong91_raw_body_finalize.sh PIPELINE_ROOT'}
 CONFIG=${CONFIG:-configs/shandong91/raw_body_heterogeneous_formal_v1.yaml}
 JOB=$(date +%Y%m%d_%H%M%S)
-GEN="$ROOT/generation/test_n100_seed424242"
+GEN="$ROOT/generation/test_n500_seed424242"
 EVAL="$ROOT/evaluation"
 cd "$(dirname "$0")"
 export CUBLAS_WORKSPACE_CONFIG=:4096:8 PYTHONUNBUFFERED=1
 test -f "$ROOT/checkpoints/best.pt"
 printf '%s\n' "$ROOT" > "$ROOT/train_run.txt"
 if [[ ! -f "$GEN/metadata.json" || ! -f "$GEN/actual_scenarios_mw.npy" ]]; then
-  [[ ! -e "$GEN" ]] || GEN="$ROOT/generation/test_n100_seed424242_retry_$JOB"
-  python generate_shandong91.py --run-dir "$ROOT" --output-dir "$GEN" --config "$CONFIG" --split test --n-samples 100 --seed 424242 --member-chunk 5
+  [[ ! -e "$GEN" ]] || GEN="$ROOT/generation/test_n500_seed424242_retry_$JOB"
+  python generate_shandong91.py --run-dir "$ROOT" --output-dir "$GEN" --config "$CONFIG" --split test --n-samples 500 --seed 424242 --member-chunk 5
 fi
 if [[ ! -f "$EVAL/RESULT_SUMMARY.md" || ! -f "$EVAL/metrics.json" ]]; then
   [[ ! -e "$EVAL" ]] || EVAL="$ROOT/evaluation_retry_$JOB"

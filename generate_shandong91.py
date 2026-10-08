@@ -10,7 +10,7 @@ from train_shandong91 import build_model, move_batch
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--run-dir',required=True); p.add_argument('--output-dir',required=True)
     p.add_argument('--config',default='configs/shandong91/raw_body_heterogeneous_formal_v1.yaml'); p.add_argument('--split',choices=('validation','test'),default='test')
-    p.add_argument('--n-samples',type=int,default=100); p.add_argument('--seed',type=int,default=424242); p.add_argument('--member-chunk',type=int,default=5); p.add_argument('--inference-steps',type=int,default=None)
+    p.add_argument('--n-samples',type=int,default=500); p.add_argument('--seed',type=int,default=424242); p.add_argument('--member-chunk',type=int,default=5); p.add_argument('--inference-steps',type=int,default=None)
     a=p.parse_args(); out=Path(a.output_dir)
     if out.exists(): raise FileExistsError(f'refusing to overwrite {out}')
     if not torch.cuda.is_available(): raise RuntimeError('formal generation requires CUDA')

@@ -58,6 +58,6 @@ sampling:
   inactive_policy: zero_residual_retain_forecast_for_train_disabled_neutralize_nonexistent_or_invalid
 generation:
   split: test
-  n_samples: 100
+  n_samples: 500
   seed: 424242
   member_chunk: 5
