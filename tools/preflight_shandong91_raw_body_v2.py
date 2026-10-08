@@ -149,7 +149,13 @@ def main() -> None:
     sign_relative = float(((left-right).abs() / right.abs().clamp_min(1.0)).max())
     sign_match = bool(torch.allclose(left, right, rtol=1e-6, atol=1e-4))
     record("inverse_normalization_residual_sign", sign_match, {"max_abs_delta": sign_delta, "max_relative_delta": sign_relative, "formula": "actual=forecast+residual"})
-    record("v1_v2_isolation", denoiser.architecture != "shandong91_heterogeneous_raw_body_v1" and config["experiment"]["name"].endswith("v2_faithful24"), {"model": denoiser.architecture, "experiment": config["experiment"]["name"]})
+    experiment_name = config["experiment"]["name"]
+    record(
+        "v1_v2_isolation",
+        denoiser.architecture != "shandong91_heterogeneous_raw_body_v1"
+        and experiment_name.startswith(denoiser.architecture),
+        {"model": denoiser.architecture, "experiment": experiment_name},
+    )
 
     status = "PASS" if all(item["status"] == "PASS" for item in checks.values()) else "FAIL"
     report = {"status": status, "scope": "bounded engineering preflight; no formal training", "device": str(device), "amp": args.amp, "full_model": args.full_model, "checks": checks, "resource_gradients": resource_gradients, "formal_training": "NOT RUN", "formal_generation": "NOT RUN"}

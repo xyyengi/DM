@@ -14,7 +14,7 @@ import yaml
 from datasets.shandong91_faithful24 import (
     Shandong91Faithful24Dataset, threshold_sha256,
 )
-from train_shandong91_v2 import MODEL_ID, build_model, move_batch
+from train_shandong91_v2 import MODEL_ID, build_model, data_contract_record, move_batch
 
 
 def main() -> None:
@@ -48,6 +48,8 @@ def main() -> None:
         raise ValueError("checkpoint model identifier mismatch")
     if saved.get("config_snapshot", {}).get("model") != config["model"]:
         raise ValueError("checkpoint/config model mismatch")
+    if saved.get("data_contract") is not None and saved["data_contract"] != data_contract_record(config["data"]):
+        raise ValueError("checkpoint/config data contract mismatch")
     thresholds = saved["state_thresholds"]
     dataset = Shandong91Faithful24Dataset(config["data"]["data_path"], args.split, thresholds)
     if threshold_sha256(dataset.thresholds) != saved["state_threshold_sha256"]:
@@ -124,6 +126,7 @@ def main() -> None:
         "shape": list(shape), "sampler": method, "inference_steps": steps,
         "residual_sign": "generated_actual = forecast + generated_residual",
         "state_threshold_sha256": saved["state_threshold_sha256"],
+        "data_contract": data_contract_record(config["data"]),
         "inactive_policy": config["sampling"]["inactive_policy"],
         "physical_clipping": False,
         "bounded_engineering_generation": args.max_windows is not None,

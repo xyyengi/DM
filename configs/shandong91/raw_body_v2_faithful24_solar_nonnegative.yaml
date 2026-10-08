@@ -1,0 +1,95 @@
+experiment:
+  name: shandong91_heterogeneous_raw_body_v2_faithful24_solar_nonnegative
+  mode: formal_body_training
+  parent_reference: station24_geo_history_actual_dual_168h
+  data_modeling_convention: solar_nonnegative_projection
+data:
+  data_path: ./reliable_channel_training_v2_solar_nonnegative
+  dataset_identifier: reliable_channel_training_v2_solar_nonnegative
+  sequence_length: 168
+  node_count: 91
+  resource_count: 3
+  channel_order: [Wind, Solar, Load]
+  residual_definition: actual_minus_forecast
+  solar_actual_rule: max_valid_train_enabled_actual_mw_zero
+  solar_forecast_rule: unchanged_from_reliable_channel_training_v1
+  node48_solar_capacity_mw: 172.0
+model:
+  architecture: shandong91_heterogeneous_raw_body_v2_faithful24
+  sequence_length: 168
+  node_count: 91
+  resource_count: 3
+  base_channels: 32
+  num_layers: 3
+  channel_multipliers: [1, 2, 4]
+  group_norm_groups: 8
+  dropout: 0.10
+  timestep_embedding_dim: 128
+  spatial_mode: fixed_graph
+  spatial_mix_levels: [bottleneck]
+  parallel_spatial_fusion_levels: [encoder_0]
+  spatial_gate_init: -1.0
+  parallel_spatial_gate_init: -1.0
+  condition_gate_init: -1.0
+  use_recent_error: true
+  recent_error_hours: 24
+  use_state_encoder: true
+  state_feature_dim: 12
+  state_channels: [8, 16, 32]
+  state_ramp_lags: [3, 6]
+  state_low_quantile: 0.20
+  state_high_quantile: 0.90
+  state_ramp_quantile: 0.90
+  state_clip: 3.0
+  state_global_gate_init: -1.0
+  state_film_gate_init: -1.0
+  use_lead_condition: false
+  use_dual_fixed_graph: false
+  use_body_tail_experts: false
+  use_event_balanced_sampling: false
+  use_self_localization: false
+  use_protected_partial: false
+  use_auxiliary_losses: false
+diffusion:
+  target: epsilon
+  num_steps: 500
+  beta_start: 0.0001
+  beta_end: 0.04
+  schedule: linear
+  reverse_variance_type: posterior
+loss:
+  formal_objective: elementwise_effective_masked_mean
+  resource_balanced_objective: diagnostic_only
+training:
+  epochs: 300
+  batch_size: 2
+  gradient_accumulation_steps: 8
+  effective_batch_size: 16
+  num_workers: 2
+  optimizer: AdamW
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  scheduler: none
+  gradient_clip_norm: 1.0
+  ema_decay: 0.999
+  validation_every: 5
+  patience: 40
+  min_delta: 0.00001
+  mixed_precision: true
+  amp_overflow_policy: fail_closed
+  seed: 2027
+  validation_seed: 314159
+sampling:
+  method: ddpm
+  inference_steps: 500
+  checkpoint_state: ema
+  inactive_policy: zero_residual_retain_forecast_for_train_disabled_neutralize_nonexistent_or_invalid
+generation:
+  split: validation
+  n_samples: 500
+  seed: 424242
+  member_chunk: 2
+evaluation:
+  strict_effective_mask: true
+  compare_to_v1_on_validation: true
+  test_locked_for_selection: true

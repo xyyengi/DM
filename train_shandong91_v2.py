@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,22 @@ from src.models.shandong91_faithful24_diffusion import (
 
 MODEL_ID = Shandong91HeterogeneousRawBodyV2.architecture
 CHANNELS = ("Wind", "Solar", "Load")
+
+
+def data_contract_record(data_config):
+    root = Path(data_config["data_path"])
+    metadata = json.loads((root / "preprocessing_metadata.json").read_text("utf-8"))
+    manifest_path = root / "output_manifest.json"
+    return {
+        "dataset_identifier": data_config["dataset_identifier"],
+        "data_path": str(root),
+        "data_version": metadata.get("version", data_config["dataset_identifier"]),
+        "transformation": metadata.get("transformation", "none"),
+        "transformation_claim": metadata.get("transformation_claim"),
+        "projection_rule": metadata.get("projection_rule"),
+        "node48_solar_capacity_mw": metadata.get("node48_solar_capacity_mw"),
+        "output_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+    }
 
 
 def set_seed(seed):
@@ -158,6 +175,8 @@ def main():
         saved = torch.load(args.resume, map_location="cpu", weights_only=False)
         if saved.get("model_identifier") != MODEL_ID or saved["config_snapshot"]["model"] != config["model"]:
             raise ValueError("resume checkpoint is incompatible")
+        if saved.get("data_contract") is not None and saved["data_contract"] != data_contract_record(config["data"]):
+            raise ValueError("resume checkpoint data contract changed")
         if saved["state_threshold_sha256"] != threshold_sha256(thresholds):
             raise ValueError("state thresholds changed")
         model.load_state_dict(saved["model_state_dict"], strict=True)
@@ -173,6 +192,7 @@ def main():
         "branch": subprocess.check_output(["git", "branch", "--show-current"], text=True).strip(),
         "dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()),
         "device": str(device), "amp": amp, "config_snapshot": config,
+        "data_contract": data_contract_record(config["data"]),
         "state_threshold_sha256": threshold_sha256(thresholds),
         "condition_contract": datasets["train"].condition_manifest(),
         "parameter_count": sum(p.numel() for p in model.parameters()),
@@ -236,6 +256,7 @@ def main():
                 "epoch": epoch, "global_step": global_step,
                 "best_validation_metric": best_val, "best_epoch": best_epoch,
                 "config_snapshot": config, "state_threshold_sha256": threshold_sha256(thresholds),
+                "data_contract": data_contract_record(config["data"]),
                 "state_thresholds": threshold_document(thresholds), "rng_state": rng_state(),
                 "train_loader_generator_state": generator.get_state(),
                 "resume_level": "exact deterministic at completed epoch boundary",

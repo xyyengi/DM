@@ -2,6 +2,7 @@
 diffusion_input_station/
 diffusion_npy_normalized/
 input_4.27/
+reliable_channel_training_v2_solar_nonnegative/
 
 # Experiment outputs and local analysis artifacts
 save/
