@@ -123,6 +123,7 @@ def main() -> None:
         "checkpoint": str(checkpoint), "checkpoint_epoch": int(saved["epoch"]),
         "checkpoint_state": args.checkpoint_state,
         "split": args.split, "n_samples": args.n_samples, "seed": args.seed,
+        "member_chunk": args.member_chunk,
         "shape": list(shape), "sampler": method, "inference_steps": steps,
         "residual_sign": "generated_actual = forecast + generated_residual",
         "state_threshold_sha256": saved["state_threshold_sha256"],

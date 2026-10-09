@@ -104,6 +104,18 @@ def atomic_save(document, path):
     torch.save(document, temporary); os.replace(temporary, path)
 
 
+def loader_kwargs(training, device):
+    workers = int(training["num_workers"])
+    kwargs = {
+        "num_workers": workers,
+        "pin_memory": device.type == "cuda",
+    }
+    if workers:
+        kwargs["persistent_workers"] = bool(training.get("persistent_workers", True))
+        kwargs["prefetch_factor"] = int(training.get("prefetch_factor", 2))
+    return kwargs
+
+
 def evaluate(model, loader, device, seed, amp, max_batches=None):
     model.eval(); torch.manual_seed(seed)
     totals = {"overall": 0.0, **{name: 0.0 for name in CHANNELS}}
@@ -158,12 +170,16 @@ def main():
     datasets = {split: Shandong91Faithful24Dataset(config["data"]["data_path"], split, thresholds)
                 for split in ("train", "validation")}
     generator = torch.Generator().manual_seed(seed)
-    train_loader = DataLoader(datasets["train"], batch_size=int(config["training"]["batch_size"]),
-                              shuffle=True, num_workers=int(config["training"]["num_workers"]),
-                              generator=generator, pin_memory=device.type == "cuda")
-    val_loader = DataLoader(datasets["validation"], batch_size=int(config["training"]["batch_size"]),
-                            shuffle=False, num_workers=int(config["training"]["num_workers"]),
-                            pin_memory=device.type == "cuda")
+    training = config["training"]
+    microbatch = int(training["batch_size"])
+    accumulation = int(training["gradient_accumulation_steps"])
+    if microbatch * accumulation != int(training["effective_batch_size"]):
+        raise ValueError("batch_size * gradient_accumulation_steps must equal effective_batch_size")
+    common_loader = loader_kwargs(training, device)
+    train_loader = DataLoader(datasets["train"], batch_size=microbatch,
+                              shuffle=True, generator=generator, **common_loader)
+    val_loader = DataLoader(datasets["validation"], batch_size=microbatch,
+                            shuffle=False, **common_loader)
     model = build_model(config, datasets["train"], device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(config["training"]["learning_rate"]),
                                   weight_decay=float(config["training"]["weight_decay"]))
@@ -179,6 +195,14 @@ def main():
             raise ValueError("resume checkpoint data contract changed")
         if saved["state_threshold_sha256"] != threshold_sha256(thresholds):
             raise ValueError("state thresholds changed")
+        resume_keys = (
+            "batch_size", "gradient_accumulation_steps", "effective_batch_size",
+            "optimizer", "learning_rate", "weight_decay", "gradient_clip_norm",
+            "ema_decay", "mixed_precision", "amp_overflow_policy",
+        )
+        saved_training = saved["config_snapshot"]["training"]
+        if any(saved_training.get(key) != config["training"].get(key) for key in resume_keys):
+            raise ValueError("resume training semantics changed; start an isolated run")
         model.load_state_dict(saved["model_state_dict"], strict=True)
         ema = {name: value.to(device) for name, value in saved["ema_state_dict"].items()}
         optimizer.load_state_dict(saved["optimizer_state_dict"]); scaler.load_state_dict(saved["amp_scaler_state_dict"])
@@ -186,7 +210,9 @@ def main():
         start_epoch = int(saved["epoch"]) + 1; global_step = int(saved["global_step"])
         best_val = float(saved["best_validation_metric"]); best_epoch = int(saved["best_epoch"])
         history_path = output / "training_history.json"
-        if history_path.exists(): history = json.loads(history_path.read_text("utf-8"))
+        if history_path.exists():
+            history = [row for row in json.loads(history_path.read_text("utf-8"))
+                       if int(row["epoch"]) <= int(saved["epoch"])]
     manifest = {
         "model_identifier": MODEL_ID, "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
         "branch": subprocess.check_output(["git", "branch", "--show-current"], text=True).strip(),
@@ -200,20 +226,23 @@ def main():
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), "utf-8")
     (output / "state_thresholds.json").write_text(json.dumps(threshold_document(thresholds), indent=2), "utf-8")
-    epochs = int(args.max_epochs or config["training"]["epochs"]); accumulation = int(config["training"]["gradient_accumulation_steps"])
+    epochs = int(args.max_epochs or config["training"]["epochs"])
     clip = float(config["training"]["gradient_clip_norm"]); validation_every = int(config["training"]["validation_every"])
     patience = int(config["training"]["patience"]); min_delta = float(config["training"]["min_delta"])
     ema_decay = float(config["training"]["ema_decay"])
     for epoch in range(start_epoch, epochs + 1):
+        epoch_started = time.perf_counter()
+        if device.type == "cuda": torch.cuda.reset_peak_memory_stats(device)
         model.train(); optimizer.zero_grad(set_to_none=True)
         totals = {"overall": 0.0, **{name: 0.0 for name in CHANNELS}}; counts = {name: 0 for name in totals}
-        used_batches = 0
+        used_batches = 0; samples_seen = 0
         bounded_batches = len(train_loader)
         if args.max_train_batches is not None:
             bounded_batches = min(bounded_batches, args.max_train_batches)
         for batch_index, raw in enumerate(train_loader):
             if args.max_train_batches is not None and batch_index >= args.max_train_batches: break
             batch = move_batch(raw, device); mask = batch["effective_mask"].bool()
+            samples_seen += len(batch["residual"])
             timestep = torch.randint(0, len(model.alpha_hat), (len(batch["residual"]),), device=device)
             noise = torch.randn_like(batch["residual"])
             group_start = (used_batches // accumulation) * accumulation
@@ -235,9 +264,14 @@ def main():
             totals["overall"] += float((error.detach() * mask).sum()); counts["overall"] += int(mask.sum())
             for channel, name in enumerate(CHANNELS):
                 current = mask[..., channel]; totals[name] += float((error[..., channel].detach() * current).sum()); counts[name] += int(current.sum())
+        train_seconds = time.perf_counter() - epoch_started
         row = {"epoch": epoch, "global_step": global_step,
-               "train": {name: totals[name] / max(counts[name], 1) for name in totals}}
+               "train": {name: totals[name] / max(counts[name], 1) for name in totals},
+               "train_seconds": train_seconds,
+               "train_samples_per_second": samples_seen / max(train_seconds, 1e-12)}
+        improved = False; validated = False
         if epoch == 1 or epoch % validation_every == 0 or epoch == epochs:
+            validated = True
             raw_state = clone_state(model); model.load_state_dict(ema, strict=True)
             val = evaluate(
                 model, val_loader, device,
@@ -247,30 +281,31 @@ def main():
             model.load_state_dict(raw_state, strict=True); row["validation_ema"] = val
             improved = val["overall"] < best_val - min_delta
             if improved: best_val = val["overall"]; best_epoch = epoch
-            document = {
-                "checkpoint_version": "shandong91_faithful24_v2_epoch_boundary",
-                "model_identifier": MODEL_ID, "model_state_dict": clone_state(model),
-                "ema_state_dict": {name: value.detach().cpu().clone() for name, value in ema.items()},
-                "optimizer_state_dict": optimizer.state_dict(),
-                "amp_scaler_state_dict": scaler.state_dict(), "scheduler_state_dict": None,
-                "epoch": epoch, "global_step": global_step,
-                "best_validation_metric": best_val, "best_epoch": best_epoch,
-                "config_snapshot": config, "state_threshold_sha256": threshold_sha256(thresholds),
-                "data_contract": data_contract_record(config["data"]),
-                "state_thresholds": threshold_document(thresholds), "rng_state": rng_state(),
-                "train_loader_generator_state": generator.get_state(),
-                "resume_level": "exact deterministic at completed epoch boundary",
-            }
-            atomic_save(document, output / "checkpoints/last.pt")
-            if improved: atomic_save(document, output / "checkpoints/best.pt")
-            if best_epoch and epoch - best_epoch >= patience:
-                history.append(row)
-                (output / "training_history.json").write_text(json.dumps(history, indent=2), "utf-8")
-                print(json.dumps(row), flush=True)
-                break
+        row["epoch_seconds"] = time.perf_counter() - epoch_started
+        if device.type == "cuda":
+            row["cuda_peak_allocated_gb"] = torch.cuda.max_memory_allocated(device) / 2**30
+            row["cuda_peak_reserved_gb"] = torch.cuda.max_memory_reserved(device) / 2**30
+        document = {
+            "checkpoint_version": "shandong91_faithful24_v2_epoch_boundary",
+            "model_identifier": MODEL_ID, "model_state_dict": clone_state(model),
+            "ema_state_dict": {name: value.detach().cpu().clone() for name, value in ema.items()},
+            "optimizer_state_dict": optimizer.state_dict(),
+            "amp_scaler_state_dict": scaler.state_dict(), "scheduler_state_dict": None,
+            "epoch": epoch, "global_step": global_step,
+            "best_validation_metric": best_val, "best_epoch": best_epoch,
+            "config_snapshot": config, "state_threshold_sha256": threshold_sha256(thresholds),
+            "data_contract": data_contract_record(config["data"]),
+            "state_thresholds": threshold_document(thresholds), "rng_state": rng_state(),
+            "train_loader_generator_state": generator.get_state(),
+            "resume_level": "exact deterministic at completed epoch boundary",
+        }
+        atomic_save(document, output / "checkpoints/last.pt")
+        if improved: atomic_save(document, output / "checkpoints/best.pt")
         history.append(row)
         (output / "training_history.json").write_text(json.dumps(history, indent=2), "utf-8")
         print(json.dumps(row), flush=True)
+        if validated and best_epoch and epoch - best_epoch >= patience:
+            break
     manifest["formal_training"] = "COMPLETE"; manifest["best_epoch"] = best_epoch
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), "utf-8")
 

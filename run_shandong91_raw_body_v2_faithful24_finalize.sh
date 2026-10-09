@@ -6,6 +6,12 @@ OUTPUT_ROOT="${OUTPUT_ROOT:?set OUTPUT_ROOT to the completed V2 training directo
 GENERATION_DIR="${GENERATION_DIR:-${OUTPUT_ROOT}/validation_raw_n500}"
 EVALUATION_DIR="${EVALUATION_DIR:-${OUTPUT_ROOT}/validation_evaluation}"
 ARCHIVE="${ARCHIVE:-${OUTPUT_ROOT}_completed.tar.gz}"
+MEMBER_CHUNK="$(python - "$CONFIG" <<'PY'
+import sys, yaml
+config = yaml.safe_load(open(sys.argv[1], encoding="utf-8"))
+print(config.get("generation", {}).get("member_chunk", 2))
+PY
+)"
 
 [[ -f "${OUTPUT_ROOT}/checkpoints/best.pt" ]] || { echo "Missing best checkpoint"; exit 2; }
 [[ -f "$CONFIG" ]] || { echo "Missing config: $CONFIG"; exit 2; }
@@ -13,7 +19,7 @@ ARCHIVE="${ARCHIVE:-${OUTPUT_ROOT}_completed.tar.gz}"
 if [[ ! -e "$GENERATION_DIR" ]]; then
   python -u generate_shandong91_v2.py \
     --run-dir "$OUTPUT_ROOT" --output-dir "$GENERATION_DIR" --config "$CONFIG" \
-    --split validation --n-samples 500 --seed 424242 --member-chunk 2 \
+    --split validation --n-samples 500 --seed 424242 --member-chunk "$MEMBER_CHUNK" \
     --method ddpm --inference-steps 500 --checkpoint-state ema --device cuda
 fi
 
