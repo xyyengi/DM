@@ -29,6 +29,26 @@ The trainer now atomically writes `last.pt` after every completed epoch.
 also trims history rows newer than the checkpoint and rejects changes to batch,
 optimizer, AMP, clipping, or EMA semantics.
 
+## Station-24 runtime-parity path
+
+The actual best ordinary Station-24 Raw run
+`station24_geo_history_actual_dual` used microbatch 8, accumulation 2,
+effective batch 16, four workers, AMP, and generation member chunk 10.  The
+dedicated Shandong91 configuration
+`raw_body_v2_faithful24_solar_nonnegative_station24_runtime.yaml` copies those
+runtime choices exactly while retaining the Shandong91 data/model contract.
+Its launcher adds a mandatory full-model CUDA/AMP forward/backward/optimizer
+probe at the formal batch size, so a batch-8 OOM stops before paid training.
+
+Use the runtime-parity launcher when direct inheritance from the proven
+Station-24 setup is preferred.  The autotuner remains an optional engineering
+alternative, not a prerequisite.
+
+```bash
+export OUTPUT_ROOT=/root/autodl-tmp/shandong91_v2_solar_nonnegative_s24runtime_$(date +%Y%m%d_%H%M%S)
+bash run_shandong91_raw_body_v2_solar_nonnegative_station24_runtime.sh
+```
+
 ## Server launch
 
 Use a new output directory; do not resume the batch-2 checkpoint with the

@@ -126,6 +126,52 @@ def main() -> None:
     update_loss.backward(); optimizer.step(); update_delta = core.detach() - before
     record("optimizer_core_update", bool(torch.isfinite(core).all() and update_delta.abs().max() > 0), {"max_abs_delta": float(update_delta.abs().max()), "l2": float(update_delta.double().norm())})
 
+    if args.full_model and device.type == "cuda":
+        formal_batch_size = int(config["training"]["batch_size"])
+        try:
+            formal_batch = {
+                key: value.expand(formal_batch_size, *value.shape[1:]).contiguous()
+                for key, value in batch.items()
+            }
+            formal_timestep = torch.full((formal_batch_size,), 137, device=device, dtype=torch.long)
+            formal_noise = torch.randn_like(formal_batch["residual"])
+            formal_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+            formal_scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
+            model.train(); model.zero_grad(set_to_none=True)
+            torch.cuda.reset_peak_memory_stats(device)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=args.amp):
+                formal_prediction, formal_error = model.prediction_and_error(
+                    formal_batch, formal_timestep, formal_noise
+                )
+                formal_loss = model.masked_loss(formal_error, formal_batch["effective_mask"])
+            formal_scaler.scale(formal_loss).backward()
+            formal_scaler.unscale_(formal_optimizer)
+            formal_gradient = gradient(model, denoiser.encoder_blocks[0].conv1.weight)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["training"]["gradient_clip_norm"]))
+            formal_scaler.step(formal_optimizer); formal_scaler.update()
+            torch.cuda.synchronize(device)
+            record(
+                "formal_microbatch_cuda_amp",
+                list(formal_prediction.shape) == [formal_batch_size, 168, 91, 3]
+                and bool(torch.isfinite(formal_prediction).all())
+                and bool(torch.isfinite(formal_loss))
+                and formal_gradient["finite"] and formal_gradient["l2"] > 0,
+                {
+                    "batch_size": formal_batch_size,
+                    "gradient_accumulation_steps": int(config["training"]["gradient_accumulation_steps"]),
+                    "effective_batch_size": int(config["training"]["effective_batch_size"]),
+                    "loss": float(formal_loss.detach()),
+                    "gradient": formal_gradient,
+                    "peak_allocated_gb": torch.cuda.max_memory_allocated(device) / 2**30,
+                    "peak_reserved_gb": torch.cuda.max_memory_reserved(device) / 2**30,
+                },
+            )
+        except torch.OutOfMemoryError as exc:
+            record("formal_microbatch_cuda_amp", False, {
+                "batch_size": formal_batch_size, "error": str(exc),
+            })
+            torch.cuda.empty_cache()
+
     model.eval(); probe_noise = torch.randn_like(batch["residual"])
     with torch.no_grad(): before_reload = model.denoiser(probe_noise, timestep, batch["forecast"], batch["forecast_valid_mask"], batch["time_mark"], batch["recent_error"], batch["recent_error_valid_mask"], batch["node_state"])
     checkpoint = output / "reload_probe.pt"

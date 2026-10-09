@@ -36,6 +36,7 @@ import json, sys
 r=json.load(open(sys.argv[1], encoding="utf-8"))
 assert r["status"] == "PASS" and r["device"].startswith("cuda") and r["amp"] is True
 assert r["full_model"] is True
+assert r["checks"]["formal_microbatch_cuda_amp"]["status"] == "PASS"
 PY
 
 PHASE="formal_training"; record_status "running"
