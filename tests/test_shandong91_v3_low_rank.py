@@ -35,6 +35,18 @@ class Shandong91V3LowRankTests(unittest.TestCase):
         self.assertEqual(float(local[...,2].abs().max()),0.0)
         self.assertLess(float(transform.project_factor(local,mask).abs().max()),2e-5)
 
+    def test_half_precision_projection_solves_in_fp32_with_gradient(self):
+        sample=self.dataset[0]; mask=sample["effective_mask"][None]
+        values=sample["residual"][None].half().requires_grad_(True)
+        transform=FixedPCAFactorTransform(self.factors)
+        factors=transform.project_factor(values,mask)
+        self.assertEqual(factors.dtype,torch.float32)
+        self.assertTrue(torch.isfinite(factors).all())
+        factors.square().mean().backward()
+        self.assertIsNotNone(values.grad)
+        self.assertTrue(torch.isfinite(values.grad).all())
+        self.assertGreater(float(values.grad.float().norm()),0)
+
     def test_forward_backward_checkpoint_and_sampler(self):
         sample=self.dataset[0]; batch={k:v[None] for k,v in sample.items()}
         for key in ("actual","forecast","residual","time_mark","recent_error","node_state"): batch[key]=batch[key].float()

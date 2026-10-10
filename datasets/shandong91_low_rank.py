@@ -143,15 +143,27 @@ class FixedPCAFactorTransform(nn.Module):
 
     def _solve(self, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         batch, length = values.shape[:2]
-        output = values.new_zeros(batch, length, self.factor_count)
+        # CUDA autocast can supply FP16 denoiser outputs while the fixed PCA
+        # buffers remain FP32.  Least-squares solves are both unsupported and
+        # numerically unsafe in FP16, so keep this small K<=5 operation in
+        # FP32.  The casts remain differentiable back to the AMP backbone.
+        solve_dtype = (
+            torch.float32
+            if values.dtype in (torch.float16, torch.bfloat16)
+            else values.dtype
+        )
+        output = torch.zeros(
+            batch, length, self.factor_count,
+            device=values.device, dtype=solve_dtype,
+        )
         for channel, name in enumerate(CHANNELS):
             start, stop = self.slices[name]
-            basis = self.basis[start:stop, :, channel]
-            weight = mask[..., channel].to(values.dtype)
-            current = values[..., channel] * weight
+            basis = self.basis[start:stop, :, channel].to(solve_dtype)
+            weight = mask[..., channel].to(solve_dtype)
+            current = values[..., channel].to(solve_dtype) * weight
             gram = torch.einsum("btn,kn,ln->btkl", weight, basis, basis)
             rhs = torch.einsum("btn,kn->btk", current, basis)
-            eye = torch.eye(stop - start, device=values.device, dtype=values.dtype)
+            eye = torch.eye(stop - start, device=values.device, dtype=solve_dtype)
             output[..., start:stop] = torch.linalg.solve(
                 gram + self.ridge * eye, rhs.unsqueeze(-1)
             ).squeeze(-1)
