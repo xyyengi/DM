@@ -156,17 +156,20 @@ class FixedPCAFactorTransform(nn.Module):
             batch, length, self.factor_count,
             device=values.device, dtype=solve_dtype,
         )
-        for channel, name in enumerate(CHANNELS):
-            start, stop = self.slices[name]
-            basis = self.basis[start:stop, :, channel].to(solve_dtype)
-            weight = mask[..., channel].to(solve_dtype)
-            current = values[..., channel].to(solve_dtype) * weight
-            gram = torch.einsum("btn,kn,ln->btkl", weight, basis, basis)
-            rhs = torch.einsum("btn,kn->btk", current, basis)
-            eye = torch.eye(stop - start, device=values.device, dtype=solve_dtype)
-            output[..., start:stop] = torch.linalg.solve(
-                gram + self.ridge * eye, rhs.unsqueeze(-1)
-            ).squeeze(-1)
+        # Merely casting the inputs is insufficient on CUDA: active autocast
+        # may cast einsum back to FP16.  Disable it for the complete solve.
+        with torch.autocast(device_type=values.device.type, enabled=False):
+            for channel, name in enumerate(CHANNELS):
+                start, stop = self.slices[name]
+                basis = self.basis[start:stop, :, channel].to(solve_dtype)
+                weight = mask[..., channel].to(solve_dtype)
+                current = values[..., channel].to(solve_dtype) * weight
+                gram = torch.einsum("btn,kn,ln->btkl", weight, basis, basis)
+                rhs = torch.einsum("btn,kn->btk", current, basis)
+                eye = torch.eye(stop - start, device=values.device, dtype=solve_dtype)
+                output[..., start:stop] = torch.linalg.solve(
+                    gram + self.ridge * eye, rhs.unsqueeze(-1)
+                ).squeeze(-1)
         return output
 
     def common(self, factors: torch.Tensor) -> torch.Tensor:

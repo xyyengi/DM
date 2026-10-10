@@ -47,6 +47,18 @@ class Shandong91V3LowRankTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(values.grad).all())
         self.assertGreater(float(values.grad.float().norm()),0)
 
+    def test_projection_disables_active_autocast_for_linear_solve(self):
+        sample=self.dataset[0]; mask=sample["effective_mask"][None]
+        values=sample["residual"][None].float().requires_grad_(True)
+        transform=FixedPCAFactorTransform(self.factors)
+        with torch.autocast(device_type="cpu",dtype=torch.bfloat16,enabled=True):
+            factors=transform.project_factor(values,mask)
+            loss=factors.square().mean()
+        self.assertEqual(factors.dtype,torch.float32)
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        self.assertTrue(torch.isfinite(values.grad).all())
+
     def test_forward_backward_checkpoint_and_sampler(self):
         sample=self.dataset[0]; batch={k:v[None] for k,v in sample.items()}
         for key in ("actual","forecast","residual","time_mark","recent_error","node_state"): batch[key]=batch[key].float()
