@@ -94,7 +94,7 @@ generation:
   split: validation
   n_samples: 500
   seed: 424242
-  member_chunk: 10
+  member_chunk: 64
 evaluation:
   strict_effective_mask: true
   report_system_metrics: [coverage90, crps, width90, covariance_amplification, residual_correlation]

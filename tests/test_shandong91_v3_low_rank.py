@@ -3,14 +3,17 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
+import tempfile
 import unittest
 
+import numpy as np
 import torch
 import yaml
 
 from datasets.shandong91_faithful24 import Shandong91Faithful24Dataset, fit_faithful24_state_thresholds
 from datasets.shandong91_low_rank import FixedPCAFactorTransform, factor_sha256, fit_train_only_pca
 from src.models.shandong91_low_rank_diffusion import Shandong91HeterogeneousRawBodyV3, Shandong91LowRankDiffusion
+from generate_shandong91_v3 import atomic_json, open_array
 
 
 class Shandong91V3LowRankTests(unittest.TestCase):
@@ -58,6 +61,19 @@ class Shandong91V3LowRankTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         loss.backward()
         self.assertTrue(torch.isfinite(values.grad).all())
+
+    def test_disk_backed_generation_array_reopens_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"scenarios.npy"; progress=Path(directory)/"progress.json"
+            array=open_array(path,shape=(2,3),dtype=np.float32,resume=False)
+            array[0]=[1,2,3]; array.flush()
+            atomic_json({"completed_windows":1},progress)
+            resumed=open_array(path,shape=(2,3),dtype=np.float32,resume=True)
+            self.assertTrue(np.array_equal(resumed[0],[1,2,3]))
+            self.assertEqual(__import__("json").loads(progress.read_text("utf-8"))["completed_windows"],1)
+            with self.assertRaises(ValueError):
+                open_array(path,shape=(3,2),dtype=np.float32,resume=True)
+            resumed._mmap.close(); array._mmap.close()
 
     def test_forward_backward_checkpoint_and_sampler(self):
         sample=self.dataset[0]; batch={k:v[None] for k,v in sample.items()}

@@ -13,11 +13,11 @@ PY
 )"
 
 [[ -f "${OUTPUT_ROOT}/checkpoints/best.pt" ]] || { echo "Missing best checkpoint"; exit 2; }
-if [[ ! -e "$GENERATION_DIR" ]]; then
+if [[ ! -f "$GENERATION_DIR/metadata.json" ]]; then
   python -u generate_shandong91_v3.py --run-dir "$OUTPUT_ROOT" --output-dir "$GENERATION_DIR" \
     --config "$CONFIG" --split validation --n-samples 500 --seed 424242 \
     --member-chunk "$MEMBER_CHUNK" --method ddpm --inference-steps 500 \
-    --checkpoint-state ema --device cuda
+    --checkpoint-state ema --device cuda --resume-output
 fi
 python - "$GENERATION_DIR/metadata.json" <<'PY'
 import json,sys
@@ -39,4 +39,10 @@ for r in ("Wind","Solar","Load"):
     assert math.isfinite(m["system_aggregate"][r]["covariance_amplification"]["mean"])
 PY
 if [[ ! -e "$ARCHIVE" ]]; then tar -czf "$ARCHIVE" "$OUTPUT_ROOT"; fi
+python - "${OUTPUT_ROOT}_status.json" "$OUTPUT_ROOT" <<'PY'
+import json,pathlib,sys,time
+pathlib.Path(sys.argv[1]).write_text(json.dumps({
+    "state":"complete","phase":"complete","root":sys.argv[2],"timestamp":time.time()
+},indent=2))
+PY
 echo "FINALIZE_COMPLETE=$ARCHIVE"
