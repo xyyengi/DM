@@ -169,7 +169,14 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(training["learning_rate"]),
                                   weight_decay=float(training["weight_decay"]))
     amp = bool(training["mixed_precision"]) and device.type == "cuda"
-    scaler = torch.amp.GradScaler(device.type, enabled=amp)
+    amp_initial_scale = float(training.get("amp_initial_scale", 65536.0))
+    amp_growth_interval = int(training.get("amp_growth_interval", 2000))
+    if amp_initial_scale <= 0 or amp_growth_interval <= 0:
+        raise ValueError("AMP scale and growth interval must be positive")
+    scaler = torch.amp.GradScaler(
+        device.type, enabled=amp, init_scale=amp_initial_scale,
+        growth_interval=amp_growth_interval,
+    )
     ema = clone_state(model, cpu=False); start_epoch = 1; global_step = 0
     best_val = float("inf"); best_epoch = 0; history = []
     if args.resume:
@@ -188,6 +195,7 @@ def main():
             "batch_size", "gradient_accumulation_steps", "effective_batch_size",
             "optimizer", "learning_rate", "weight_decay", "gradient_clip_norm",
             "ema_decay", "mixed_precision", "amp_overflow_policy",
+            "amp_initial_scale", "amp_growth_interval",
         )
         saved_training = saved["config_snapshot"]["training"]
         if any(saved_training.get(key) != training.get(key) for key in resume_keys):
@@ -249,8 +257,28 @@ def main():
             scaler.scale(loss).backward(); used += 1
             if used % accumulation == 0 or used == bounded:
                 scaler.unscale_(optimizer)
-                gradients = [p.grad for p in model.parameters() if p.grad is not None]
-                if not gradients or not all(torch.isfinite(g).all() for g in gradients):
+                named_gradients = [
+                    (name, parameter.grad) for name, parameter in model.named_parameters()
+                    if parameter.grad is not None
+                ]
+                bad_gradients = [
+                    name for name, gradient in named_gradients
+                    if not torch.isfinite(gradient).all()
+                ]
+                if not named_gradients or bad_gradients:
+                    failure = {
+                        "epoch": epoch, "batch_index_zero_based": index,
+                        "used_microbatches": used,
+                        "global_step_before_failure": global_step,
+                        "timesteps": timestep.detach().cpu().tolist(),
+                        "loss": float(loss.detach()),
+                        "amp": amp,
+                        "amp_scale": float(scaler.get_scale()),
+                        "bad_gradient_parameters": bad_gradients,
+                    }
+                    (output / "gradient_failure.json").write_text(
+                        json.dumps(failure, indent=2), "utf-8"
+                    )
                     raise FloatingPointError("missing/non-finite V3 gradient; fail closed")
                 torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
                 scaler.step(optimizer); scaler.update(); optimizer.zero_grad(set_to_none=True)

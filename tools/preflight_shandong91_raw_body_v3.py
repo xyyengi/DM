@@ -140,14 +140,58 @@ def main():
     load_scale=float(centered.abs()[load_active].max()); load_rank1_relative=load_rank1_error/max(load_scale,1.0)
     record("sample_load_rank1",load_rank1_error<2e-4 and load_rank1_relative<1e-6,{"reconstruction_max_abs":load_rank1_error,"relative_to_max_abs":load_rank1_relative,"contract":"centered Load lies in the single fixed PCA loading span"})
     if args.full_model and device.type=="cuda":
-        formal=int(config["training"]["batch_size"]); expanded={k:v.expand(formal,*v.shape[1:]).contiguous() for k,v in batch.items()}
-        model.train(); model.zero_grad(set_to_none=True); torch.cuda.reset_peak_memory_stats(device)
-        with torch.autocast(device_type="cuda",dtype=torch.float16,enabled=args.amp):
-            _,formal_error,formal_latents=model.prediction_and_error(expanded,torch.full((formal,),137,device=device,dtype=torch.long),return_latents=True)
-            if objective=="elementwise_effective_masked_mean": formal_loss=model.masked_loss(formal_error,expanded["effective_mask"])
-            else: formal_loss,_=model.coordinate_loss(formal_latents,expanded["effective_mask"])
-        formal_loss.backward(); finite=all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
-        record("formal_microbatch_cuda_amp",bool(torch.isfinite(formal_loss) and finite),{"batch_size":formal,"loss":float(formal_loss.detach()),"peak_allocated_gb":torch.cuda.max_memory_allocated(device)/2**30})
+        training=config["training"]; formal=int(training["batch_size"])
+        accumulation=int(training["gradient_accumulation_steps"])
+        scale=float(training.get("amp_initial_scale",65536.0))
+        growth_interval=int(training.get("amp_growth_interval",2000))
+        formal_model=Shandong91LowRankDiffusion(
+            denoiser_class(config["model"],dataset.node_features.to(device),
+                           dataset.adjacency_with_self.float().to(device)),
+            config["diffusion"],factors,
+        ).to(device)
+        formal_optimizer=torch.optim.AdamW(formal_model.parameters(),lr=float(training["learning_rate"]),weight_decay=float(training["weight_decay"]))
+        formal_scaler=torch.amp.GradScaler("cuda",enabled=args.amp,init_scale=scale,growth_interval=growth_interval)
+        timestep_patterns=(
+            (0,1,10,50,137,250,400,499),
+            (499,400,250,137,50,10,1,0),
+        )
+        formal_model.train(); formal_optimizer.zero_grad(set_to_none=True); torch.cuda.reset_peak_memory_stats(device)
+        losses=[]
+        for microbatch_index in range(accumulation):
+            indices=range(microbatch_index*formal,(microbatch_index+1)*formal)
+            raw={key:torch.stack([dataset[index][key] for index in indices]) for key in dataset[0]}
+            expanded=move_batch(raw,device)
+            pattern=timestep_patterns[microbatch_index % len(timestep_patterns)]
+            formal_timestep=torch.tensor(
+                [pattern[index % len(pattern)] for index in range(formal)],
+                device=device,dtype=torch.long,
+            )
+            with torch.autocast(device_type="cuda",dtype=torch.float16,enabled=args.amp):
+                _,formal_error,formal_latents=formal_model.prediction_and_error(
+                    expanded,formal_timestep,return_latents=True,
+                )
+                if objective=="elementwise_effective_masked_mean":
+                    formal_loss=formal_model.masked_loss(formal_error,expanded["effective_mask"])
+                else:
+                    formal_loss,_=formal_model.coordinate_loss(formal_latents,expanded["effective_mask"])
+                scaled_loss=formal_loss/accumulation
+            formal_scaler.scale(scaled_loss).backward(); losses.append(float(formal_loss.detach()))
+        formal_scaler.unscale_(formal_optimizer)
+        named=[(name,p.grad) for name,p in formal_model.named_parameters() if p.grad is not None]
+        bad=[name for name,gradient in named if not torch.isfinite(gradient).all()]
+        finite=bool(named) and not bad
+        core=formal_model.denoiser.encoder_blocks[0].conv1.weight; formal_before=core.detach().clone()
+        if finite:
+            torch.nn.utils.clip_grad_norm_(formal_model.parameters(),float(training["gradient_clip_norm"]))
+            formal_scaler.step(formal_optimizer); formal_scaler.update()
+        formal_delta=float((core.detach()-formal_before).abs().max())
+        record("formal_microbatch_cuda_amp",bool(all(np.isfinite(losses)) and finite and formal_delta>0),{
+            "batch_size":formal,"gradient_accumulation_steps":accumulation,
+            "effective_batch_size":formal*accumulation,"timesteps":[list(item) for item in timestep_patterns],
+            "losses":losses,"amp_initial_scale":scale,"amp_scale_after_step":float(formal_scaler.get_scale()),
+            "bad_gradient_parameters":bad,"core_update_max_abs":formal_delta,
+            "peak_allocated_gb":torch.cuda.max_memory_allocated(device)/2**30,
+        })
     parameter_count=sum(p.numel() for p in model.parameters()); status="PASS" if all(v["status"]=="PASS" for v in checks.values()) else "FAIL"
     report={"status":status,"scope":"bounded V3/V3.1 engineering preflight; no formal training/generation","architecture":architecture,"formal_objective":objective,"device":str(device),"amp":args.amp,"full_model":args.full_model,"parameter_count":parameter_count,"factor_document_sha256":factors["sha256"],"checks":checks,"formal_training":"NOT RUN","formal_generation":"NOT RUN","cuda_amp_safety":"PASS" if args.full_model and device.type=="cuda" and status=="PASS" else "NOT RUN"}
     (output/"report.json").write_text(json.dumps(report,indent=2),"utf-8"); (output/"report.md").write_text("\n".join(["# Shandong91 V3/V3.1 preflight","",f"- Overall: **{status}**",f"- Parameters: **{parameter_count:,}**","- Formal training: **NOT RUN**","- Formal generation: **NOT RUN**",""]+[f"- {k}: **{v['status']}**" for k,v in checks.items()]),"utf-8")

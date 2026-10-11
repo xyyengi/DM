@@ -168,6 +168,8 @@ class Shandong91V3LowRankTests(unittest.TestCase):
             self.v31_config["loss"]["formal_objective"],
             "factor_coordinate_plus_projected_local_mean",
         )
+        self.assertEqual(self.v31_config["training"]["amp_initial_scale"],128.0)
+        self.assertEqual(self.v31_config["training"]["amp_growth_interval"],1000000)
 
     def test_v31_coordinate_loss_directly_supervises_all_factor_resources(self):
         sample=self.dataset[0]; mask=sample["effective_mask"][None]
@@ -203,6 +205,7 @@ class Shandong91V3LowRankTests(unittest.TestCase):
         self.assertEqual(positions,sorted(positions))
         self.assertIn('r["cuda_amp_safety"]=="PASS"',pipeline)
         self.assertIn('factor_gradient_scale_not_pca_attenuated',pipeline)
+        self.assertIn('amp_initial_scale"]==128.0',pipeline)
         self.assertIn('generate_shandong91_v3.py',finalize)
         self.assertIn('evaluate_shandong91_v3.py',finalize)
         self.assertIn('plot_shandong91_v3.py',finalize)

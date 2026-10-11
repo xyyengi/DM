@@ -56,3 +56,21 @@ evaluation and plots.  These checks establish engineering behavior only.
 Full-model CUDA/AMP safety and scientific improvement are **NOT RUN** locally
 and must be established on the target server and by the completed paired V2
 comparison.
+
+## CUDA AMP loss-scale correction
+
+The first server launch correctly stopped before its first optimizer update
+because the default GradScaler scale `65536` produced non-finite gradients.
+This exposed a mismatch in the original preflight: it used autocast but did not
+exercise the formal GradScaler path.  On a representative formal batch, the
+largest unscaled parameter gradient was about `36.05`; multiplying it by
+`65536` gives about `2.36e6`, far above the FP16 maximum `65504`.
+
+V3.1 now declares an AMP initial scale of `128` and a growth interval of
+`1000000` (effectively fixed over the configured run).  The CUDA gate uses two
+real microbatches, the formal effective batch of 16, boundary and interior
+timesteps, the exact GradScaler/unscale/clip/step sequence, and requires finite
+gradients plus a real backbone update.  The trainer writes
+`gradient_failure.json` with epoch, batch, timesteps, scale and offending
+parameter names before any fail-closed exit.  CPU evidence cannot establish
+that this CUDA gate passes; the corrected server gate remains mandatory.

@@ -38,6 +38,9 @@ assert r["status"]=="PASS" and r["cuda_amp_safety"]=="PASS"
 assert r["architecture"]=="shandong91_heterogeneous_raw_body_v3_1_factor_coordinate_loss"
 assert r["formal_objective"]=="factor_coordinate_plus_projected_local_mean"
 assert r["checks"]["formal_microbatch_cuda_amp"]["status"]=="PASS"
+assert r["checks"]["formal_microbatch_cuda_amp"]["detail"]["amp_initial_scale"]==128.0
+assert r["checks"]["formal_microbatch_cuda_amp"]["detail"]["effective_batch_size"]==16
+assert not r["checks"]["formal_microbatch_cuda_amp"]["detail"]["bad_gradient_parameters"]
 assert r["checks"]["factor_gradient_scale_not_pca_attenuated"]["status"]=="PASS"
 PY
 
