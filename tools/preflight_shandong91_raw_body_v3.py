@@ -192,6 +192,46 @@ def main():
             "bad_gradient_parameters":bad,"core_update_max_abs":formal_delta,
             "peak_allocated_gb":torch.cuda.max_memory_allocated(device)/2**30,
         })
+        generation=config.get("generation",{})
+        requested_chunk=int(generation.get("member_chunk",64))
+        auto_tune=bool(generation.get("auto_tune_member_chunk",False))
+        candidates=[int(value) for value in generation.get("member_chunk_candidates",[requested_chunk])]
+        if not auto_tune: candidates=[requested_chunk]
+        if not candidates or candidates[0]!=requested_chunk or any(value<=0 for value in candidates):
+            raise ValueError("generation chunk candidates must start with positive member_chunk")
+        if candidates!=sorted(set(candidates),reverse=True):
+            raise ValueError("generation chunk candidates must be unique and descending")
+        formal_model.eval(); selected_chunk=None; attempts=[]
+        for candidate in candidates:
+            torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(device)
+            probe=initial_factor=initial_local=sampled=None
+            try:
+                probe={key:value.expand(candidate,*value.shape[1:]) for key,value in batch.items()}
+                initial_factor=torch.randn(candidate,168,7,device=device)
+                initial_local=torch.randn_like(probe["residual"])
+                with torch.inference_mode(), torch.autocast(device_type="cuda",dtype=torch.float16,enabled=args.amp):
+                    sampled=formal_model.sample(
+                        probe,probe["effective_mask"].bool(),method="ddim",inference_steps=2,
+                        initial_factor_noise=initial_factor,initial_local_noise=initial_local,
+                    )
+                is_finite=bool(torch.isfinite(sampled).all())
+                peak=float(torch.cuda.max_memory_allocated(device)/2**30)
+                attempts.append({"member_chunk":candidate,"status":"PASS" if is_finite else "FAIL_NONFINITE","peak_allocated_gb":peak})
+                if is_finite:
+                    selected_chunk=candidate
+                    break
+            except (torch.cuda.OutOfMemoryError,RuntimeError) as exc:
+                if not isinstance(exc,torch.cuda.OutOfMemoryError) and "out of memory" not in str(exc).lower():
+                    raise
+                attempts.append({"member_chunk":candidate,"status":"OOM","error":str(exc)[:300]})
+            finally:
+                del sampled,initial_factor,initial_local,probe
+                torch.cuda.empty_cache()
+        record("generation_member_chunk_cuda_amp",selected_chunk is not None,{
+            "requested_member_chunk":requested_chunk,"selected_member_chunk":selected_chunk,
+            "auto_tune":auto_tune,"candidates":candidates,"attempts":attempts,
+            "probe":"full V3.1 model, real 91-node window, FP16 autocast, two-step DDIM memory/finite proxy; formal generation remains DDPM500",
+        })
     parameter_count=sum(p.numel() for p in model.parameters()); status="PASS" if all(v["status"]=="PASS" for v in checks.values()) else "FAIL"
     report={"status":status,"scope":"bounded V3/V3.1 engineering preflight; no formal training/generation","architecture":architecture,"formal_objective":objective,"device":str(device),"amp":args.amp,"full_model":args.full_model,"parameter_count":parameter_count,"factor_document_sha256":factors["sha256"],"checks":checks,"formal_training":"NOT RUN","formal_generation":"NOT RUN","cuda_amp_safety":"PASS" if args.full_model and device.type=="cuda" and status=="PASS" else "NOT RUN"}
     (output/"report.json").write_text(json.dumps(report,indent=2),"utf-8"); (output/"report.md").write_text("\n".join(["# Shandong91 V3/V3.1 preflight","",f"- Overall: **{status}**",f"- Parameters: **{parameter_count:,}**","- Formal training: **NOT RUN**","- Formal generation: **NOT RUN**",""]+[f"- {k}: **{v['status']}**" for k,v in checks.items()]),"utf-8")

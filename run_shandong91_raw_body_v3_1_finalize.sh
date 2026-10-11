@@ -22,11 +22,31 @@ trap 'code=$?; record_status "failed"; exit "$code"' ERR
 
 [[ -f "$CONFIG" ]] || { echo "Missing config: $CONFIG"; exit 2; }
 [[ -f "${OUTPUT_ROOT}/checkpoints/best.pt" ]] || { echo "Missing best checkpoint"; exit 2; }
-MEMBER_CHUNK="$(python - "$CONFIG" <<'PY'
-import sys,yaml
-print(yaml.safe_load(open(sys.argv[1],encoding="utf-8"))["generation"]["member_chunk"])
+MEMBER_CHUNK="$(python - "$CONFIG" "${OUTPUT_ROOT}_cuda_preflight/report.json" "${MEMBER_CHUNK:-}" <<'PY'
+import json,sys,yaml
+config=yaml.safe_load(open(sys.argv[1],encoding="utf-8"))
+generation=config["generation"]
+allowed=[int(value) for value in generation.get("member_chunk_candidates",[generation["member_chunk"]])]
+if sys.argv[3]:
+    selected=int(sys.argv[3])
+else:
+    report=json.load(open(sys.argv[2],encoding="utf-8"))
+    gate=report["checks"]["generation_member_chunk_cuda_amp"]
+    if gate["status"]!="PASS": raise RuntimeError("generation member-chunk CUDA gate did not pass")
+    selected=int(gate["detail"]["selected_member_chunk"])
+if selected not in allowed: raise ValueError("selected member chunk is outside configured candidates")
+print(selected)
 PY
 )"
+python - "$OUTPUT_ROOT/generation_runtime.json" "$MEMBER_CHUNK" "$CONFIG" <<'PY'
+import json,pathlib,sys
+path=pathlib.Path(sys.argv[1])
+record={"selected_member_chunk":int(sys.argv[2]),"selection_source":"cuda_amp_preflight","config":sys.argv[3]}
+if path.exists():
+    if json.loads(path.read_text("utf-8"))!=record: raise RuntimeError("generation runtime selection changed")
+else:
+    path.write_text(json.dumps(record,indent=2),"utf-8")
+PY
 
 PHASE="generation"; record_status "running"
 if [[ ! -f "$GENERATION_DIR/metadata.json" ]]; then
@@ -35,7 +55,7 @@ if [[ ! -f "$GENERATION_DIR/metadata.json" ]]; then
     --member-chunk "$MEMBER_CHUNK" --method ddpm --inference-steps 500 \
     --checkpoint-state ema --device cuda --resume-output
 fi
-python - "$GENERATION_DIR/metadata.json" <<'PY'
+python - "$GENERATION_DIR/metadata.json" "$MEMBER_CHUNK" <<'PY'
 import json,math,sys
 m=json.load(open(sys.argv[1],encoding="utf-8"))
 assert m["model_identifier"]=="shandong91_heterogeneous_raw_body_v3_1_factor_coordinate_loss"
@@ -43,6 +63,7 @@ assert m["formal_objective"]=="factor_coordinate_plus_projected_local_mean"
 assert m["split"]=="validation" and m["n_samples"]==500
 assert m["sampler"]=="ddpm" and m["inference_steps"]==500
 assert m["load_local_branch"]=="disabled_strict_rank1"
+assert m["member_chunk"]==int(sys.argv[2])
 PY
 
 PHASE="evaluation"; record_status "running"

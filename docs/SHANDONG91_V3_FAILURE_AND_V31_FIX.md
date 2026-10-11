@@ -74,3 +74,13 @@ gradients plus a real backbone update.  The trainer writes
 `gradient_failure.json` with epoch, batch, timesteps, scale and offending
 parameter names before any fail-closed exit.  CPU evidence cannot establish
 that this CUDA gate passes; the corrected server gate remains mandatory.
+
+Generation now requests a member chunk of `256`.  The same server preflight
+tests the full V3.1 model on one real 91-node window under FP16 autocast and
+selects the first finite allocation from `256, 128, 64`; an OOM at a larger
+candidate is cleared before the next attempt.  The selected value is passed to
+the formal DDPM500 generator, recorded in `generation_runtime.json`, and checked
+against generation metadata.  This bounded two-step DDIM probe validates peak
+tensor shape and finiteness, not formal generation quality.  Changing chunk
+alters the random-number stream, so an already-started generation directory
+cannot silently resume under a different value.

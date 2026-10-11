@@ -42,13 +42,25 @@ assert r["checks"]["formal_microbatch_cuda_amp"]["detail"]["amp_initial_scale"]=
 assert r["checks"]["formal_microbatch_cuda_amp"]["detail"]["effective_batch_size"]==16
 assert not r["checks"]["formal_microbatch_cuda_amp"]["detail"]["bad_gradient_parameters"]
 assert r["checks"]["factor_gradient_scale_not_pca_attenuated"]["status"]=="PASS"
+g=r["checks"]["generation_member_chunk_cuda_amp"]
+assert g["status"]=="PASS"
+assert g["detail"]["requested_member_chunk"]==256
+assert g["detail"]["selected_member_chunk"] in (256,128,64)
 PY
+
+MEMBER_CHUNK="$(python - "$PREFLIGHT_ROOT/report.json" <<'PY'
+import json,sys
+r=json.load(open(sys.argv[1],encoding="utf-8"))
+print(r["checks"]["generation_member_chunk_cuda_amp"]["detail"]["selected_member_chunk"])
+PY
+)"
 
 PHASE="formal_training"; record_status "running"
 python -u train_shandong91_v3.py --config "$CONFIG" --output-dir "$OUTPUT_ROOT" --device cuda
 
 PHASE="generation_evaluation_plots_archive"; record_status "running"
-CONFIG="$CONFIG" OUTPUT_ROOT="$OUTPUT_ROOT" bash run_shandong91_raw_body_v3_1_finalize.sh
+CONFIG="$CONFIG" OUTPUT_ROOT="$OUTPUT_ROOT" MEMBER_CHUNK="$MEMBER_CHUNK" \
+  bash run_shandong91_raw_body_v3_1_finalize.sh
 
 PHASE="complete"; record_status "complete"
 trap - ERR

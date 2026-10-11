@@ -170,6 +170,9 @@ class Shandong91V3LowRankTests(unittest.TestCase):
         )
         self.assertEqual(self.v31_config["training"]["amp_initial_scale"],128.0)
         self.assertEqual(self.v31_config["training"]["amp_growth_interval"],1000000)
+        self.assertEqual(self.v31_config["generation"]["member_chunk"],256)
+        self.assertTrue(self.v31_config["generation"]["auto_tune_member_chunk"])
+        self.assertEqual(self.v31_config["generation"]["member_chunk_candidates"],[256,128,64])
 
     def test_v31_coordinate_loss_directly_supervises_all_factor_resources(self):
         sample=self.dataset[0]; mask=sample["effective_mask"][None]
@@ -206,6 +209,9 @@ class Shandong91V3LowRankTests(unittest.TestCase):
         self.assertIn('r["cuda_amp_safety"]=="PASS"',pipeline)
         self.assertIn('factor_gradient_scale_not_pca_attenuated',pipeline)
         self.assertIn('amp_initial_scale"]==128.0',pipeline)
+        self.assertIn('generation_member_chunk_cuda_amp',pipeline)
+        self.assertIn('MEMBER_CHUNK="$MEMBER_CHUNK"',pipeline)
+        self.assertIn('generation_runtime.json',finalize)
         self.assertIn('generate_shandong91_v3.py',finalize)
         self.assertIn('evaluate_shandong91_v3.py',finalize)
         self.assertIn('plot_shandong91_v3.py',finalize)

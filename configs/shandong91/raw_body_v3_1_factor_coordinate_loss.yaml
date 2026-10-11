@@ -100,7 +100,9 @@ generation:
   split: validation
   n_samples: 500
   seed: 424242
-  member_chunk: 64
+  member_chunk: 256
+  auto_tune_member_chunk: true
+  member_chunk_candidates: [256, 128, 64]
 evaluation:
   strict_effective_mask: true
   report_node_metrics: [coverage90, crps, width90, interval_score90, conditional_std, residual_quantiles, temporal_acf, spatial_correlation, ramp_crps]
