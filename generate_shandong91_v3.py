@@ -15,7 +15,7 @@ import yaml
 from datasets.shandong91_faithful24 import Shandong91Faithful24Dataset, threshold_sha256
 from datasets.shandong91_low_rank import factor_sha256, fit_train_only_pca
 from train_shandong91_v2 import data_contract_record, move_batch
-from train_shandong91_v3 import MODEL_ID, build_model
+from train_shandong91_v3 import MODEL_ID, SUPPORTED_MODEL_IDS, build_model
 
 
 def atomic_json(document, path):
@@ -58,10 +58,11 @@ def main():
         raise FileExistsError(f"refusing to overwrite V3 generation output: {output}")
     if args.device == "cuda" and not torch.cuda.is_available(): raise RuntimeError("CUDA unavailable")
     config = yaml.safe_load(Path(args.config).read_text("utf-8"))
-    if config["model"]["architecture"] != MODEL_ID: raise ValueError("wrong V3 config")
+    model_id = config["model"]["architecture"]
+    if model_id not in SUPPORTED_MODEL_IDS: raise ValueError("wrong V3/V3.1 config")
     checkpoint = Path(args.run_dir) / "checkpoints/best.pt"
     saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    if saved.get("model_identifier") != MODEL_ID: raise ValueError("checkpoint model mismatch")
+    if saved.get("model_identifier") != model_id: raise ValueError("checkpoint model mismatch")
     if saved["config_snapshot"]["model"] != config["model"]: raise ValueError("checkpoint/config model mismatch")
     if saved.get("data_contract") != data_contract_record(config["data"]): raise ValueError("data contract mismatch")
     current_factor = fit_train_only_pca(config["data"]["data_path"], config["model"]["common_factor_counts"])
@@ -82,7 +83,11 @@ def main():
     shape = (windows, args.n_samples, 168, 91, 3)
     static_shape = (windows,168,91,3)
     contract = {
-        "version":"shandong91_v3_window_resume_v2","model_identifier":MODEL_ID,
+        "version": (
+            "shandong91_v3_window_resume_v2" if model_id == MODEL_ID
+            else "shandong91_v3_1_window_resume_v1"
+        ),
+        "model_identifier":model_id,
         "projection_backend":"precomputed_masked_least_squares_v1",
         "checkpoint_epoch":int(saved["epoch"]),"checkpoint_state":args.checkpoint_state,
         "factor_document_sha256":saved["factor_document"]["sha256"],
@@ -143,13 +148,14 @@ def main():
             return
     if not np.isfinite(scenarios).all(): raise FloatingPointError("V3 scenarios contain NaN/Inf")
     metadata = {
-        "model_identifier":MODEL_ID,"checkpoint":str(checkpoint),"checkpoint_epoch":int(saved["epoch"]),
+        "model_identifier":model_id,"checkpoint":str(checkpoint),"checkpoint_epoch":int(saved["epoch"]),
         "checkpoint_state":args.checkpoint_state,"split":args.split,"n_samples":args.n_samples,"seed":args.seed,
         "member_chunk":args.member_chunk,"shape":list(shape),"sampler":method,"inference_steps":steps,
         "residual_sign":"generated_actual = forecast + generated_residual",
         "factor_document_sha256":saved["factor_document"]["sha256"],
         "load_local_branch":"disabled_strict_rank1","data_contract":data_contract_record(config["data"]),
         "projection_backend":"precomputed_masked_least_squares_v1",
+        "formal_objective":config["loss"]["formal_objective"],
         "physical_clipping":False,"bounded_engineering_generation":args.max_windows is not None,
         "git_commit":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),
         "resumable_generation":True,"completed_windows":windows,

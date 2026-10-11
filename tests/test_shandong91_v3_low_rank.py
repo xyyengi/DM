@@ -13,7 +13,11 @@ import yaml
 
 from datasets.shandong91_faithful24 import Shandong91Faithful24Dataset, fit_faithful24_state_thresholds
 from datasets.shandong91_low_rank import FixedPCAFactorTransform, factor_sha256, fit_train_only_pca
-from src.models.shandong91_low_rank_diffusion import Shandong91HeterogeneousRawBodyV3, Shandong91LowRankDiffusion
+from src.models.shandong91_low_rank_diffusion import (
+    Shandong91HeterogeneousRawBodyV3,
+    Shandong91HeterogeneousRawBodyV31,
+    Shandong91LowRankDiffusion,
+)
 from generate_shandong91_v3 import atomic_json, open_array
 
 
@@ -21,6 +25,7 @@ class Shandong91V3LowRankTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.config=yaml.safe_load(Path("configs/shandong91/raw_body_v3_low_rank_common_factor.yaml").read_text("utf-8"))
+        cls.v31_config=yaml.safe_load(Path("configs/shandong91/raw_body_v3_1_factor_coordinate_loss.yaml").read_text("utf-8"))
         cls.factors=fit_train_only_pca(cls.config["data"]["data_path"])
         cls.thresholds=fit_faithful24_state_thresholds(cls.config["data"]["data_path"])
         cls.dataset=Shandong91Faithful24Dataset(cls.config["data"]["data_path"],"train",cls.thresholds)
@@ -150,6 +155,59 @@ class Shandong91V3LowRankTests(unittest.TestCase):
             right=clone.sample(batch,batch["effective_mask"],method="ddim",inference_steps=2,
                                initial_factor_noise=factor_noise,initial_local_noise=local_noise)
         self.assertTrue(torch.allclose(left,right,rtol=0,atol=1e-6)); self.assertTrue(torch.isfinite(left).all())
+
+    def test_v31_versions_training_semantics_without_architecture_expansion(self):
+        self.assertNotEqual(
+            Shandong91HeterogeneousRawBodyV3.architecture,
+            Shandong91HeterogeneousRawBodyV31.architecture,
+        )
+        old=copy.deepcopy(self.config["model"]); new=copy.deepcopy(self.v31_config["model"])
+        old["architecture"]=new["architecture"]
+        self.assertEqual(old,new)
+        self.assertEqual(
+            self.v31_config["loss"]["formal_objective"],
+            "factor_coordinate_plus_projected_local_mean",
+        )
+
+    def test_v31_coordinate_loss_directly_supervises_all_factor_resources(self):
+        sample=self.dataset[0]; mask=sample["effective_mask"][None]
+        config=copy.deepcopy(self.v31_config["model"])
+        config.update(base_channels=8,channel_multipliers=[1,2,2],group_norm_groups=4,state_channels=[4,8,8],dropout=0.0)
+        model=Shandong91LowRankDiffusion(
+            Shandong91HeterogeneousRawBodyV31(config,self.dataset.node_features,self.dataset.adjacency_with_self.float()),
+            self.v31_config["diffusion"],self.factors,
+        )
+        predicted_factor=torch.zeros(1,168,7,requires_grad=True)
+        predicted_local=torch.zeros(1,168,91,3,requires_grad=True)
+        latents={
+            "predicted_factor_noise":predicted_factor,
+            "factor_noise":torch.ones_like(predicted_factor),
+            "predicted_local_noise":predicted_local,
+            "local_noise":torch.ones_like(predicted_local),
+        }
+        loss,terms=model.coordinate_loss(latents,mask)
+        self.assertTrue(torch.allclose(loss,terms["factor_coordinate"]+terms["local_projected"]))
+        loss.backward()
+        norms=[]
+        for start,stop in ((0,5),(5,6),(6,7)):
+            value=float(predicted_factor.grad[...,start:stop].norm())
+            self.assertGreater(value,0); self.assertTrue(np.isfinite(value)); norms.append(value)
+        self.assertLess(max(norms)/min(norms),3.0)
+        self.assertEqual(float(predicted_local.grad[...,2].abs().max()),0.0)
+
+    def test_v31_pipeline_is_fail_closed_and_complete(self):
+        pipeline=Path("run_shandong91_raw_body_v3_1_pipeline.sh").read_text("utf-8")
+        finalize=Path("run_shandong91_raw_body_v3_1_finalize.sh").read_text("utf-8")
+        ordered=("cuda_amp_preflight","formal_training","generation_evaluation_plots_archive","complete")
+        positions=[pipeline.index(f'PHASE="{name}"') for name in ordered]
+        self.assertEqual(positions,sorted(positions))
+        self.assertIn('r["cuda_amp_safety"]=="PASS"',pipeline)
+        self.assertIn('factor_gradient_scale_not_pca_attenuated',pipeline)
+        self.assertIn('generate_shandong91_v3.py',finalize)
+        self.assertIn('evaluate_shandong91_v3.py',finalize)
+        self.assertIn('plot_shandong91_v3.py',finalize)
+        self.assertIn('tar -czf "$TEMP_ARCHIVE"',finalize)
+        self.assertIn('--resume-output',finalize)
 
 
 if __name__=="__main__": unittest.main()

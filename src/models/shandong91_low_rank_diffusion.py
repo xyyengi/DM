@@ -25,6 +25,12 @@ class Shandong91HeterogeneousRawBodyV3(Shandong91HeterogeneousRawBodyV2):
         super().__init__(config, node_features, adjacency)
 
 
+class Shandong91HeterogeneousRawBodyV31(Shandong91HeterogeneousRawBodyV3):
+    """V3.1 keeps the V3 backbone and versions only its training semantics."""
+
+    architecture = "shandong91_heterogeneous_raw_body_v3_1_factor_coordinate_loss"
+
+
 class Shandong91LowRankDiffusion(torch.nn.Module):
     """Diffuse seven factors and a projected Wind/Solar local field jointly.
 
@@ -99,6 +105,42 @@ class Shandong91LowRankDiffusion(torch.nn.Module):
                 "noisy_node": noisy_node, "target_node_noise": target,
             }
         return prediction, error
+
+    def coordinate_loss(self, latents, mask):
+        """Supervise the two standardized latent blocks without PCA attenuation.
+
+        This is deliberately not a resource-balanced node loss.  The seven
+        train-only PCA coordinates retain their selected dimensionality
+        (Wind=5, Solar=1, Load=1), while the projected Wind/Solar local field is
+        a second coordinate block.  Load has no local coordinate.
+        """
+        factor_error = (
+            latents["predicted_factor_noise"] - latents["factor_noise"]
+        ).square()
+        local_error = (
+            latents["predicted_local_noise"] - latents["local_noise"]
+        ).square()
+        local_mask = mask.bool().clone()
+        local_mask[..., 2] = False
+        factor_mean = factor_error.mean()
+        local_mean = self.masked_loss(local_error, local_mask)
+        objective = factor_mean + local_mean
+        factor_by_resource = {}
+        for name, (start, stop) in self.transform.slices.items():
+            factor_by_resource[name] = factor_error[..., start:stop].mean()
+        local_by_resource = {
+            name: self.masked_loss(local_error[..., channel], local_mask[..., channel])
+            for channel, name in enumerate(("Wind", "Solar"))
+        }
+        return objective, {
+            "factor_coordinate": factor_mean,
+            "local_projected": local_mean,
+            "factor_by_resource": factor_by_resource,
+            "local_by_resource": local_by_resource,
+            "factor_error": factor_error,
+            "local_error": local_error,
+            "local_mask": local_mask,
+        }
 
     def _step(self, current, epsilon, alpha_bar, previous_bar, method, *, noise):
         clean = (current - torch.sqrt(1 - alpha_bar) * epsilon) / torch.sqrt(alpha_bar).clamp_min(1e-12)

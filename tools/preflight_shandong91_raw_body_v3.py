@@ -15,7 +15,11 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 
 from datasets.shandong91_faithful24 import Shandong91Faithful24Dataset, fit_faithful24_state_thresholds
 from datasets.shandong91_low_rank import FixedPCAFactorTransform, fit_train_only_pca
-from src.models.shandong91_low_rank_diffusion import Shandong91HeterogeneousRawBodyV3, Shandong91LowRankDiffusion
+from src.models.shandong91_low_rank_diffusion import (
+    Shandong91HeterogeneousRawBodyV3,
+    Shandong91HeterogeneousRawBodyV31,
+    Shandong91LowRankDiffusion,
+)
 from train_shandong91_v2 import move_batch
 
 CHANNELS=("Wind","Solar","Load")
@@ -37,7 +41,17 @@ def main():
     batch=move_batch({k:v.unsqueeze(0) for k,v in dataset[0].items()},device); mask=batch["effective_mask"].bool()
     small=copy.deepcopy(config["model"])
     if not args.full_model: small.update(base_channels=8,channel_multipliers=[1,2,2],group_norm_groups=4,state_channels=[4,8,8],dropout=0.0)
-    denoiser=Shandong91HeterogeneousRawBodyV3(small,dataset.node_features.to(device),dataset.adjacency_with_self.float().to(device))
+    architecture=config["model"]["architecture"]
+    denoiser_class={
+        Shandong91HeterogeneousRawBodyV3.architecture: Shandong91HeterogeneousRawBodyV3,
+        Shandong91HeterogeneousRawBodyV31.architecture: Shandong91HeterogeneousRawBodyV31,
+    }.get(architecture)
+    if denoiser_class is None: raise ValueError("unsupported V3/V3.1 architecture")
+    objective=config["loss"]["formal_objective"]
+    expected=("elementwise_effective_masked_mean" if denoiser_class is Shandong91HeterogeneousRawBodyV3
+              else "factor_coordinate_plus_projected_local_mean")
+    if objective!=expected: raise ValueError(f"architecture requires {expected}")
+    denoiser=denoiser_class(small,dataset.node_features.to(device),dataset.adjacency_with_self.float().to(device))
     model=Shandong91LowRankDiffusion(denoiser,config["diffusion"],factors).to(device)
     checks={}
     def record(name,passed,detail): checks[name]={"status":"PASS" if passed else "FAIL","detail":detail}
@@ -56,25 +70,62 @@ def main():
     record("load_local_disabled",float(local[...,2].abs().max())==0.0,{"max_abs":float(local[...,2].abs().max())})
     contract=dataset.condition_manifest(); record("causal_conditions",contract["recent_error_future_actual_used"] is False and contract["lead"]=="disabled",{"recent_error":contract["recent_error"],"recent_error_future_actual_used":contract["recent_error_future_actual_used"],"lead":contract["lead"],"state_threshold_sha256":contract["state_threshold_sha256"]})
     timestep=torch.tensor([137],device=device); source_noise=torch.randn_like(batch["residual"])
+    model.eval()
     with torch.autocast(device_type=device.type,dtype=torch.float16,enabled=args.amp):
         prediction,error,latents=model.prediction_and_error(batch,timestep,noise=source_noise,return_latents=True)
-        loss=model.masked_loss(error,mask)
+        if objective=="elementwise_effective_masked_mean":
+            loss=model.masked_loss(error,mask); terms=None
+        else:
+            loss,terms=model.coordinate_loss(latents,mask)
     latents["predicted_factor_noise"].retain_grad(); model.zero_grad(set_to_none=True); loss.backward()
     gradients=[p.grad for p in model.parameters() if p.grad is not None]
     factor_grad=latents["predicted_factor_noise"].grad
     record("forward_backward_finite",prediction.shape==(1,168,91,3) and torch.isfinite(loss) and gradients and all(torch.isfinite(g).all() for g in gradients),{"loss":float(loss.detach()),"prediction_shape":list(prediction.shape)})
     factor_slices={"Wind":(0,5),"Solar":(5,6),"Load":(6,7)}
+    factor_gradient_norms={}
     for name,(start,stop) in factor_slices.items():
         norm=float(factor_grad[...,start:stop].double().norm())
+        factor_gradient_norms[name]=norm
         record(f"{name.lower()}_factor_gradient",np.isfinite(norm) and norm>0,{"l2":norm})
+    if terms is not None:
+        exact=float((terms["factor_coordinate"]+terms["local_projected"]).detach())
+        record("factor_coordinate_objective_contract",abs(float(loss.detach())-exact)<1e-7,{
+            "objective":float(loss.detach()),"factor_coordinate":float(terms["factor_coordinate"].detach()),
+            "local_projected":float(terms["local_projected"].detach()),
+            "combination":"sum; not resource-balanced node weighting",
+        })
+        positive=list(factor_gradient_norms.values())
+        ratio=max(positive)/min(positive)
+        record("factor_gradient_scale_not_pca_attenuated",np.isfinite(ratio) and ratio<20,{
+            "gradient_norms":factor_gradient_norms,"max_to_min_ratio":ratio,
+        })
     core=denoiser.encoder_blocks[0].conv1.weight; before=core.detach().clone(); optimizer=torch.optim.AdamW(model.parameters(),lr=1e-4)
     optimizer.step(); delta=float((core.detach()-before).abs().max())
     record("optimizer_core_update",np.isfinite(delta) and delta>0,{"max_abs_delta":delta})
-    changed=prediction.detach().clone(); changed[~mask]+=999
-    invariant=model.masked_loss((changed-model.transform.reconstruct(latents["factor_noise"],latents["local_noise"],mask,include_mean=False)).square(),mask)
-    record("mask_invariance",abs(float(invariant)-float(loss.detach()))<1e-6,{"absolute_delta":abs(float(invariant)-float(loss.detach()))})
+    if terms is not None:
+        with torch.no_grad(), torch.autocast(device_type=device.type,dtype=torch.float16,enabled=args.amp):
+            _,_,after_latents=model.prediction_and_error(
+                batch,timestep,factor_noise=latents["factor_noise"].detach(),
+                local_noise=latents["local_noise"].detach(),return_latents=True,
+            )
+            after_loss,_=model.coordinate_loss(after_latents,mask)
+        before_loss=float(loss.detach()); after_value=float(after_loss.detach())
+        record("fixed_noise_objective_decreases_after_update",after_value<before_loss,{
+            "before":before_loss,"after":after_value,"delta":after_value-before_loss,
+        })
+    if terms is None:
+        changed=prediction.detach().clone(); changed[~mask]+=999
+        invariant=model.masked_loss((changed-model.transform.reconstruct(latents["factor_noise"],latents["local_noise"],mask,include_mean=False)).square(),mask)
+    else:
+        changed_latents=dict(latents)
+        changed_local=latents["predicted_local_noise"].detach().clone()
+        changed_local[~mask]+=999
+        changed_latents["predicted_local_noise"]=changed_local
+        invariant,_=model.coordinate_loss(changed_latents,mask)
+    invariant_delta=abs(float(invariant.detach())-float(loss.detach()))
+    record("mask_invariance",invariant_delta<1e-6,{"absolute_delta":invariant_delta})
     checkpoint=output/"reload_probe.pt"; torch.save(model.state_dict(),checkpoint)
-    clone=Shandong91LowRankDiffusion(Shandong91HeterogeneousRawBodyV3(small,dataset.node_features.to(device),dataset.adjacency_with_self.float().to(device)),config["diffusion"],factors).to(device)
+    clone=Shandong91LowRankDiffusion(denoiser_class(small,dataset.node_features.to(device),dataset.adjacency_with_self.float().to(device)),config["diffusion"],factors).to(device)
     clone.load_state_dict(torch.load(checkpoint,map_location=device,weights_only=True),strict=True); clone.eval(); model.eval()
     initial_factor=torch.randn(1,168,7,device=device); initial_local=torch.randn_like(batch["residual"])
     with torch.no_grad():
@@ -92,12 +143,14 @@ def main():
         formal=int(config["training"]["batch_size"]); expanded={k:v.expand(formal,*v.shape[1:]).contiguous() for k,v in batch.items()}
         model.train(); model.zero_grad(set_to_none=True); torch.cuda.reset_peak_memory_stats(device)
         with torch.autocast(device_type="cuda",dtype=torch.float16,enabled=args.amp):
-            _,formal_error=model.prediction_and_error(expanded,torch.full((formal,),137,device=device,dtype=torch.long)); formal_loss=model.masked_loss(formal_error,expanded["effective_mask"])
+            _,formal_error,formal_latents=model.prediction_and_error(expanded,torch.full((formal,),137,device=device,dtype=torch.long),return_latents=True)
+            if objective=="elementwise_effective_masked_mean": formal_loss=model.masked_loss(formal_error,expanded["effective_mask"])
+            else: formal_loss,_=model.coordinate_loss(formal_latents,expanded["effective_mask"])
         formal_loss.backward(); finite=all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
         record("formal_microbatch_cuda_amp",bool(torch.isfinite(formal_loss) and finite),{"batch_size":formal,"loss":float(formal_loss.detach()),"peak_allocated_gb":torch.cuda.max_memory_allocated(device)/2**30})
     parameter_count=sum(p.numel() for p in model.parameters()); status="PASS" if all(v["status"]=="PASS" for v in checks.values()) else "FAIL"
-    report={"status":status,"scope":"bounded V3 engineering preflight; no formal training/generation","device":str(device),"amp":args.amp,"full_model":args.full_model,"parameter_count":parameter_count,"factor_document_sha256":factors["sha256"],"checks":checks,"formal_training":"NOT RUN","formal_generation":"NOT RUN","cuda_amp_safety":"PASS" if args.full_model and device.type=="cuda" and status=="PASS" else "NOT RUN"}
-    (output/"report.json").write_text(json.dumps(report,indent=2),"utf-8"); (output/"report.md").write_text("\n".join(["# Shandong91 V3 preflight","",f"- Overall: **{status}**",f"- Parameters: **{parameter_count:,}**","- Formal training: **NOT RUN**","- Formal generation: **NOT RUN**",""]+[f"- {k}: **{v['status']}**" for k,v in checks.items()]),"utf-8")
+    report={"status":status,"scope":"bounded V3/V3.1 engineering preflight; no formal training/generation","architecture":architecture,"formal_objective":objective,"device":str(device),"amp":args.amp,"full_model":args.full_model,"parameter_count":parameter_count,"factor_document_sha256":factors["sha256"],"checks":checks,"formal_training":"NOT RUN","formal_generation":"NOT RUN","cuda_amp_safety":"PASS" if args.full_model and device.type=="cuda" and status=="PASS" else "NOT RUN"}
+    (output/"report.json").write_text(json.dumps(report,indent=2),"utf-8"); (output/"report.md").write_text("\n".join(["# Shandong91 V3/V3.1 preflight","",f"- Overall: **{status}**",f"- Parameters: **{parameter_count:,}**","- Formal training: **NOT RUN**","- Formal generation: **NOT RUN**",""]+[f"- {k}: **{v['status']}**" for k,v in checks.items()]),"utf-8")
     print(json.dumps(report,indent=2));
     if status!="PASS": raise SystemExit(1)
 

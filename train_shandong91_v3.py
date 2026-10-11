@@ -20,7 +20,8 @@ from datasets.shandong91_faithful24 import (
 )
 from datasets.shandong91_low_rank import fit_train_only_pca, factor_sha256
 from src.models.shandong91_low_rank_diffusion import (
-    Shandong91HeterogeneousRawBodyV3, Shandong91LowRankDiffusion,
+    Shandong91HeterogeneousRawBodyV3, Shandong91HeterogeneousRawBodyV31,
+    Shandong91LowRankDiffusion,
 )
 from train_shandong91_v2 import (
     atomic_save, clone_state, data_contract_record, loader_kwargs, move_batch,
@@ -28,6 +29,8 @@ from train_shandong91_v2 import (
 )
 
 MODEL_ID = Shandong91HeterogeneousRawBodyV3.architecture
+V31_MODEL_ID = Shandong91HeterogeneousRawBodyV31.architecture
+SUPPORTED_MODEL_IDS = (MODEL_ID, V31_MODEL_ID)
 CHANNELS = ("Wind", "Solar", "Load")
 
 
@@ -35,7 +38,14 @@ def build_model(config, dataset, device, factor_document=None):
     factor_document = factor_document or fit_train_only_pca(
         config["data"]["data_path"], config["model"]["common_factor_counts"]
     )
-    denoiser = Shandong91HeterogeneousRawBodyV3(
+    architecture = config["model"]["architecture"]
+    model_class = {
+        MODEL_ID: Shandong91HeterogeneousRawBodyV3,
+        V31_MODEL_ID: Shandong91HeterogeneousRawBodyV31,
+    }.get(architecture)
+    if model_class is None:
+        raise ValueError(f"unsupported low-rank architecture: {architecture}")
+    denoiser = model_class(
         config["model"], dataset.node_features.to(device),
         dataset.adjacency_with_self.float().to(device),
     ).to(device)
@@ -44,10 +54,13 @@ def build_model(config, dataset, device, factor_document=None):
     ).to(device)
 
 
-def evaluate(model, loader, device, seed, amp, max_batches=None):
+def evaluate(model, loader, device, seed, amp, objective, max_batches=None):
     model.eval(); torch.manual_seed(seed)
     totals = {"overall": 0.0, **{name: 0.0 for name in CHANNELS}}
     counts = {name: 0 for name in totals}
+    coordinate = {"factor_sum": 0.0, "factor_count": 0,
+                  "local_sum": 0.0, "local_count": 0,
+                  "factor_by_resource": {name: [0.0, 0] for name in CHANNELS}}
     with torch.no_grad():
         for index, raw in enumerate(loader):
             if max_batches is not None and index >= max_batches:
@@ -55,13 +68,41 @@ def evaluate(model, loader, device, seed, amp, max_batches=None):
             batch = move_batch(raw, device); mask = batch["effective_mask"].bool()
             timestep = torch.randint(0, len(model.alpha_hat), (len(mask),), device=device)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
-                _, error = model.prediction_and_error(batch, timestep)
+                _, error, latents = model.prediction_and_error(
+                    batch, timestep, return_latents=True
+                )
             totals["overall"] += float((error * mask).sum()); counts["overall"] += int(mask.sum())
             for channel, name in enumerate(CHANNELS):
                 current = mask[..., channel]
                 totals[name] += float((error[..., channel] * current).sum())
                 counts[name] += int(current.sum())
-    return {name: totals[name] / max(counts[name], 1) for name in totals}
+            if objective == "factor_coordinate_plus_projected_local_mean":
+                _, terms = model.coordinate_loss(latents, mask)
+                coordinate["factor_sum"] += float(terms["factor_error"].sum())
+                coordinate["factor_count"] += int(terms["factor_error"].numel())
+                coordinate["local_sum"] += float(
+                    (terms["local_error"] * terms["local_mask"]).sum()
+                )
+                coordinate["local_count"] += int(terms["local_mask"].sum())
+                for name, (start, stop) in model.transform.slices.items():
+                    current = terms["factor_error"][..., start:stop]
+                    coordinate["factor_by_resource"][name][0] += float(current.sum())
+                    coordinate["factor_by_resource"][name][1] += int(current.numel())
+    node = {name: totals[name] / max(counts[name], 1) for name in totals}
+    if objective == "elementwise_effective_masked_mean":
+        return node
+    factor = coordinate["factor_sum"] / max(coordinate["factor_count"], 1)
+    local = coordinate["local_sum"] / max(coordinate["local_count"], 1)
+    return {
+        "formal_objective": factor + local,
+        "factor_coordinate": factor,
+        "local_projected": local,
+        "factor_by_resource": {
+            name: value / max(count, 1)
+            for name, (value, count) in coordinate["factor_by_resource"].items()
+        },
+        "node_space_diagnostic": node,
+    }
 
 
 def main():
@@ -71,10 +112,22 @@ def main():
     parser.add_argument("--allow-dirty", action="store_true"); parser.add_argument("--max-epochs", type=int)
     parser.add_argument("--max-train-batches", type=int); parser.add_argument("--max-val-batches", type=int)
     args = parser.parse_args(); config = yaml.safe_load(Path(args.config).read_text("utf-8"))
-    if config["model"]["architecture"] != MODEL_ID:
-        raise ValueError("wrong V3 architecture identifier")
-    if config["loss"]["formal_objective"] != "elementwise_effective_masked_mean":
-        raise ValueError("V3 retains the unweighted elementwise effective-mask objective")
+    model_id = config["model"]["architecture"]
+    if model_id not in SUPPORTED_MODEL_IDS:
+        raise ValueError("wrong V3/V3.1 architecture identifier")
+    objective = config["loss"]["formal_objective"]
+    expected_objective = (
+        "elementwise_effective_masked_mean" if model_id == MODEL_ID
+        else "factor_coordinate_plus_projected_local_mean"
+    )
+    if objective != expected_objective:
+        raise ValueError(
+            f"{model_id} requires formal objective {expected_objective}"
+        )
+    checkpoint_version = (
+        "shandong91_v3_low_rank_epoch_boundary" if model_id == MODEL_ID
+        else "shandong91_v3_1_factor_coordinate_epoch_boundary"
+    )
     if config["training"]["optimizer"] != "AdamW" or config["training"]["scheduler"] != "none":
         raise ValueError("V3 requires AdamW and no scheduler")
     if config["training"].get("amp_overflow_policy") != "fail_closed":
@@ -121,7 +174,9 @@ def main():
     best_val = float("inf"); best_epoch = 0; history = []
     if args.resume:
         saved = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if saved.get("model_identifier") != MODEL_ID or saved["config_snapshot"]["model"] != config["model"]:
+        if (saved.get("model_identifier") != model_id
+                or saved.get("checkpoint_version") != checkpoint_version
+                or saved["config_snapshot"]["model"] != config["model"]):
             raise ValueError("resume checkpoint is incompatible")
         if saved.get("data_contract") != data_contract_record(config["data"]):
             raise ValueError("resume data contract changed")
@@ -148,7 +203,7 @@ def main():
             history = [row for row in json.loads(history_path.read_text("utf-8"))
                        if int(row["epoch"]) <= int(saved["epoch"])]
     manifest = {
-        "model_identifier": MODEL_ID,
+        "model_identifier": model_id,
         "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
         "branch": subprocess.check_output(["git", "branch", "--show-current"], text=True).strip(),
         "dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()),
@@ -171,6 +226,9 @@ def main():
     for epoch in range(start_epoch, epochs + 1):
         started = time.perf_counter(); model.train(); optimizer.zero_grad(set_to_none=True)
         totals = {"overall": 0.0, **{name: 0.0 for name in CHANNELS}}; counts = {name: 0 for name in totals}
+        coordinate = {"factor_sum": 0.0, "factor_count": 0,
+                      "local_sum": 0.0, "local_count": 0,
+                      "factor_by_resource": {name: [0.0, 0] for name in CHANNELS}}
         used = 0; bounded = min(len(train_loader), args.max_train_batches or len(train_loader))
         for index, raw in enumerate(train_loader):
             if index >= bounded: break
@@ -178,8 +236,15 @@ def main():
             timestep = torch.randint(0, len(model.alpha_hat), (len(mask),), device=device)
             divisor = min(accumulation, bounded - (used // accumulation) * accumulation)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
-                _, error = model.prediction_and_error(batch, timestep)
-                loss = model.masked_loss(error, mask) / divisor
+                _, error, latents = model.prediction_and_error(
+                    batch, timestep, return_latents=True
+                )
+                if objective == "elementwise_effective_masked_mean":
+                    formal_loss = model.masked_loss(error, mask)
+                    terms = None
+                else:
+                    formal_loss, terms = model.coordinate_loss(latents, mask)
+                loss = formal_loss / divisor
             if not torch.isfinite(loss): raise FloatingPointError("non-finite V3 loss")
             scaler.scale(loss).backward(); used += 1
             if used % accumulation == 0 or used == bounded:
@@ -195,21 +260,54 @@ def main():
                 current = mask[..., channel]
                 totals[name] += float((error[..., channel].detach() * current).sum())
                 counts[name] += int(current.sum())
+            if terms is not None:
+                coordinate["factor_sum"] += float(terms["factor_error"].detach().sum())
+                coordinate["factor_count"] += int(terms["factor_error"].numel())
+                coordinate["local_sum"] += float(
+                    (terms["local_error"].detach() * terms["local_mask"]).sum()
+                )
+                coordinate["local_count"] += int(terms["local_mask"].sum())
+                for name, (start, stop) in model.transform.slices.items():
+                    current = terms["factor_error"][..., start:stop].detach()
+                    coordinate["factor_by_resource"][name][0] += float(current.sum())
+                    coordinate["factor_by_resource"][name][1] += int(current.numel())
+        node_train = {name: totals[name] / max(counts[name], 1) for name in totals}
+        if objective == "elementwise_effective_masked_mean":
+            train_metrics = node_train
+        else:
+            factor = coordinate["factor_sum"] / max(coordinate["factor_count"], 1)
+            local = coordinate["local_sum"] / max(coordinate["local_count"], 1)
+            train_metrics = {
+                "formal_objective": factor + local,
+                "factor_coordinate": factor,
+                "local_projected": local,
+                "factor_by_resource": {
+                    name: value / max(count, 1)
+                    for name, (value, count) in coordinate["factor_by_resource"].items()
+                },
+                "node_space_diagnostic": node_train,
+            }
         row = {"epoch": epoch, "global_step": global_step,
-               "train": {name: totals[name] / max(counts[name], 1) for name in totals},
+               "train": train_metrics,
                "epoch_seconds": time.perf_counter() - started}
         improved = False; validated = epoch == 1 or epoch % validation_every == 0 or epoch == epochs
         if validated:
             raw_state = clone_state(model); model.load_state_dict(ema, strict=True)
-            row["validation_ema"] = evaluate(model, val_loader, device,
-                                               int(training["validation_seed"]), amp,
-                                               args.max_val_batches)
+            row["validation_ema"] = evaluate(
+                model, val_loader, device, int(training["validation_seed"]),
+                amp, objective, args.max_val_batches,
+            )
             model.load_state_dict(raw_state, strict=True)
-            improved = row["validation_ema"]["overall"] < best_val - min_delta
-            if improved: best_val = row["validation_ema"]["overall"]; best_epoch = epoch
+            selection_metric = (
+                row["validation_ema"]["overall"]
+                if objective == "elementwise_effective_masked_mean"
+                else row["validation_ema"]["formal_objective"]
+            )
+            improved = selection_metric < best_val - min_delta
+            if improved: best_val = selection_metric; best_epoch = epoch
         document = {
-            "checkpoint_version": "shandong91_v3_low_rank_epoch_boundary",
-            "model_identifier": MODEL_ID, "model_state_dict": clone_state(model),
+            "checkpoint_version": checkpoint_version,
+            "model_identifier": model_id, "model_state_dict": clone_state(model),
             "ema_state_dict": {name: value.detach().cpu().clone() for name, value in ema.items()},
             "optimizer_state_dict": optimizer.state_dict(), "amp_scaler_state_dict": scaler.state_dict(),
             "scheduler_state_dict": None, "epoch": epoch, "global_step": global_step,
