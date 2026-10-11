@@ -51,14 +51,19 @@ class Shandong91LowRankDiffusion(torch.nn.Module):
         weight = mask.to(error.dtype)
         return (error * weight).sum() / weight.sum().clamp_min(1)
 
-    def _predict_latents(self, noisy_node, batch, timestep, mask):
+    def _predict_latents(self, noisy_node, batch, timestep, mask, projection=None):
         raw = self.denoiser(
             noisy_node, timestep, batch["forecast"], batch["forecast_valid_mask"],
             batch["time_mark"], batch["recent_error"],
             batch["recent_error_valid_mask"], batch["node_state"],
         )
-        factor = self.transform.project_factor(raw, mask)
-        local = self.transform.project_local(raw, mask)
+        factor = self.transform.project_factor(raw, mask, projection)
+        if projection is None:
+            # Reference path retained for numerical-equivalence tests.
+            local = self.transform.project_local(raw, mask)
+        else:
+            local = (raw - self.transform.common(factor)) * mask.to(raw.dtype)
+            local[..., 2] = 0
         return factor, local
 
     def prediction_and_error(self, batch, timestep, noise=None, *, factor_noise=None,
@@ -109,8 +114,13 @@ class Shandong91LowRankDiffusion(torch.nn.Module):
 
     @torch.no_grad()
     def sample(self, batch, generation_mask, *, method="ddpm", inference_steps=500,
-               initial_factor_noise=None, initial_local_noise=None, generator=None):
+               initial_factor_noise=None, initial_local_noise=None, generator=None,
+               _precompute_projection=True):
         shape = batch["forecast"].shape
+        projection = (
+            self.transform.prepare_projection(generation_mask)
+            if _precompute_projection else None
+        )
         factors = (
             torch.randn(shape[0], shape[1], self.transform.factor_count,
                         device=batch["forecast"].device,
@@ -122,7 +132,7 @@ class Shandong91LowRankDiffusion(torch.nn.Module):
                         dtype=batch["forecast"].dtype, generator=generator)
             if initial_local_noise is None else initial_local_noise.clone()
         )
-        local = self.transform.project_local(local_source, generation_mask)
+        local = self.transform.project_local(local_source, generation_mask, projection)
         total = len(self.alpha_hat)
         if method == "ddpm":
             if inference_steps != total:
@@ -138,7 +148,7 @@ class Shandong91LowRankDiffusion(torch.nn.Module):
                                   dtype=torch.long)
             noisy_node = self.transform.reconstruct(factors, local, generation_mask)
             epsilon_factor, epsilon_local = self._predict_latents(
-                noisy_node, batch, timestep, generation_mask
+                noisy_node, batch, timestep, generation_mask, projection
             )
             alpha_bar = self.alpha_hat[int(t_value)].to(factors.dtype)
             previous_bar = None
@@ -149,7 +159,7 @@ class Shandong91LowRankDiffusion(torch.nn.Module):
             )
             local_random = self.transform.project_local(
                 torch.randn(local.shape, device=local.device, dtype=local.dtype,
-                            generator=generator), generation_mask
+                            generator=generator), generation_mask, projection
             )
             factors = self._step(
                 factors, epsilon_factor, alpha_bar, previous_bar, method,
@@ -159,5 +169,5 @@ class Shandong91LowRankDiffusion(torch.nn.Module):
                 local, epsilon_local, alpha_bar, previous_bar, method,
                 noise=local_random,
             )
-            local = self.transform.project_local(local, generation_mask)
+            local = self.transform.project_local(local, generation_mask, projection)
         return self.transform.reconstruct(factors, local, generation_mask).contiguous()

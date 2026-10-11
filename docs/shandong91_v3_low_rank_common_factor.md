@@ -30,7 +30,7 @@ The V2 backbone is unchanged: `777,152` trainable parameters in both V2 and V3. 
 
 The evaluator reports strict-mask node and system CRPS, 90% coverage and width, system interval score, member-conditional covariance amplification, residual spatial correlation, temporal ACF and joint Energy Score. Cross-time truth correlation and member-conditional generated correlation are explicitly labeled as different estimands.
 
-Formal generation uses disk-backed arrays and persists an atomic RNG/progress checkpoint after every validation window. An interrupted run resumes at the next incomplete window with an exact continuation of the sampler RNG stream; a bounded two-window stop/resume matched uninterrupted generation bit-for-bit. Member-level progress is printed for every chunk. The 12 GB server default is `member_chunk=64`; this changes batching only, not the 500-member, 500-step DDPM contract.
+Formal generation uses disk-backed arrays and persists an atomic RNG/progress checkpoint after every validation window. An interrupted run resumes at the next incomplete window with an exact continuation of the sampler RNG stream; a bounded two-window stop/resume matched uninterrupted generation bit-for-bit. Member-level progress is printed for every chunk. The 12 GB server default is `member_chunk=64`; this changes batching only, not the 500-member, 500-step DDPM contract. The versioned `precomputed_masked_least_squares_v1` backend computes the fixed masked PCA solve once per forecast window and reuses the resulting linear operator during reverse diffusion. Its outputs are isolated under `validation_raw_n500_fast_projection_v2`, so older per-step-solve partial arrays cannot be mixed into the optimized result.
 
 ## Server entry
 

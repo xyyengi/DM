@@ -3,8 +3,8 @@ set -Eeuo pipefail
 
 CONFIG="${CONFIG:-configs/shandong91/raw_body_v3_low_rank_common_factor.yaml}"
 OUTPUT_ROOT="${OUTPUT_ROOT:?set OUTPUT_ROOT to the completed V3 training directory}"
-GENERATION_DIR="${GENERATION_DIR:-${OUTPUT_ROOT}/validation_raw_n500}"
-EVALUATION_DIR="${EVALUATION_DIR:-${OUTPUT_ROOT}/validation_evaluation}"
+GENERATION_DIR="${GENERATION_DIR:-${OUTPUT_ROOT}/validation_raw_n500_fast_projection_v2}"
+EVALUATION_DIR="${EVALUATION_DIR:-${OUTPUT_ROOT}/validation_evaluation_fast_projection_v2}"
 ARCHIVE="${ARCHIVE:-${OUTPUT_ROOT}_completed.tar.gz}"
 MEMBER_CHUNK="$(python - "$CONFIG" <<'PY'
 import sys,yaml

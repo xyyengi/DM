@@ -172,6 +172,44 @@ class FixedPCAFactorTransform(nn.Module):
                 ).squeeze(-1)
         return output
 
+    def prepare_projection(self, mask: torch.Tensor) -> torch.Tensor:
+        """Build one masked least-squares operator for a generation window.
+
+        Ensemble members share the same forecast-valid mask.  Reusing this
+        operator removes CUDA-synchronizing ``linalg.solve`` calls from every
+        reverse-diffusion step without changing the fixed-PCA projection.
+        """
+        if mask.ndim != 4 or tuple(mask.shape[-2:]) != (91, 3):
+            raise ValueError("projection mask must have shape [B,T,91,3]")
+        reference = mask[:1].bool()
+        if mask.shape[0] > 1 and not torch.equal(mask.bool(), reference.expand_as(mask)):
+            raise ValueError("fast projection requires one shared mask per ensemble")
+        operator = torch.zeros(
+            mask.shape[1], self.factor_count, 91, 3,
+            device=mask.device, dtype=torch.float32,
+        )
+        with torch.autocast(device_type=mask.device.type, enabled=False):
+            for channel, name in enumerate(CHANNELS):
+                start, stop = self.slices[name]
+                basis = self.basis[start:stop, :, channel].float()
+                weight = reference[0, ..., channel].float()
+                gram = torch.einsum("tn,kn,ln->tkl", weight, basis, basis)
+                eye = torch.eye(stop - start, device=mask.device, dtype=torch.float32)
+                weighted_basis = basis.unsqueeze(0) * weight.unsqueeze(1)
+                operator[:, start:stop, :, channel] = torch.linalg.solve(
+                    gram + self.ridge * eye, weighted_basis
+                )
+        return operator
+
+    def _apply_projection(self, values: torch.Tensor, operator: torch.Tensor) -> torch.Tensor:
+        expected = (values.shape[1], self.factor_count, 91, 3)
+        if tuple(operator.shape) != expected:
+            raise ValueError(
+                f"projection operator shape {tuple(operator.shape)} != {expected}"
+            )
+        with torch.autocast(device_type=values.device.type, enabled=False):
+            return torch.einsum("btnr,tknr->btk", values.float(), operator.float())
+
     def common(self, factors: torch.Tensor) -> torch.Tensor:
         return torch.einsum("btk,knr->btnr", factors, self.basis)
 
@@ -184,11 +222,15 @@ class FixedPCAFactorTransform(nn.Module):
         local = self.project_local(local, mask)
         return factors, local
 
-    def project_factor(self, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def project_factor(self, values: torch.Tensor, mask: torch.Tensor,
+                       operator: torch.Tensor | None = None) -> torch.Tensor:
+        if operator is not None:
+            return self._apply_projection(values, operator)
         return self._solve(values * mask.to(values.dtype), mask)
 
-    def project_local(self, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        projected = values - self.common(self._solve(values, mask))
+    def project_local(self, values: torch.Tensor, mask: torch.Tensor,
+                      operator: torch.Tensor | None = None) -> torch.Tensor:
+        projected = values - self.common(self.project_factor(values, mask, operator))
         projected = projected * mask.to(values.dtype)
         projected[..., 2] = 0
         return projected

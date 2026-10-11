@@ -5,6 +5,7 @@ import copy
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -61,6 +62,59 @@ class Shandong91V3LowRankTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         loss.backward()
         self.assertTrue(torch.isfinite(values.grad).all())
+
+    def test_precomputed_projection_matches_direct_solve(self):
+        sample=self.dataset[0]
+        mask=sample["effective_mask"][None].expand(3,-1,-1,-1)
+        values=torch.randn(mask.shape,dtype=torch.float32)
+        transform=FixedPCAFactorTransform(self.factors)
+        operator=transform.prepare_projection(mask)
+        direct=transform.project_factor(values,mask)
+        fast=transform.project_factor(values,mask,operator)
+        self.assertTrue(torch.allclose(direct,fast,atol=2e-5,rtol=2e-5))
+        direct_local=transform.project_local(values,mask)
+        fast_local=transform.project_local(values,mask,operator)
+        self.assertTrue(torch.allclose(direct_local,fast_local,atol=2e-5,rtol=2e-5))
+
+    def test_sampling_solves_only_when_preparing_window_projection(self):
+        sample=self.dataset[0]; batch={k:v[None].expand(2,*v.shape) for k,v in sample.items()}
+        for key in ("actual","forecast","residual","time_mark","recent_error","node_state"):
+            batch[key]=batch[key].float()
+        model_config=copy.deepcopy(self.config["model"])
+        model_config.update(base_channels=8,channel_multipliers=[1,2,2],group_norm_groups=4,state_channels=[4,8,8],dropout=0.0)
+        model=Shandong91LowRankDiffusion(
+            Shandong91HeterogeneousRawBodyV3(model_config,self.dataset.node_features,self.dataset.adjacency_with_self.float()),
+            self.config["diffusion"],self.factors)
+        original=torch.linalg.solve
+        with mock.patch("torch.linalg.solve",wraps=original) as solve:
+            model.sample(batch,batch["effective_mask"],method="ddim",inference_steps=3,
+                         generator=torch.Generator().manual_seed(17))
+        self.assertEqual(solve.call_count,3)
+
+    def test_fast_sampler_matches_reference_per_step_solve(self):
+        sample=self.dataset[0]; batch={k:v[None] for k,v in sample.items()}
+        for key in ("actual","forecast","residual","time_mark","recent_error","node_state"):
+            batch[key]=batch[key].float()
+        model_config=copy.deepcopy(self.config["model"])
+        model_config.update(base_channels=8,channel_multipliers=[1,2,2],group_norm_groups=4,state_channels=[4,8,8],dropout=0.0)
+        model=Shandong91LowRankDiffusion(
+            Shandong91HeterogeneousRawBodyV3(model_config,self.dataset.node_features,self.dataset.adjacency_with_self.float()),
+            self.config["diffusion"],self.factors).eval()
+        initial_factor=torch.randn(1,168,7)
+        initial_local=torch.randn(1,168,91,3)
+        reference=model.sample(
+            batch,batch["effective_mask"],method="ddim",inference_steps=3,
+            initial_factor_noise=initial_factor,initial_local_noise=initial_local,
+            generator=torch.Generator().manual_seed(23),_precompute_projection=False)
+        fast=model.sample(
+            batch,batch["effective_mask"],method="ddim",inference_steps=3,
+            initial_factor_noise=initial_factor,initial_local_noise=initial_local,
+            generator=torch.Generator().manual_seed(23))
+        delta=(reference-fast).abs()
+        self.assertTrue(
+            torch.allclose(reference,fast,atol=3e-4,rtol=3e-5),
+            f"max_abs={float(delta.max())}, mean_abs={float(delta.mean())}",
+        )
 
     def test_disk_backed_generation_array_reopens_without_overwrite(self):
         with tempfile.TemporaryDirectory() as directory:

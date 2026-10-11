@@ -82,7 +82,8 @@ def main():
     shape = (windows, args.n_samples, 168, 91, 3)
     static_shape = (windows,168,91,3)
     contract = {
-        "version":"shandong91_v3_window_resume_v1","model_identifier":MODEL_ID,
+        "version":"shandong91_v3_window_resume_v2","model_identifier":MODEL_ID,
+        "projection_backend":"precomputed_masked_least_squares_v1",
         "checkpoint_epoch":int(saved["epoch"]),"checkpoint_state":args.checkpoint_state,
         "factor_document_sha256":saved["factor_document"]["sha256"],
         "split":args.split,"windows":windows,"n_samples":args.n_samples,"seed":args.seed,
@@ -148,6 +149,7 @@ def main():
         "residual_sign":"generated_actual = forecast + generated_residual",
         "factor_document_sha256":saved["factor_document"]["sha256"],
         "load_local_branch":"disabled_strict_rank1","data_contract":data_contract_record(config["data"]),
+        "projection_backend":"precomputed_masked_least_squares_v1",
         "physical_clipping":False,"bounded_engineering_generation":args.max_windows is not None,
         "git_commit":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),
         "resumable_generation":True,"completed_windows":windows,
