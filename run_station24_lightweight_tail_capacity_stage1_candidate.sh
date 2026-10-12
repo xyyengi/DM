@@ -8,16 +8,15 @@ TAG=${1:?'usage: stage1_candidate.sh TAG SEARCH_ROOT'};ROOT=${2:?'missing SEARCH
 OUT="$ROOT/$TAG";CONFIG="configs/station24_lightweight_tail_capacity_search/$TAG.yaml";mkdir -p "$OUT" "$OUT/training"
 RAW_RUN=outputs_shandong/station24/body_tail_moe_20260824_191036/training/20260824_191044_station24_body_tail_moe_20260824_191036_seed2027
 RAW_CKPT="$RAW_RUN/checkpoints/model_best.pt";GRAPH="$RAW_RUN/graphs/secondary_adjacency.npy"
-RAW500=outputs_shandong/station24/body_tail_moe_raw_inference_20260824_224151/validation_results/geo_history_actual_body_tail_moe_raw_val_n500_seed424242
 ORIGINAL=outputs_shandong/station24/lightweight_joint_tail_v2_fair_20260923_194256/mixture_body400_tail100_n500
-RAW150="$ROOT/raw_prefix_n150_seed424242";STATUS="$OUT/status.env";LOG="$OUT/stage1.log";PHASE=init
+RAW500=$(cat "$ROOT/raw500_path.txt");RAW150="$ROOT/raw_prefix_n150_seed424242";STATUS="$OUT/status.env";LOG="$OUT/stage1.log";PHASE=init
 exec > >(tee -a "$LOG") 2>&1
 status(){ printf 'state=%s\nphase=%s\ntag=%s\nupdated_at=%s\n' "$1" "$PHASE" "$TAG" "$(date --iso-8601=seconds)" > "$STATUS"; }
 fail(){ c=$?;status failed;echo "STAGE1_FAILED tag=$TAG phase=$PHASE code=$c";exit "$c";};trap fail ERR;status running
-for f in "$CONFIG" "$RAW_CKPT" "$GRAPH" "$RAW500/metrics.json" "$RAW150/metrics.json" "$ORIGINAL/metrics.json";do test -f "$f";done
+for f in "$CONFIG" "$RAW_CKPT" "$GRAPH" "$RAW500/metrics.json" "$RAW150/metrics.json";do test -f "$f";done
 if pgrep -af 'train_shandong91|generate_shandong91|run_shandong91'|grep -v grep;then echo 'Station-91 task detected; no Station-24 launch';false;fi
 PHASE=cuda_amp_gate;status running
-if [[ ! -f "$OUT/preflight_cuda/preflight.json" ]];then python -m tools.audit_station24_lightweight_joint_tail --config "$CONFIG" --checkpoint "$RAW_CKPT" --secondary-adjacency "$GRAPH" --data-path diffusion_input_station --device cuda --formal-gate --output "$OUT/preflight_cuda";fi
+if [[ ! -f "$OUT/preflight_cuda/preflight.json" ]];then python -m tools.audit_station24_lightweight_joint_tail --config "$CONFIG" --checkpoint "$RAW_CKPT" --secondary-adjacency "$GRAPH" --data-path diffusion_input_station --body-results "$RAW500" --device cuda --formal-gate --output "$OUT/preflight_cuda";fi
 python -c 'import json,sys;assert json.load(open(sys.argv[1]))["launch_eligible"]' "$OUT/preflight_cuda/preflight.json"
 PHASE=train_to_1520;status running
 if [[ ! -f "$OUT/train_run.txt" ]];then
@@ -38,6 +37,8 @@ POST="$OUT/stage1_numeric_evaluation";mkdir -p "$POST";PHASE=numeric_evaluation;
 if [[ ! -f "$POST/comparisons/comparison_report.md" ]];then python tools/compare_station24_multiscale_2a.py "$RAW150" "$MIX" --output-dir "$POST/comparisons" --baseline-variant "$BASE_VARIANT" --candidate-variant "$CAND_VARIANT" --baseline-parallel-levels encoder_0 --candidate-parallel-levels encoder_0 --baseline-label 'Raw prefix n150' --candidate-label "$TAG" --candidate-spatial-levels bottleneck --title "Stage1 Raw150 vs $TAG";fi
 if [[ ! -f "$POST/events/report.md" ]];then python tools/evaluate_station24_jstd_events.py --baseline "$RAW150" --candidate "$MIX" --candidate-run "$RUN" --data-path diffusion_input_station --output-dir "$POST/events" --baseline-label 'Raw prefix n150' --candidate-label "$TAG";fi
 if [[ ! -f "$POST/joint/ordinary_comparison.csv" ]];then python tools/evaluate_station24_diffusion_ts.py --baseline "$RAW150" --candidate "$MIX" --data diffusion_input_station --output "$POST/joint" --candidate-label "$TAG";fi
-if [[ ! -f "$POST/recovery/drop_recovery_summary.csv" ]];then python -m tools.diagnose_station24_wind_direction_recovery --data-path diffusion_input_station --raw-result "$RAW150" --lightweight-result "$ORIGINAL" --ramp-selection-result "$MIX" --ramp-selection-run "$RUN" --output-dir "$POST/recovery" --candidate-label "$TAG";fi
+RECOVERY_REFERENCE="$ORIGINAL"
+if [[ ! -f "$RECOVERY_REFERENCE/actual_scenarios_normalized.npy" ]];then RECOVERY_REFERENCE="$RAW150";echo "ORIGINAL_LIGHTWEIGHT_ARRAYS_MISSING recovery_reference=Raw150";fi
+if [[ ! -f "$POST/recovery/drop_recovery_summary.csv" ]];then python -m tools.diagnose_station24_wind_direction_recovery --data-path diffusion_input_station --raw-result "$RAW150" --lightweight-result "$RECOVERY_REFERENCE" --ramp-selection-result "$MIX" --ramp-selection-run "$RUN" --output-dir "$POST/recovery" --candidate-label "$TAG";fi
 python -c 'import json,sys,pathlib;pathlib.Path(sys.argv[1]).write_text(json.dumps({"tag":sys.argv[2],"run":sys.argv[3],"pause":sys.argv[4],"tail30":sys.argv[5],"mixture150":sys.argv[6],"evaluation":sys.argv[7]},indent=2),encoding="utf-8")' "$OUT/stage1_artifacts.json" "$TAG" "$RUN" "$PAUSE" "$TAIL" "$MIX" "$POST"
 PHASE=complete;status complete;echo "STAGE1_CANDIDATE_COMPLETE tag=$TAG output=$OUT"
