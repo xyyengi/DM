@@ -51,7 +51,7 @@ if [[ ! -f "$POST/comparisons/comparison_report.md" ]];then python tools/compare
 preserve_incomplete "$POST/events" report.md
 if [[ ! -f "$POST/events/report.md" ]];then python tools/evaluate_station24_jstd_events.py --baseline "$RAW150" --candidate "$MIX" --candidate-run "$RUN" --data-path diffusion_input_station --output-dir "$POST/events" --baseline-label 'Raw prefix n150' --candidate-label "$TAG";fi
 preserve_incomplete "$POST/joint" ordinary_comparison.csv
-if [[ ! -f "$POST/joint/ordinary_comparison.csv" ]];then python tools/evaluate_station24_diffusion_ts.py --baseline "$RAW150" --candidate "$MIX" --data diffusion_input_station --output "$POST/joint" --candidate-label "$TAG";fi
+if [[ ! -f "$POST/joint/ordinary_comparison.csv" ]];then python tools/evaluate_station24_diffusion_ts.py --baseline "$RAW150" --candidate "$MIX" --data diffusion_input_station --output "$POST/joint" --candidate-label "$TAG" --exploratory-member-count 150;fi
 RECOVERY_REFERENCE="$ORIGINAL"
 if [[ ! -f "$RECOVERY_REFERENCE/actual_scenarios_normalized.npy" ]];then RECOVERY_REFERENCE="$RAW150";echo "ORIGINAL_LIGHTWEIGHT_ARRAYS_MISSING recovery_reference=Raw150";fi
 preserve_incomplete "$POST/recovery" drop_recovery_summary.csv
