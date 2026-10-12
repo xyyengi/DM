@@ -49,6 +49,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-label", default="Lightweight ramp selection")
     parser.add_argument("--gradient-batches", type=int, default=3)
     parser.add_argument("--gradient-batch-size", type=int, default=2)
+    parser.add_argument(
+        "--expected-trainable-parameters", type=int, default=20588,
+        help=("Fail closed unless the loaded checkpoint has this many trainable parameters; "
+              "the historical diagnostic default remains the 20,588-parameter Tail"),
+    )
     parser.add_argument("--seed", type=int, default=2027)
     parser.add_argument("--event-context-hours", type=int, default=6)
     parser.add_argument("--allow-cpu", action="store_true")
@@ -198,11 +203,16 @@ def direction_gradient_rows(
     batches: int,
     batch_size: int,
     seed: int,
+    expected_trainable_parameters: int,
 ) -> list[dict[str, object]]:
     loader = gradient_loader(data_path, run, config, checkpoint, batch_size, seed)
     parameters = [p for p in model.parameters() if p.requires_grad]
-    if sum(p.numel() for p in parameters) != 20588:
-        raise ValueError("direction audit requires the 20,588-parameter Lightweight Tail")
+    actual_trainable_parameters = sum(p.numel() for p in parameters)
+    if actual_trainable_parameters != expected_trainable_parameters:
+        raise ValueError(
+            "direction audit trainable-parameter mismatch: "
+            f"expected {expected_trainable_parameters:,}, got {actual_trainable_parameters:,}"
+        )
     diffusion = model.diffusion
     wind_mask = diffusion.denoiser.wind_station_mask.to(device)
     lag_weights = dict(zip(diffusion.ramp_auxiliary_lags, diffusion.ramp_auxiliary_lag_weights))
@@ -485,6 +495,7 @@ def main() -> None:
     gradient_rows = direction_gradient_rows(
         model, run, data_path, config, checkpoint, device,
         args.gradient_batches, args.gradient_batch_size, args.seed,
+        args.expected_trainable_parameters,
     )
     after = state_digest(model)
     if before != after:
@@ -518,6 +529,7 @@ def main() -> None:
         "status": "PASS", "device": str(device), "formal_training": "NOT RUN",
         "optimizer_steps": 0, "checkpoint_writes": 0, "new_generation": "NOT RUN",
         "trainable_parameters": int(sum(p.numel() for p in model.parameters() if p.requires_grad)),
+        "expected_trainable_parameters": args.expected_trainable_parameters,
         "state_hash_before_after_equal": True, "gradient_batches": args.gradient_batches,
         "gradient_batch_size": args.gradient_batch_size, "matched_timestep_noise": True,
         "event_context": context_audit, "strong_negative_definition": (

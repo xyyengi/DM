@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 import torch
 from src.models.station_joint_multiresidual_tail import JointMultiresolutionResidualTail
 
@@ -33,5 +34,9 @@ class TailCapacitySearchTests(unittest.TestCase):
             low,high=m.haar.split(forecast);torch.testing.assert_close(low+high,forecast,rtol=0,atol=1e-6)
     def test_invalid_grouping(self):
         with self.assertRaises(ValueError): JointMultiresolutionResidualTail(32,*self.assets(),channels=18,groups=8)
+    def test_stage1_direction_audit_uses_manifest_parameter_count(self):
+        script=Path('run_station24_lightweight_tail_capacity_stage1_candidate.sh').read_text(encoding='utf-8')
+        self.assertIn('station24_tail_capacity_search_manifest.csv',script)
+        self.assertIn('--expected-trainable-parameters "$TAIL_PARAMETERS"',script)
 
 if __name__=='__main__':unittest.main()
