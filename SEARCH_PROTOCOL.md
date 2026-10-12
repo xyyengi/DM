@@ -1,119 +1,142 @@
-# Station-24 Lightweight Tail Structure/Capacity Search Protocol
+# Station-24 Lightweight Tail Staged Structure/Capacity Search Protocol
 
-**FROZEN BEFORE CANDIDATE TRAINING — 2026-10-12**
+**FROZEN BEFORE CANDIDATE TRAINING — revised 2026-10-12**
 
-This protocol is frozen before any new candidate result is inspected. It is a
-bounded empirical search, not a claim of global optimality. Test remains locked.
+This staged protocol supersedes the earlier plan to fully train all 24
+combinations. No candidate had been trained when this revision was frozen. The
+24 configs remain reproducible artifacts; they are not 24 discovered good
+models and are no longer the default execution list. This bounded search does
+not establish a global optimum. Test remains locked throughout selection.
 
-## Verified reference
+## What exists and what it proves
 
-The reference is Original Lightweight / Joint Multiresolution Residual Tail
-(`station24_lightweight_joint_tail_v2_fair_168h`). Raw is frozen and kept in
-evaluation mode. The additive Tail has exactly 20,588 trainable parameters at
-`channels=24`, `fusion_layers=2`, `haar_levels=3`. Those are newly instantiated
-Tail parameters, not parameters selected from Raw. The reference fusion stack is:
+The 24 configs are `4 widths × 3 fusion depths × 2 Haar levels`. Implementation,
+exact parameter counting, CPU shape/route/Haar and functional-branch update
+tests, and restartable launch wiring are complete. These establish structural
+consistency and executable CPU code. They do not establish CUDA/AMP safety,
+real-task learning, probability quality, extreme-event skill, recovery skill,
+or superiority of any candidate.
 
-1. `Conv1d(2C,C,k=5,d=1,p=2) + GroupNorm(8) + SiLU`;
-2. Fast: `Conv1d(C,C,k=3,d=2,p=2) + SiLU`; Slow: the same with `d=4,p=4`.
+The reference Original Lightweight / Joint Multiresolution Residual Tail is
+`channels=24`, `fusion_layers=2`, `haar_levels=3`, with exactly 20,588 newly
+added trainable Tail parameters. They were not selected from Raw. Raw stays
+frozen/eval. Depth 2 is historical; depth 1 removes only its second dilated
+convolution; depth 3 appends a fixed `k=3` layer (Fast `d=4`, Slow `d=8`). No
+internal residual skip is added and GroupNorm remains 8.
 
-There are no residual skip connections inside this stack.
+### Parameter-count objects must not be mixed
 
-## Frozen search space
+`779,248` is the frozen parameter inventory instantiated by the Lightweight/Raw
+body-tail configuration. It includes inherited legacy body-tail expert modules
+because `use_body_tail_experts=true`; those remain frozen during JMRT training.
+`772,290` is the entire trainable model instantiated by Full Independent Tail
+V1/V2 with `use_body_tail_experts=false` and
+`independent_joint_tail_training=true`. Their 6,958 difference is a module-
+inventory/configuration difference, not an error bar and not Tail compression.
+Report efficiency using the newly trainable Lightweight Tail count; never mix
+these two whole-model objects in a compression ratio.
 
-- Tail channels: `16, 24, 32, 48`.
-- Fast/Slow fusion convolution count: `1, 2, 3`.
-- Haar levels: `2, 3` (4 h and 8 h block projections).
-- Total: 24 candidates, including the reference `24/2/3`.
+## Frozen common recipe
 
-Only Fast/Slow fusion depth changes. Hidden projection, condition encoders,
-system branch, output heads, graph/state encoders, and all conditions remain
-unchanged. Depth 1 uses only item 1 above. Depth 2 is byte/key compatible with
-the historical reference. Depth 3 appends one `C->C, k=3` convolution: Fast
-uses `d=4,p=4`; Slow uses `d=8,p=8`; it is followed by SiLU. No depth has an
-internal residual skip. GroupNorm remains exactly 8 groups and all channel
-choices are divisible by 8.
+All stages use the same Raw checkpoint, train/validation split, normalization,
+valid masks, 60% event-balanced sampling, all-valid epsilon objective,
+ramp/shape/slow weights `0.18/0.14/0.10`, optimizer, LR, batch/accumulation,
+diffusion schedule, conditions and event definition. Auxiliary timestep
+compensation is OFF. Loss weights, sampling ratio and architecture outside the
+JMRT search variables are not searched. Test is unused until one final recipe,
+member ratio and evaluation protocol are frozen, and cannot reopen selection.
 
-If and only if the first-round non-dominated evidence clearly points to the
-48-channel boundary, at most two 64-channel candidates may be added, using the
-best boundary depth/Haar settings. No other boundary expansion is permitted.
+## Stage 0: mandatory gates
 
-## Fixed training and generation conditions
+Before paid work: `c24_d2_h3=20,588`; shape/mask/graph and Haar checks; Tail-off
+equals Raw; every functional Tail branch updates; optimizer contains Tail only;
+Raw parameters/buffers unchanged; no future actual/residual generation input;
+checkpoint save/reload; target-server CUDA/AMP forward/backward. The server also
+verifies complete Raw member arrays, checkpoint, validation windows, generation
+seed and member ordering. Any mandatory failure stops training. `NOT RUN` is not
+`PASS`; no Station-91 process may be interrupted or competed with.
 
-The following must match the formal reference config and artifacts: Raw
-checkpoint; train/validation split; normalization and valid masks; 60% event-
-balanced sampling; all-valid epsilon objective; auxiliary ramp/shape/slow
-weights `0.18/0.14/0.10`; all other loss switches; optimizer, LR, batch,
-gradient accumulation, 240-epoch cap, validation interval, patience and
-checkpoint selection; diffusion schedule; condition inputs; event definition;
-generation seed and evaluation code. Auxiliary timestep compensation is OFF.
-Each formal comparison is `400 Raw + 100 Tail`. Loss weights, sampling ratio,
-Tail ratio and member count are not search dimensions.
+## Stage 1: six-candidate one-third-budget screen
 
-Validation alone is used for search. Test may run once only after one final
-recipe, all hyperparameters, member ratio and evaluation protocol are frozen;
-test cannot trigger another search.
+Default candidates are:
 
-## Evidence gates
+- `c16_d2_h3` — smaller capacity;
+- `c24_d2_h3` — matched reference;
+- `c32_d2_h3` — moderate width;
+- `c48_d2_h3` — larger width;
+- `c24_d3_h3` — depth-only contrast;
+- `c24_d2_h2` — Haar-only contrast.
 
-Before paid training: exact `24/2/3 = 20,588` reproduction; shape/mask/graph
-checks; exact slow+fast Haar reconstruction; disabled Tail equals Raw; every
-trainable branch receives gradients and updates; optimizer contains Tail only;
-Raw parameters and buffers are unchanged; no future actual/residual is a
-generation condition; CPU forward/backward/reload; target-server CUDA/AMP
-forward/backward/reload. Any mandatory failure stops training. NOT RUN is not
-PASS.
+The currently loaded formal Station-24 train split has 290 windows, batch 8 and
+accumulation 2: `ceil(290/8)=37` batches and 19 optimizer updates/epoch (the
+final partial accumulation is stepped). The full 240-epoch cap is 4,560 updates; screening
+pauses after 1,520 updates, exactly 80 completed epochs. This is a pause, not a
+compressed schedule. The project has no LR scheduler (constant AdamW LR), so
+scheduler state is explicitly `none`; it must not be invented. Screening does
+not early-stop before the registered pause. The pause checkpoint contains model,
+optimizer, AMP scaler, EMA, update count, best validation state, history,
+Python/NumPy/Torch/CUDA RNG and train-sampler generator state. Resume continues
+toward the original cap and reinstates the original validation/patience rule.
 
-Each candidate receives the complete common budget and early-stop rule, then
-generation, 400+100 merge, complete evaluation, plots, summary and archive.
-Candidates are never removed using early training loss. Interrupted stages are
-resumed idempotently without overwriting prior outputs.
+The Stage-1 reference is the matched `c24_d2_h3` 1,520-update checkpoint. The
+historical fully trained reference is context only, not its replacement.
 
-## Measurements
+### Lightweight validation evaluation
 
-Body: wind/solar/renewable CRPS, Energy Score, 90% coverage error together with
-interval width and interval score, overall spatial and wind-solar correlation
-RMSE. Persistent events: any-hit, member-hit, onset, duration and depth using
-the existing frozen event standard. Local dynamics: wind 1/3/6 h ramp
-distribution/std and existing strong-drop anchored 3/6 h half-recovery,
-recovery time and amplitude. Also record exact Raw/Tail/total parameters,
-wall-clock train/generation/evaluation time, peak CUDA memory and hardware.
+Reuse the same verified Raw pool and fixed 120-member prefix. Generate 30 Tail
+members with seed 424242 and merge `120 Raw + 30 Tail` (20%). Use every existing
+validation window and identical Raw member ordering. The exploratory 30-Tail
+hit rate is not directly comparable to formal 100-Tail hits, and absence of one
+rare hit cannot alone eliminate a candidate.
 
-## Pre-registered screening and selection
+Retain numeric evaluation only: wind/solar/renewable CRPS; 90% coverage error,
+width and interval score jointly; persistent-event depth/onset/duration plus
+descriptive hits; wind 1/3/6 h ramps; frozen-anchor strong-drop 3/6 h half-
+recovery probability, time and amplitude. No bulk plots or archive in Stage 1.
+Training loss alone is never a selection criterion.
 
-No arbitrary weighted total score is permitted. First apply the already frozen
-engineering Body guardrails: relative to Raw, renewable CRPS <=2% degradation,
-Energy Score <=1%, wind CRPS <=2%, solar-daylight CRPS <=2%, and overall
-spatial/wind-solar correlation RMSE <=5%. These are finite-search engineering
-screens, not universal or theoretical thresholds. Calibration improvement must
-not be explained solely by wider intervals: coverage error to 0.90, width and
-interval score are reported jointly and paired where available.
+## Pre-registered promotion rule
 
-Among candidates passing integrity and Body screens, retain the Pareto frontier
-over ordinary quality, persistent-event behavior, ramp/recovery behavior and
-Tail parameter count. An extreme-family improvement cannot be declared from a
-single event, solar case, sign or lag; event-wise, sign/lag-stratified and paired
-bootstrap evidence is reported. If matched baseline-repeat variation is
-insufficient, the result is explicitly descriptive and is resolved only by the
-pre-registered repeat stage, not by changing thresholds.
+Apply integrity checks, then the registered finite-search Body guardrails:
+relative to Raw, renewable CRPS <=2% degradation, Energy Score <=1%, wind CRPS
+<=2%, solar-daylight CRPS <=2%, and overall spatial/wind-solar correlation RMSE
+<=5%. These are engineering screens, not universal statistical thresholds.
+Coverage error, width and interval score are read jointly.
 
-Choose at most three representatives: overall compromise, recovery-oriented,
-and parameter-efficient (one candidate may fill multiple roles). If performance
-is practically indistinguishable, choose fewer parameters, then the recipe
-closest to the reference. The reference always remains a candidate.
+No arbitrary weighted score is allowed. Retain the descriptive Pareto set over
+ordinary quality, persistent events, ramp/recovery and Tail parameters. One
+event, sign or lag cannot decide promotion. Select at most two promising non-
+baseline candidates plus `c24_d2_h3` for full budget. If ranks are close,
+families disagree, or learning is still materially improving at update 1,520,
+extend at most three non-baseline candidates to 3,040 updates (160 epochs) before
+deciding. Do not force elimination. If indistinguishable, prefer fewer
+parameters, then the recipe closest to reference.
 
-## Repeat and stopping rules
+## Stage 2: full budget and formal evaluation
 
-Each selected representative and the reference use training seeds `2027` plus
-two fixed additional seeds `3407` and `7919`. Each uses the same paired
-generation seeds `424242`, `271828`, and `314159`. Training-seed and generation-
-seed variability are reported separately. Existing runs are reused only when
-their full manifest hashes match this protocol.
+Resume promoted checkpoints; do not retrain. Continue toward 240 epochs with
+the original validation interval, patience and checkpoint selection semantics.
+A historical reference is reusable only if config, budget, initialization and
+evaluation hashes match; otherwise complete the matched reference.
 
-Stop after the 24 candidates, optional maximum two 64-channel candidates, and
-the registered repeats. Do not proceed to loss, sampling, member-ratio or new-
-module searches. If larger models lack stable gain, costs rise materially, or
-models are indistinguishable, select the compact candidate. Keeping the
-reference is a valid outcome. Full Independent V2 differs in adaptation method
-as well as capacity, so its gap cannot be attributed solely to parameter count.
-The small number of independent validation extremes limits generalization
-claims.
+Formal evaluation restores `400 Raw + 100 Tail`, the frozen seed and complete
+chain: ordinary/calibration metrics, persistent events, joint/spatial structure,
+ramps, drop-recovery, necessary plots, summary and archive.
+
+## Targeted additions, repeats and stop
+
+Never return automatically to 24 full runs and never start a loss-weight search.
+Only if evidence clearly points to the width boundary, or separately supports
+width and depth, may at most two targeted configs be added after writing their
+rationale. Select one candidate and the reference for final stability. Each
+totals training seeds `2027`, `3407`, `7919` with paired generation seeds
+`424242`, `271828`, `314159`; report the two sources of variation separately.
+
+If no stable advantage exists, retain the reference and stop. Full V2 differs
+in adaptation mechanism as well as capacity. Limited independent validation
+extremes bound generalization claims.
+
+After every candidate and stage, report what should continue, why, remaining
+uncertainty and the next question. Final delivery contains a summary CSV, only
+necessary plots and `FINAL_SELECTION.md`, answering capacity limitation,
+depth/Haar effects, replacement evidence and the stopping basis.

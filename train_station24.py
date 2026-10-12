@@ -6,6 +6,7 @@ import argparse
 import copy
 import json
 import random
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -61,6 +62,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Initialize a parameter-isolated expert from an existing checkpoint",
     )
+    parser.add_argument("--resume-checkpoint", default=None,
+                        help="Resume an interrupted run with optimizer/AMP/EMA/RNG state")
+    parser.add_argument("--max-optimizer-updates", type=int, default=None,
+                        help="Pause at an epoch boundary after at least this many updates")
+    parser.add_argument("--disable-early-stop", action="store_true",
+                        help="Use only for a registered staged-search pause")
     parser.add_argument("--allow-cpu", action="store_true")
     return parser.parse_args()
 
@@ -562,6 +569,7 @@ def save_checkpoint(
     event_replay: Mapping[str, object] | None,
     graph_manifest: Mapping[str, object],
     ema_metadata: Mapping[str, object] | None = None,
+    training_state: Mapping[str, object] | None = None,
 ) -> None:
     payload = {
         "architecture": model.architecture,
@@ -739,6 +747,7 @@ def save_checkpoint(
             else None
         ),
         "graph_manifest": copy.deepcopy(dict(graph_manifest)),
+        "training_state": copy.deepcopy(dict(training_state)) if training_state else None,
     }
     torch.save(payload, path)
 
@@ -1722,8 +1731,74 @@ def main() -> None:
     best_epoch = 0
     optimizer_updates = 0
     current_ema_decay = ema_decay_for_step(ema_decay, 0, ema_warmup)
+    start_epoch = 1
+    patience_floor_epoch = 0
+
+    def resumable_state() -> dict[str, object]:
+        sampler_generator = getattr(getattr(train_loader, "sampler", None), "generator", None)
+        return {
+            "format": "station24_epoch_boundary_v1",
+            "optimizer_updates": int(optimizer_updates),
+            "best_val": float(best_val),
+            "best_epoch": int(best_epoch),
+            "history": copy.deepcopy(history),
+            "scaler_state_dict": scaler.state_dict(),
+            "scheduler": "none",
+            "scheduler_state_dict": None,
+            "python_random_state": random.getstate(),
+            "numpy_random_state": np.random.get_state(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "train_sampler_generator_state": (
+                sampler_generator.get_state() if sampler_generator is not None else None
+            ),
+            "train_loader_generator_state": (
+                train_loader.generator.get_state()
+                if getattr(train_loader, "generator", None) is not None else None
+            ),
+        }
+
+    if args.resume_checkpoint is not None:
+        resume_path = Path(args.resume_checkpoint)
+        resume = torch.load(resume_path, map_location="cpu", weights_only=False)
+        state = resume.get("training_state")
+        if not isinstance(state, Mapping) or state.get("format") != "station24_epoch_boundary_v1":
+            raise ValueError("resume checkpoint lacks complete epoch-boundary training state")
+        if resume.get("config", {}).get("model") != config.get("model") or resume.get("config", {}).get("train") != config.get("train"):
+            raise ValueError("resume checkpoint model/train config differs from requested run")
+        model.load_state_dict(resume["model_state_dict"], strict=True)
+        optimizer.load_state_dict(resume["optimizer_state_dict"])
+        scaler.load_state_dict(state["scaler_state_dict"])
+        ema_state = {name: value.to(device) for name, value in resume["ema_model_state_dict"].items()}
+        optimizer_updates = int(state["optimizer_updates"])
+        best_val = float(state["best_val"]); best_epoch = int(state["best_epoch"])
+        history = copy.deepcopy(list(state["history"]))
+        start_epoch = int(resume["epoch"]) + 1
+        patience_floor_epoch = int(resume["epoch"])
+        random.setstate(state["python_random_state"])
+        np.random.set_state(state["numpy_random_state"])
+        torch.set_rng_state(state["torch_rng_state"])
+        if torch.cuda.is_available() and state["cuda_rng_state_all"] is not None:
+            torch.cuda.set_rng_state_all(state["cuda_rng_state_all"])
+        sampler_generator = getattr(getattr(train_loader, "sampler", None), "generator", None)
+        if sampler_generator is not None and state["train_sampler_generator_state"] is not None:
+            sampler_generator.set_state(state["train_sampler_generator_state"])
+        # In the historical loader the sampler and worker seeding share one
+        # Generator. Persistent workers do not consume a new base seed between
+        # uninterrupted epochs, whereas a resumed DataLoader must create new
+        # workers. Decouple only the resumed loader's worker generator so that
+        # creating workers cannot advance the restored sampler stream.
+        if state.get("train_loader_generator_state") is not None:
+            resumed_loader_generator = torch.Generator()
+            resumed_loader_generator.set_state(state["train_loader_generator_state"])
+            train_loader.generator = resumed_loader_generator
+        print(f"RESUME checkpoint={resume_path} epoch={start_epoch} optimizer_updates={optimizer_updates}")
+        prior_best = resume_path.parent / "model_best.pt"
+        if not prior_best.is_file():
+            raise ValueError("resume checkpoint directory lacks the prior model_best.pt")
+        shutil.copy2(prior_best, checkpoint_dir / "model_best.pt")
     optimizer.zero_grad(set_to_none=True)
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         train_started = time.perf_counter()
@@ -1958,6 +2033,7 @@ def main() -> None:
                         "optimizer_updates": optimizer_updates,
                         "current_decay": current_ema_decay,
                     },
+                    resumable_state(),
                 )
             print(
                 f"epoch={epoch:04d} train={train_loss:.7f} val={val_loss:.7f} "
@@ -1969,7 +2045,8 @@ def main() -> None:
                 f" sampler_es={row.get('train_sampler_energy_score')}"
                 f" val_sampler_es={row.get('val_sampler_energy_score')}"
             )
-            if best_epoch and epoch - best_epoch >= patience:
+            if (not args.disable_early_stop and best_epoch
+                    and epoch - max(best_epoch, patience_floor_epoch) >= patience):
                 history.append(row)
                 print(f"EARLY_STOP best_epoch={best_epoch} best_val={best_val:.7f}")
                 break
@@ -2007,7 +2084,21 @@ def main() -> None:
                     "optimizer_updates": optimizer_updates,
                     "current_decay": current_ema_decay,
                 },
+                resumable_state(),
             )
+
+        if args.max_optimizer_updates is not None and optimizer_updates >= args.max_optimizer_updates:
+            pause_path = checkpoint_dir / f"model_pause_updates_{optimizer_updates}.pt"
+            save_checkpoint(
+                pause_path, model, ema_state, optimizer, config, residual_scale,
+                epoch, train_loss, row.get("val_loss", float("nan")), parameter_count,
+                state_thresholds, event_weighting, event_replay, graph_manifest,
+                {"max_decay": ema_decay, "warmup": copy.deepcopy(dict(ema_warmup)) if ema_warmup else None,
+                 "optimizer_updates": optimizer_updates, "current_decay": current_ema_decay},
+                resumable_state(),
+            )
+            print(f"TRAINING_PAUSED epoch={epoch} optimizer_updates={optimizer_updates} checkpoint={pause_path}")
+            break
 
     if not (checkpoint_dir / "model_best.pt").is_file():
         raise RuntimeError("training ended without a best checkpoint")

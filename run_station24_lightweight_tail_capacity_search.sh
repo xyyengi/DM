@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Sequential, restart-safe 24-candidate orchestrator. It never launches 64ch automatically.
 set -Eeuo pipefail
+if [[ "${ALLOW_FULL24_SEARCH:-0}" != "1" ]];then
+  echo 'Full 24-candidate execution is disabled by the revised staged protocol.' >&2
+  echo 'Use launch_station24_lightweight_tail_capacity_search.sh for the six-candidate screen.' >&2
+  exit 2
+fi
 cd /root/autodl-tmp/DM
 JOB=${1:-$(date +%Y%m%d_%H%M%S)}
 ROOT="outputs_shandong/station24/lightweight_tail_capacity_search_${JOB}"
