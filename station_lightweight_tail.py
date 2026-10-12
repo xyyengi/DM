@@ -4,6 +4,7 @@ from pathlib import Path
 import yaml
 
 VERSION = "v2_fair_v1"
+CAPACITY_SEARCH_VERSION = "v2_capacity_search_v1"
 RAMP_SELECTION_VERSION = "source_direction_daylight_pooled_v1"
 AUX_TIMESTEP_COMPENSATION_VERSION = "clipped_sqrt_snr_mean1_v1"
 FROZEN_AUXILIARY_ALPHAS = {
@@ -98,11 +99,28 @@ def validate_model_version(config):
     version = config.get("joint_multiresidual_training_version", "legacy_v1")
     if version == "legacy_v1":
         return False
-    if version != VERSION:
+    if version not in (VERSION, CAPACITY_SEARCH_VERSION):
         raise ValueError(f"unknown joint multiresidual training version: {version}")
-    for key, expected in ADDITIONS.items():
+    additions = dict(ADDITIONS)
+    if version == CAPACITY_SEARCH_VERSION:
+        additions.pop("joint_multiresidual_training_version")
+    for key, expected in additions.items():
+        if version == CAPACITY_SEARCH_VERSION and key in (
+            "joint_multiresidual_channels", "joint_multiresidual_haar_levels"
+        ):
+            continue
         if config.get(key) != expected:
             raise ValueError(f"lightweight V2 requires {key}={expected!r}")
+    if version == CAPACITY_SEARCH_VERSION:
+        channels = int(config.get("joint_multiresidual_channels", 0))
+        layers = int(config.get("joint_multiresidual_fusion_layers", 0))
+        levels = int(config.get("joint_multiresidual_haar_levels", 0))
+        if channels not in (16, 24, 32, 48, 64):
+            raise ValueError("capacity search Tail channels outside frozen space")
+        if layers not in (1, 2, 3) or levels not in (2, 3):
+            raise ValueError("capacity search structure outside frozen space")
+        if config.get("auxiliary_timestep_compensation", False):
+            raise ValueError("capacity search forbids timestep compensation")
     alpha = float(config.get("auxiliary_strength_alpha", 1.0))
     if alpha not in FROZEN_AUXILIARY_ALPHAS:
         raise ValueError(f"alpha is outside the frozen Stage 1A set: {alpha}")
@@ -125,6 +143,7 @@ def validate_model_version(config):
 
 
 def validate_config(config, resolved=False):
+    search = config["model"].get("joint_multiresidual_training_version") == CAPACITY_SEARCH_VERSION
     ramp_selection = (
         config["model"].get(
             "event_balanced_ramp_selection_version", "legacy_abs_topk_v1"
@@ -146,6 +165,22 @@ def validate_config(config, resolved=False):
         auxiliary_alpha=auxiliary_alpha,
         auxiliary_timestep_compensation=auxiliary_timestep_compensation,
     )
+    if search:
+        channels = int(config["model"]["joint_multiresidual_channels"])
+        layers = int(config["model"]["joint_multiresidual_fusion_layers"])
+        levels = int(config["model"]["joint_multiresidual_haar_levels"])
+        tag = f"c{channels}_d{layers}_h{levels}"
+        expected["experiment"].update(
+            name=f"station24_lightweight_tail_capacity_{tag}_168h",
+            variant=f"geo_history_actual_lightweight_tail_capacity_{tag}",
+            description="Frozen Station-24 Lightweight Tail structure/capacity search candidate",
+        )
+        expected["model"].update(
+            joint_multiresidual_training_version=CAPACITY_SEARCH_VERSION,
+            joint_multiresidual_channels=channels,
+            joint_multiresidual_fusion_layers=layers,
+            joint_multiresidual_haar_levels=levels,
+        )
     actual = deepcopy(config)
     if resolved:
         if Path(actual["data"]["data_path"]).resolve() != Path(expected["data"]["data_path"]).resolve():

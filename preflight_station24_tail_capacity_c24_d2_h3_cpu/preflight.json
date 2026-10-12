@@ -1,0 +1,45 @@
+{
+  "checks": {
+    "V2_recipe_and_version": {
+      "status": "PASS",
+      "evidence": null
+    },
+    "same_V2_body400_actual_scenarios_normalized.npy": {
+      "status": "PASS",
+      "evidence": null
+    },
+    "same_V2_body400_actual_scenarios_raw_normalized.npy": {
+      "status": "PASS",
+      "evidence": null
+    },
+    "same_V2_body400_generated_residual_normalized.npy": {
+      "status": "PASS",
+      "evidence": null
+    },
+    "same_V2_body400_generated_residual_standardized.npy": {
+      "status": "PASS",
+      "evidence": null
+    }
+  },
+  "launch_eligible": false,
+  "formal_training_started": false,
+  "device": "cpu",
+  "torch": "2.14.0+cpu",
+  "formal_500_member_generation": "NOT RUN",
+  "config_sha256": "c99d8787a32397a98f9e0cd70e0ec9e4de0211c56f6510f4fa76d41dff41b9b0",
+  "config_used_sha256": "574c57e4961eb25e0d2b3a8cb7cbd7c79c768dd3993bf7733516fa07e2935e7f",
+  "wrapper": "run_station24_lightweight_tail_capacity_candidate.sh",
+  "wrapper_sha256": "4d710c86af8d4f2ff0fc9cf869f364732e592bcef1c8fef7ca50cd8da373258c",
+  "source_hashes": {
+    "station_lightweight_tail.py": "c58411f475021a5f1625bfdadd326feea19f5c698121f1d826b5680f6c562bbb",
+    "src/models/station_conditioned_diffusion.py": "219ac83ee11406309033217b9f9af356eb3f11507a37da9d6c76804da2777701",
+    "src/models/station_joint_multiresidual_tail.py": "ba296b4d3251c914f3b13bef284cd51392cf9e7c4aee17367dc096ea68ea2e4c",
+    "train_station24.py": "33fc2d30c87ee2451bce9ea2ee7f3ee7b125c43fd18dd82624f9ff9d5f2fb576",
+    "generate_station24.py": "5e76ec5d2a725889b27ed26c34fab16cf8172c1bff04c0aa6f4e4372bdbde8d3",
+    "tools/audit_station24_lightweight_joint_tail.py": "f59d596a00957c5881bb7dadd45d3c9946f87e367b183e93cfce533c53c401e0"
+  },
+  "checkpoint_sha256": "9a242d087dd7d31b48695db48c34e0354b0d2989e41aac1cf350c8ce76f98adb",
+  "secondary_graph_sha256": "cce05d63e97e9498d6ccbc7414fab416acf6fbccba465d433aea19b1c8aa71a8",
+  "preflight_execution": "FAIL",
+  "error": "FileNotFoundError(2, 'No such file or directory')"
+}

@@ -76,8 +76,14 @@ class JointMultiresolutionResidualTail(nn.Module):
     """
     def __init__(self,hidden_channels: int,station_features: torch.Tensor,
                  adjacency: torch.Tensor,station_capacities: torch.Tensor,
-                 channels: int=24,groups: int=8,haar_levels: int=3):
+                 channels: int=24,groups: int=8,haar_levels: int=3,
+                 fusion_layers: int=2):
         super().__init__();self.station_count=int(station_features.shape[0])
+        self.channels=int(channels);self.fusion_layers=int(fusion_layers)
+        if self.fusion_layers not in (1,2,3):
+            raise ValueError('fusion_layers must be 1, 2, or 3')
+        if channels % groups:
+            raise ValueError('Tail channels must be divisible by GroupNorm groups')
         self.haar=HaarMultiresolution(haar_levels)
         graph=adjacency.float();degree=graph.sum(-1).clamp(min=1e-8)
         graph=degree.rsqrt()[:,None]*graph*degree.rsqrt()[None,:]
@@ -90,8 +96,14 @@ class JointMultiresolutionResidualTail(nn.Module):
         self.hidden=nn.Sequential(nn.Conv1d(hidden_channels,channels,1),norm(),nn.SiLU())
         self.fast_condition=nn.Sequential(nn.Conv1d(6,channels,5,padding=2),norm(),nn.SiLU())
         self.slow_condition=nn.Sequential(nn.Conv1d(6,channels,5,padding=2),norm(),nn.SiLU())
-        self.fast_fuse=nn.Sequential(nn.Conv1d(2*channels,channels,5,padding=2),norm(),nn.SiLU(),nn.Conv1d(channels,channels,3,padding=2,dilation=2),nn.SiLU())
-        self.slow_fuse=nn.Sequential(nn.Conv1d(2*channels,channels,5,padding=2),norm(),nn.SiLU(),nn.Conv1d(channels,channels,3,padding=4,dilation=4),nn.SiLU())
+        def fusion(dilations):
+            layers=[nn.Conv1d(2*channels,channels,5,padding=2),norm(),nn.SiLU()]
+            for dilation in dilations[:self.fusion_layers-1]:
+                layers.extend([nn.Conv1d(channels,channels,3,padding=dilation,dilation=dilation),nn.SiLU()])
+            return nn.Sequential(*layers)
+        # Depth=2 exactly preserves the historical module keys and operations.
+        self.fast_fuse=fusion((2,4))
+        self.slow_fuse=fusion((4,8))
         # Two physical types are channels of one joint correction, not routes.
         self.local_fast=nn.Conv1d(channels,2,1);self.local_slow=nn.Conv1d(channels,2,1)
         self.system=nn.Sequential(nn.Conv1d(8,channels,5,padding=2),norm(),nn.SiLU(),nn.Conv1d(channels,channels,3,padding=1),nn.SiLU())

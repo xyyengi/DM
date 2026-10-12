@@ -182,6 +182,8 @@ def main():
     p.add_argument("--v2-mixture", default="outputs_shandong/station24/independent_joint_tail_v2_event_balanced_20260910_200653/mixture_body400_tail100_n500")
     p.add_argument("--device", choices=("cpu", "cuda"), required=True)
     p.add_argument("--output", required=True)
+    p.add_argument("--formal-gate", action="store_true",
+                   help="allow launch eligibility only after every CUDA check passes")
     args = p.parse_args()
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=False)
@@ -210,6 +212,9 @@ def main():
         report["config_sha256"] = sha(args.config)
         report["config_used_sha256"] = sha(out / "config_used.yaml")
         wrapper_name = (
+            "run_station24_lightweight_tail_capacity_candidate.sh"
+            if config["model"].get("joint_multiresidual_training_version") == "v2_capacity_search_v1"
+            else
             "run_station24_auxiliary_alpha_stage1a.sh"
             if "auxiliary_strength_alpha" in config["model"]
             else
@@ -296,7 +301,11 @@ def main():
         report["trainable_parameter_names"] = sorted(trainable)
         report["trainable_parameter_count"] = count
         report["frozen_parameter_count"] = frozen_count
-        check("trainable_parameters", count == 20588 and all(n.startswith(PREFIX) for n in trainable), count)
+        expected_tail_count = sum(
+            value.numel() for value in model.denoiser.joint_multiresidual_tail.parameters()
+        )
+        check("trainable_parameters", count == expected_tail_count and all(n.startswith(PREFIX) for n in trainable),
+              {"actual": count, "expected_tail": expected_tail_count})
         check("Raw_eval", all(not m.training for n, m in model.named_modules()
                               if "joint_multiresidual_tail" not in n))
         before_hash = frozen_hash(model)
@@ -454,15 +463,19 @@ def main():
             check("slow_fast_active_and_Haar_complementary", slow.square().sum() > 0 and fast.square().sum() > 0 and overlap < 1e-5,
                   {"slow_rms": float(slow.square().mean().sqrt()), "fast_rms": float(fast.square().mean().sqrt()), "normalized_inner_product": overlap})
         report["preflight_execution"] = "PASS"
-        report["launch_eligible"] = False
-        report["reason"] = "Preflight only; formal training requires separate user confirmation and all target-device gates."
+        report["launch_eligible"] = bool(args.formal_gate and args.device == "cuda")
+        report["reason"] = (
+            "All target-device gates passed for the explicitly requested formal gate."
+            if report["launch_eligible"] else
+            "Preflight only; formal training requires --formal-gate on CUDA and every target-device gate."
+        )
     except Exception as exc:
         report["preflight_execution"] = "FAIL"
         report["error"] = repr(exc)
         raise
     finally:
         (out / "preflight.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-        lines = ["# Lightweight Joint Tail preflight", "", f"Device: {args.device}; formal training: NOT RUN; launch eligible: false", "", "| Check | Status |", "|---|---|"]
+        lines = ["# Lightweight Joint Tail preflight", "", f"Device: {args.device}; formal training: NOT RUN; launch eligible: {str(report['launch_eligible']).lower()}", "", "| Check | Status |", "|---|---|"]
         lines += [f"| {k} | {v['status']} |" for k, v in report["checks"].items()]
         if "daylight_mask" in report:
             daylight = report["daylight_mask"]

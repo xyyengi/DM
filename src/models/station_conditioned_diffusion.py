@@ -1959,7 +1959,9 @@ class StationConditionalResUNet1D(nn.Module):
         self.use_joint_multiresidual_tail = bool(
             config.get("use_joint_multiresidual_tail", False)
         )
-        self.lightweight_v2 = config.get("joint_multiresidual_training_version", "legacy_v1") == "v2_fair_v1"
+        self.lightweight_v2 = config.get("joint_multiresidual_training_version", "legacy_v1") in (
+            "v2_fair_v1", "v2_capacity_search_v1"
+        )
         if self.use_joint_multiresidual_tail and not self.use_body_tail_experts:
             raise ValueError("joint multiresidual tail requires body-tail interface")
         if self.use_jstd_tail and self.use_joint_multiresidual_tail:
@@ -2176,6 +2178,7 @@ class StationConditionalResUNet1D(nn.Module):
                     channels=int(config.get("joint_multiresidual_channels", 24)),
                     groups=groups,
                     haar_levels=int(config.get("joint_multiresidual_haar_levels", 3)),
+                    fusion_layers=int(config.get("joint_multiresidual_fusion_layers", 2)),
                 )
         if self.use_retrieval_mismatch_expert:
             retrieval_channels = int(config.get("retrieval_encoder_channels", 32))
