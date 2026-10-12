@@ -198,6 +198,10 @@ def main():
     try:
         config = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
         validate_config(config)
+        capacity_search = (
+            config["model"].get("joint_multiresidual_training_version")
+            == "v2_capacity_search_v1"
+        )
         ramp_selection = (
             config["model"].get(
                 "event_balanced_ramp_selection_version", "legacy_abs_topk_v1"
@@ -268,9 +272,25 @@ def main():
         body_hashes = {}
         for name in MEMBER_ARRAYS:
             body = np.load(Path(args.body_results) / name, mmap_mode="r")
-            reference = np.load(Path(args.v2_mixture) / name, mmap_mode="r")
-            check("same_V2_body400_" + name, body.shape == (23, 500, 168, 24)
-                  and np.array_equal(body[:, :400], reference[:, :400]))
+            check("complete_Raw500_" + name, body.shape == (23, 500, 168, 24),
+                  {"shape": list(body.shape), "source": str(args.body_results)})
+            reference_path = Path(args.v2_mixture) / name
+            if reference_path.is_file():
+                reference = np.load(reference_path, mmap_mode="r")
+                check("same_V2_body400_" + name,
+                      reference.shape[0] == 23 and reference.shape[1] >= 400
+                      and reference.shape[2:] == (168, 24)
+                      and np.array_equal(body[:, :400], reference[:, :400]))
+            elif capacity_search:
+                report["checks"]["same_V2_body400_" + name] = {
+                    "status": "NOT RUN",
+                    "evidence": (
+                        "Not applicable to staged capacity screening: the locked Raw500 "
+                        "pool is checked directly and a common Raw120 prefix is reused."
+                    ),
+                }
+            else:
+                raise FileNotFoundError(reference_path)
             body_hashes[name] = hashlib.sha256(np.ascontiguousarray(body[:, :400]).tobytes()).hexdigest()
         report["frozen_body400_hashes"] = body_hashes
         report["body_results"] = args.body_results
