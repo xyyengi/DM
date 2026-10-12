@@ -16,7 +16,10 @@ fail(){ c=$?;status failed;echo "STAGE1_FAILED tag=$TAG phase=$PHASE code=$c";ex
 for f in "$CONFIG" "$RAW_CKPT" "$GRAPH" "$RAW500/metrics.json" "$RAW150/metrics.json";do test -f "$f";done
 if pgrep -af 'train_shandong91|generate_shandong91|run_shandong91'|grep -v grep;then echo 'Station-91 task detected; no Station-24 launch';false;fi
 PHASE=cuda_amp_gate;status running
-if [[ ! -f "$OUT/preflight_cuda/preflight.json" ]];then python -m tools.audit_station24_lightweight_joint_tail --config "$CONFIG" --checkpoint "$RAW_CKPT" --secondary-adjacency "$GRAPH" --data-path diffusion_input_station --body-results "$RAW500" --device cuda --formal-gate --output "$OUT/preflight_cuda";fi
+if ! python -c 'import json,sys;assert json.load(open(sys.argv[1]))["launch_eligible"]' "$OUT/preflight_cuda/preflight.json" 2>/dev/null;then
+ if [[ -e "$OUT/preflight_cuda" ]];then mv "$OUT/preflight_cuda" "$OUT/preflight_cuda_failed_$(date +%Y%m%d_%H%M%S)";fi
+ python -m tools.audit_station24_lightweight_joint_tail --config "$CONFIG" --checkpoint "$RAW_CKPT" --secondary-adjacency "$GRAPH" --data-path diffusion_input_station --body-results "$RAW500" --device cuda --formal-gate --output "$OUT/preflight_cuda"
+fi
 python -c 'import json,sys;assert json.load(open(sys.argv[1]))["launch_eligible"]' "$OUT/preflight_cuda/preflight.json"
 PHASE=train_to_1520;status running
 if [[ ! -f "$OUT/train_run.txt" ]];then
