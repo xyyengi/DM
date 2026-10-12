@@ -23,6 +23,9 @@ else
 fi
 printf '%s\n' "$RAW500" > "$ROOT/raw500_path.txt"
 RAW150="$ROOT/raw_prefix_n150_seed424242";if [[ ! -f "$RAW150/metrics.json" ]];then python tools/subset_station24_members.py --source "$RAW500" --output "$RAW150" --members 150 --data-path diffusion_input_station;fi
+if [[ ! -f "$RAW150/tail_expert_route.npy" ]];then
+ python -c 'import numpy as np,sys,pathlib;src=pathlib.Path(sys.argv[1]);out=pathlib.Path(sys.argv[2]);r=np.load(src/"tail_expert_route.npy",mmap_mode="r");s=np.asarray(r[:,:150],dtype=np.uint8);np.save(out/"tail_expert_route.npy",s);np.save(out/"tail_expert_probability.npy",s.mean(1,dtype=np.float64).astype(np.float32));print("RAW150_ROUTE_REPAIRED",s.shape)' "$RAW500" "$RAW150"
+fi
 for tag in c16_d2_h3 c24_d2_h3 c32_d2_h3 c48_d2_h3 c24_d3_h3 c24_d2_h2;do
  CURRENT=$tag;PHASE=candidate;write_status running
  if grep -q '^state=complete$' "$ROOT/$tag/status.env" 2>/dev/null;then echo "REUSED $tag";else bash run_station24_lightweight_tail_capacity_stage1_candidate.sh "$tag" "$ROOT";fi

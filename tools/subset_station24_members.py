@@ -23,6 +23,17 @@ def main():
         if not 1<a.members<=value.shape[1]:raise ValueError('invalid member prefix')
         np.save(out/name,value[:,:a.members])
     for name in STATIC_ARRAYS:np.save(out/name,np.load(src/name,mmap_mode='r'))
+    source_route=src/'tail_expert_route.npy'
+    if source_route.is_file():
+        route=np.load(source_route,mmap_mode='r')
+        if route.shape[0] != np.load(out/'actual_data_normalized.npy',mmap_mode='r').shape[0] or route.shape[1] < a.members:
+            raise ValueError('invalid source tail_expert_route shape')
+        selected=np.asarray(route[:,:a.members],dtype=np.uint8)
+    else:
+        issue_count=np.load(out/'actual_data_normalized.npy',mmap_mode='r').shape[0]
+        selected=np.zeros((issue_count,a.members),dtype=np.uint8)
+    np.save(out/'tail_expert_route.npy',selected)
+    np.save(out/'tail_expert_probability.npy',selected.mean(axis=1,dtype=np.float64).astype(np.float32))
     data=Path(a.data_path);stations=pd.read_csv(data/'station_order.csv').sort_values('channel_index').reset_index(drop=True)
     summary,station,lead=evaluate_station_scenarios(np.load(out/'actual_scenarios_normalized.npy',mmap_mode='r'),
         np.load(out/'actual_scenarios_raw_normalized.npy',mmap_mode='r'),np.load(out/'actual_data_normalized.npy',mmap_mode='r'),
