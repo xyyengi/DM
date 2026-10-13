@@ -1,5 +1,7 @@
 # Station-24 S5-ESPC 零训练实验技术报告
 
+> **封存状态（2026-10-13）：本研究分支已正式收束。Original S5 保留为正式方法；完整 ESPC 作为负结果，event-aware + adaptive length 作为未达到稳定收益的消融。禁止据此继续 S5-V3 或验证集参数搜索。成员级归因与下一步 Lightweight 计划见 `station24_s5_closure_and_lightweight_local_trajectory_plan.md`。**
+
 > 实验范围：24 场站、168 h 风光联合条件扩散；Full Independent Joint Tail V2 + self-localization。  
 > 数据范围：仅 validation；封存 test 未访问。  
 > 训练与生成：均未执行；复用冻结的 Raw 500 与 Full V2 Tail 100 成员。  
