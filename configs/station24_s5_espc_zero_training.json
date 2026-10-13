@@ -1,0 +1,23 @@
+{
+  "experiment": "station24_s5_espc_zero_training_v1",
+  "scope": "validation_only",
+  "body_members": 400,
+  "tail_members": 100,
+  "pairing": "raw_members_401_500_to_full_v2_tail_members_1_100",
+  "generation_seed": 424242,
+  "edge_taper_hours": 3,
+  "adaptive_length_source": "train_continuous_event_duration_q25_q50_q75",
+  "adaptive_lengths_h_observed": [5, 7, 8],
+  "event_structure": {
+    "components": ["sustained_low", "absolute_ramp_1_3_6h", "optional_drop_recovery"],
+    "combine": "maximum",
+    "solar_low_daylight_only": true
+  },
+  "candidate_score": "geometric_mean(within_member_energy_percentile_rank, within_member_structure_percentile_rank)",
+  "boundary_constraint": "localized_1_3_6h_ramp_le_max(train_q99, paired_raw_ramp)",
+  "fallback": "unconstrained_event_aware_adaptive_winner",
+  "pairing_sensitivity_seeds": [1729, 271828, 314159],
+  "training": false,
+  "new_generation": false,
+  "test_access": false
+}
