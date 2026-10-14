@@ -73,6 +73,116 @@ class Station24CRNSamplingTests(unittest.TestCase):
         self.assertFalse(torch.equal(reference, changed_stage))
         self.assertFalse(torch.equal(reference, changed_block))
 
+    def test_keyed_noise_is_invariant_to_runtime_chunk_partition(self):
+        common = dict(
+            base_seed=314159,
+            issue_indices=torch.tensor([2]),
+            stage=217,
+            stations=3,
+            length=8,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        whole = keyed_ancestral_noise(
+            member_block_start=397, members=11, **common
+        )
+        partitioned = torch.cat(
+            [
+                keyed_ancestral_noise(
+                    member_block_start=397, members=2, **common
+                ),
+                keyed_ancestral_noise(
+                    member_block_start=399, members=6, **common
+                ),
+                keyed_ancestral_noise(
+                    member_block_start=405, members=3, **common
+                ),
+            ],
+            dim=0,
+        )
+        self.assertTrue(torch.equal(whole, partitioned))
+
+    def test_keyed_noise_is_invariant_to_issue_batch_partition(self):
+        common = dict(
+            base_seed=271828,
+            member_block_start=400,
+            stage=99,
+            members=4,
+            stations=3,
+            length=8,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        together = keyed_ancestral_noise(
+            issue_indices=torch.tensor([7, 11]), **common
+        ).reshape(2, 4, 3, 8)
+        separate = torch.stack(
+            [
+                keyed_ancestral_noise(
+                    issue_indices=torch.tensor([issue]), **common
+                )
+                for issue in (7, 11)
+            ],
+            dim=0,
+        )
+        self.assertTrue(torch.equal(together, separate))
+
+    def test_explicit_noise_provider_replays_keyed_full_path(self):
+        common = dict(
+            base_seed=161803,
+            issue_indices=self.issue_indices,
+            member_block_start=400,
+            members=5,
+            stations=3,
+            length=8,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        initial = keyed_ancestral_noise(stage=4, **common)
+
+        def provider(step):
+            return keyed_ancestral_noise(stage=step, **common)
+
+        keyed = self.diffusion.sample(
+            self.forecast,
+            self.calendar,
+            self.lead,
+            n_samples=5,
+            ancestral_noise_seed=161803,
+            ancestral_issue_indices=self.issue_indices,
+            ancestral_member_block_start=400,
+        )
+        explicit = self.diffusion.sample(
+            self.forecast,
+            self.calendar,
+            self.lead,
+            n_samples=5,
+            ancestral_initial_noise=initial,
+            ancestral_noise_provider=provider,
+        )
+        self.assertTrue(torch.equal(keyed, explicit))
+
+    def test_old_and_explicit_reverse_step_are_numerically_identical(self):
+        noisy = torch.randn(6, 3, 8)
+        timestep = torch.full((6,), 2, dtype=torch.long)
+        forecast = torch.zeros_like(noisy)
+        calendar = torch.zeros(6, 8, 1)
+        lead = torch.zeros(6, 8, 1)
+        torch.manual_seed(20261014)
+        old = self.diffusion.denoise_step(
+            noisy, timestep, forecast, calendar, lead
+        )
+        torch.manual_seed(20261014)
+        injected = self.diffusion.denoise_step(
+            noisy,
+            timestep,
+            forecast,
+            calendar,
+            lead,
+            ancestral_random_noise=torch.randn_like(noisy),
+        )
+        self.assertTrue(torch.equal(old, injected))
+
     def test_default_sampling_keeps_historical_global_rng_semantics(self):
         torch.manual_seed(1234)
         first = self.diffusion.sample(

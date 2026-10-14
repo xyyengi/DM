@@ -1334,13 +1334,13 @@ def main() -> None:
             ancestral_noise_seed if keyed_ancestral_noise else None
         ),
         "ancestral_noise_scheme": (
-            "splitmix64_keyed_torch_randn_per_issue_member_block_and_reverse_stage_v1"
+            "splitmix64_keyed_torch_randn_per_issue_canonical100_block_and_reverse_stage_v2"
             if keyed_ancestral_noise
             else "historical_global_torch_rng"
         ),
         "ancestral_member_offset": int(args.ancestral_member_offset),
         "ancestral_member_block_size": (
-            member_chunk_size if keyed_ancestral_noise else None
+            100 if keyed_ancestral_noise else None
         ),
         "ancestral_noise_controls_initial_and_all_reverse_steps": bool(
             keyed_ancestral_noise
