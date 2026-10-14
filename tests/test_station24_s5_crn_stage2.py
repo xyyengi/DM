@@ -67,6 +67,21 @@ class Station24S5CRNStage2Tests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_gate(path)
 
+    def test_materializer_propagates_formal_evaluation_metadata(self):
+        source = Path("tools/materialize_station24_s5_crn_single_seed.py").read_text(
+            encoding="utf-8"
+        )
+        for key in (
+            "spatial_mode",
+            "physical_projection",
+            "spatial_mix_levels",
+            "parallel_spatial_fusion_levels",
+            "parallel_spatial_adjacency_mode",
+            "parameter_count",
+            "checkpoint_validation_objective",
+        ):
+            self.assertIn(f'"{key}"', source)
+
 
 if __name__ == "__main__":
     unittest.main()

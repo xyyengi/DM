@@ -40,7 +40,28 @@ for path in "$ROOT/raw_n500/actual_scenarios_normalized.npy" "$ROOT/tail_n100/ac
 
 PHASE=coupling_materialization
 COUPLINGS="$ROOT/couplings"
-if [[ ! -s "$COUPLINGS/coupling_manifest.json" ]]; then
+COUPLINGS_READY=false
+if [[ -s "$COUPLINGS/coupling_manifest.json" ]]; then
+  if "$PY" - "$COUPLINGS" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+required = {
+    "spatial_mode", "physical_projection", "spatial_mix_levels",
+    "parallel_spatial_fusion_levels", "parallel_spatial_adjacency_mode",
+    "parameter_count", "checkpoint_validation_objective",
+}
+for arm in ("full_v2_mixture", "crn_identity", "permutation_1", "permutation_2", "permutation_3"):
+    run = json.loads((root / arm / "metrics.json").read_text(encoding="utf-8"))["run"]
+    missing = sorted(required - set(run))
+    if missing:
+        raise SystemExit(f"{arm} missing evaluation metadata: {missing}")
+print("COUPLING_METADATA_SCHEMA_PASS")
+PY
+  then
+    COUPLINGS_READY=true
+  fi
+fi
+if [[ "$COUPLINGS_READY" != true ]]; then
   [[ ! -e "$COUPLINGS" ]] || mv "$COUPLINGS" "${COUPLINGS}_incomplete_${STAMP}"
   "$PY" -m tools.materialize_station24_s5_crn_single_seed \
     --raw-results "$ROOT/raw_n500" --tail-results "$ROOT/tail_n100" \

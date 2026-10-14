@@ -175,6 +175,16 @@ def main() -> None:
         for name in evaluation_arrays
     }
     common = {
+        **{key: raw_meta[key] for key in (
+            "split", "generation_seed", "physical_projection", "architecture",
+            "spatial_mode", "spatial_mix_levels", "parallel_spatial_fusion_levels",
+            "parallel_spatial_adjacency_mode",
+        ) if key in raw_meta},
+        **{key: tail_meta[key] for key in (
+            "parameter_count", "checkpoint_validation_objective",
+            "checkpoint_validation_mse", "checkpoint_validation_objective_type",
+            "checkpoint_epoch",
+        ) if key in tail_meta},
         "family": "station24_s5_crn_single_seed_v1",
         "split": "val",
         "generation_seed": args.generation_seed,
