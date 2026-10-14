@@ -1,0 +1,26 @@
+experiment:
+  name: station24_s5_crn_single_seed
+  split: val
+  generation_seed: 271828
+  duration_seed: 424242
+  permutation_seeds: [104729, 130363, 155921]
+  body_members: 400
+  background_members: 100
+  tail_members: 100
+  edge_taper_hours: 3
+  energy_score_member_limit: 80
+
+paths:
+  data_path: diffusion_input_station
+  raw_run: outputs_shandong/station24/body_tail_moe_20260824_191036/training/20260824_191044_station24_body_tail_moe_20260824_191036_seed2027
+  tail_run: outputs_shandong/station24/independent_joint_tail_v2_event_balanced_20260910_200653/training/20260910_200730_independent_joint_tail_v2_event_balanced_seed2027_seed2027
+
+runtime:
+  cuda_required: true
+  gate_amp: true
+  formal_generation_amp: false
+  issue_batch_size: 1
+  member_chunk_size: 100
+  checkpoint_state: raw
+  canonical_member_block_size: 100
+

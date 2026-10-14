@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", default=271828, type=int)
     parser.add_argument("--member-offset", default=400, type=int)
     parser.add_argument("--allow-cpu", action="store_true")
+    parser.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run model forward/sampling under CUDA float16 autocast",
+    )
     return parser.parse_args()
 
 
@@ -166,9 +173,15 @@ def actual_model_run(
     issue_index: int,
     seed: int,
     member_offset: int,
+    amp: bool,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     before = state_sha256(model)
-    with torch.inference_mode():
+    autocast = (
+        torch.autocast(device_type="cuda", dtype=torch.float16)
+        if amp
+        else nullcontext()
+    )
+    with torch.inference_mode(), autocast:
         samples = model.generate(
             batch,
             4,
@@ -205,6 +218,8 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda" and not args.allow_cpu:
         raise SystemExit("pass --allow-cpu for the local phase-1 audit")
+    if args.amp and device.type != "cuda":
+        raise SystemExit("--amp requires CUDA; CPU AMP cannot satisfy the server gate")
 
     raw_model, raw_batch, raw_meta = load_model_and_issue(
         args.raw_run, args.data_path, device, args.seed
@@ -226,10 +241,12 @@ def main() -> None:
     add(checks, "formal_ancestral_DDPM_contract", "PASS" if contract == {"raw_steps": 500, "tail_steps": 500, "raw_schedule": "linear", "tail_schedule": "linear"} else "FAIL", contract)
 
     raw_samples, raw_audit = actual_model_run(
-        "Raw", raw_model, raw_batch, issue_index, args.seed, args.member_offset
+        "Raw", raw_model, raw_batch, issue_index, args.seed, args.member_offset,
+        args.amp,
     )
     tail_samples, tail_audit = actual_model_run(
-        "Full Independent Tail V2", tail_model, tail_batch, issue_index, args.seed, args.member_offset
+        "Full Independent Tail V2", tail_model, tail_batch, issue_index, args.seed,
+        args.member_offset, args.amp,
     )
     shape_ok = raw_samples.shape == tail_samples.shape == (1, 4, 24, 168)
     finite_ok = raw_audit["finite"] and tail_audit["finite"]
@@ -260,13 +277,26 @@ def main() -> None:
         if value is not None:
             condition_kwargs[name] = value.repeat_interleave(4, dim=0)
     rng_state = torch.random.get_rng_state()
-    with torch.inference_mode():
+    cuda_rng_state = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
+    autocast = (
+        torch.autocast(device_type="cuda", dtype=torch.float16)
+        if args.amp
+        else nullcontext()
+    )
+    with torch.inference_mode(), autocast:
         old = diffusion.denoise_step(
             noisy, timestep, forecast, calendar, lead, **condition_kwargs
         )
     torch.random.set_rng_state(rng_state)
+    if cuda_rng_state is not None:
+        torch.cuda.set_rng_state(cuda_rng_state, device)
     explicit = torch.randn_like(noisy)
-    with torch.inference_mode():
+    autocast = (
+        torch.autocast(device_type="cuda", dtype=torch.float16)
+        if args.amp
+        else nullcontext()
+    )
+    with torch.inference_mode(), autocast:
         new = diffusion.denoise_step(
             noisy, timestep, forecast, calendar, lead,
             ancestral_random_noise=explicit,
@@ -282,7 +312,12 @@ def main() -> None:
     add(checks, "F_default_interface_historical_path", "PASS", "optional arguments default to None; unit test replays historical global-RNG behavior")
     add(checks, "no_optimizer_or_checkpoint_write", "PASS", "inference_mode only; no optimizer constructed")
     add(checks, "test_split_locked", "PASS", "loader split is hard-coded to val")
-    add(checks, "target_server_CUDA_AMP", "PASS" if device.type == "cuda" else "NOT VERIFIED", str(device))
+    add(
+        checks,
+        "target_server_CUDA_AMP",
+        "PASS" if device.type == "cuda" and args.amp else "NOT VERIFIED",
+        {"device": str(device), "amp": bool(args.amp)},
+    )
 
     failed = [row["check"] for row in checks if row["status"] == "FAIL"]
     report = {
@@ -292,6 +327,8 @@ def main() -> None:
         "training": "NOT RUN",
         "test_split": "NOT ACCESSED",
         "device": str(device),
+        "amp": bool(args.amp),
+        "launch_eligible": bool(device.type == "cuda" and args.amp and not failed),
         "seed": args.seed,
         "issue_index": issue_index,
         "member_ids": list(range(args.member_offset, args.member_offset + 4)),
