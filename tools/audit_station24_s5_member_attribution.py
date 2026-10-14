@@ -27,6 +27,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--localized-event-evaluation", required=True, type=Path)
     parser.add_argument("--event-targets", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--full-label", default="Independent joint tail V2")
+    parser.add_argument("--localized-label", default="V2 self-localized")
     return parser.parse_args()
 
 
@@ -52,8 +54,8 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    full = candidate_rows(args.full_event_evaluation, "Independent joint tail V2")
-    localized = candidate_rows(args.localized_event_evaluation, "V2 self-localized")
+    full = candidate_rows(args.full_event_evaluation, args.full_label)
+    localized = candidate_rows(args.localized_event_evaluation, args.localized_label)
     keys = ["event_id", "issue", "source", "direction", "member"]
     paired = full.merge(localized, on=keys, suffixes=("_full", "_localized"), validate="one_to_one")
     paired = paired[paired.member.ge(400)].copy()

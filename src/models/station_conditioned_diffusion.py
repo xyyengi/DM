@@ -29,6 +29,65 @@ from src.models.station_joint_multiresidual_tail import (
 SPATIAL_MODES = {"none", "fixed_graph", "type_gated_graph"}
 
 
+def _splitmix64(value: int) -> int:
+    """Return a stable 63-bit integer suitable for ``torch.Generator``.
+
+    Python's process-randomized ``hash`` cannot be used for a persisted noise
+    plan.  SplitMix64 gives a small, dependency-free key mixer whose output is
+    identical across Python processes and machines.
+    """
+
+    mask = (1 << 64) - 1
+    value = (int(value) + 0x9E3779B97F4A7C15) & mask
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & mask
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & mask
+    return int((value ^ (value >> 31)) & ((1 << 63) - 1))
+
+
+def keyed_ancestral_noise(
+    *,
+    base_seed: int,
+    issue_indices: torch.Tensor,
+    member_block_start: int,
+    stage: int,
+    members: int,
+    stations: int,
+    length: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Draw one explicit standard-normal DDPM noise block per issue.
+
+    The key is ``(base_seed, issue_index, member_block_start, stage)``.  A
+    formal CRN run fixes the member block size and uses the same keys for Raw
+    and Tail, so the initial noise and every stochastic reverse transition are
+    exactly shared.  This function changes only the coupling: every marginal
+    draw still comes from ``torch.randn`` on the target device.
+    """
+
+    indices = issue_indices.detach().to(device="cpu", dtype=torch.int64).tolist()
+    if len(indices) == 0 or members <= 0 or stations <= 0 or length <= 0:
+        raise ValueError("invalid keyed ancestral noise shape")
+    blocks = []
+    for issue_index in indices:
+        key = int(base_seed) & ((1 << 64) - 1)
+        for component in (int(issue_index), int(member_block_start), int(stage)):
+            key = _splitmix64(key ^ (component & ((1 << 64) - 1)))
+        generator = torch.Generator(device=device)
+        generator.manual_seed(key)
+        blocks.append(
+            torch.randn(
+                (int(members), int(stations), int(length)),
+                generator=generator,
+                device=device,
+                dtype=dtype,
+            )
+        )
+    return torch.stack(blocks, dim=0).reshape(
+        len(indices) * int(members), int(stations), int(length)
+    )
+
+
 def _group_count(channels: int, requested: int) -> int:
     """Choose the largest valid GroupNorm divisor up to ``requested``."""
     for groups in range(min(int(requested), int(channels)), 0, -1):
@@ -3951,6 +4010,7 @@ class StationGaussianDiffusion(nn.Module):
         mismatch_expert_route: torch.Tensor | float | None = None,
         mismatch_time_gate: torch.Tensor | None = None,
         jstd_event_hypothesis: torch.Tensor | None = None,
+        ancestral_random_noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         forecast_guidance_scale = float(forecast_guidance_scale)
         if not 0.0 <= forecast_guidance_scale <= 1.0:
@@ -4002,7 +4062,14 @@ class StationGaussianDiffusion(nn.Module):
         coefficient = (1.0 - alpha) / (1.0 - alpha_hat).sqrt()
         mean = (noisy - coefficient * predicted_noise) / alpha.sqrt()
         variance = self.reverse_variance(timestep).view(-1, 1, 1)
-        random_noise = torch.randn_like(noisy)
+        if ancestral_random_noise is None:
+            random_noise = torch.randn_like(noisy)
+        else:
+            if ancestral_random_noise.shape != noisy.shape:
+                raise ValueError("ancestral random noise shape does not match noisy state")
+            random_noise = ancestral_random_noise.to(
+                device=noisy.device, dtype=noisy.dtype
+            )
         nonzero = (timestep > 0).to(noisy.dtype).view(-1, 1, 1)
         return mean + nonzero * variance.sqrt() * random_noise
 
@@ -4027,9 +4094,22 @@ class StationGaussianDiffusion(nn.Module):
         mismatch_expert_route: torch.Tensor | None = None,
         mismatch_time_gate: torch.Tensor | None = None,
         jstd_event_hypothesis: torch.Tensor | None = None,
+        ancestral_noise_seed: int | None = None,
+        ancestral_issue_indices: torch.Tensor | None = None,
+        ancestral_member_block_start: int = 0,
     ) -> torch.Tensor:
         batch, stations, length = forecast.shape
         n_samples = int(n_samples)
+        keyed_noise = ancestral_noise_seed is not None
+        if keyed_noise:
+            if ancestral_issue_indices is None or ancestral_issue_indices.shape != (batch,):
+                raise ValueError(
+                    "keyed ancestral sampling requires issue indices with shape [B]"
+                )
+            if int(ancestral_member_block_start) < 0:
+                raise ValueError("ancestral member block start must be nonnegative")
+        elif ancestral_issue_indices is not None:
+            raise ValueError("ancestral issue indices require an ancestral noise seed")
         forecast = forecast.repeat_interleave(n_samples, dim=0)
         calendar = calendar.repeat_interleave(n_samples, dim=0)
         lead = lead.repeat_interleave(n_samples, dim=0)
@@ -4110,15 +4190,43 @@ class StationGaussianDiffusion(nn.Module):
                 )
         else:
             prototype = None
-        noisy = torch.randn(
-            batch * n_samples,
-            stations,
-            length,
-            device=forecast.device,
-        )
+        if keyed_noise:
+            noisy = keyed_ancestral_noise(
+                base_seed=int(ancestral_noise_seed),
+                issue_indices=ancestral_issue_indices,
+                member_block_start=int(ancestral_member_block_start),
+                stage=self.num_steps,
+                members=n_samples,
+                stations=stations,
+                length=length,
+                device=forecast.device,
+                dtype=forecast.dtype,
+            )
+        else:
+            noisy = torch.randn(
+                batch * n_samples,
+                stations,
+                length,
+                device=forecast.device,
+            )
         for step in range(self.num_steps - 1, -1, -1):
             timestep = torch.full(
                 (batch * n_samples,), step, device=forecast.device, dtype=torch.long
+            )
+            reverse_noise = (
+                keyed_ancestral_noise(
+                    base_seed=int(ancestral_noise_seed),
+                    issue_indices=ancestral_issue_indices,
+                    member_block_start=int(ancestral_member_block_start),
+                    stage=step,
+                    members=n_samples,
+                    stations=stations,
+                    length=length,
+                    device=forecast.device,
+                    dtype=forecast.dtype,
+                )
+                if keyed_noise
+                else None
             )
             noisy = self.denoise_step(
                 noisy,
@@ -4131,6 +4239,7 @@ class StationGaussianDiffusion(nn.Module):
                 tail_time_mask=time_mask,
                 event_prototype=prototype,
                 mismatch_expert_route=mismatch_route,
+                ancestral_random_noise=reverse_noise,
                 **optional_conditions,
             )
         return noisy.reshape(batch, n_samples, stations, length)
@@ -6251,6 +6360,9 @@ class Station24DiffusionModel(nn.Module):
         forecast_guidance_scale: float = 1.0,
         return_expert_audit: bool = False,
         tail_route_probability_override: float | None = None,
+        ancestral_noise_seed: int | None = None,
+        ancestral_issue_indices: torch.Tensor | None = None,
+        ancestral_member_block_start: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         correction = self.predict_forecast_correction(batch)
         forecast_center, history_fraction = self.predict_forecast_center(batch)
@@ -6481,6 +6593,9 @@ class Station24DiffusionModel(nn.Module):
                 if self.use_jstd_event_hypothesis
                 else None
             ),
+            ancestral_noise_seed=ancestral_noise_seed,
+            ancestral_issue_indices=ancestral_issue_indices,
+            ancestral_member_block_start=ancestral_member_block_start,
         )
         if (
             self.event_prototype_anchor_strength > 0.0

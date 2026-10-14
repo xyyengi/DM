@@ -96,6 +96,30 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ancestral-noise-mode",
+        choices=["default", "keyed_full_path"],
+        default="default",
+        help=(
+            "Keep historical global-RNG sampling or use an explicit keyed noise "
+            "block for the initial state and every ancestral reverse step"
+        ),
+    )
+    parser.add_argument(
+        "--ancestral-noise-seed",
+        type=int,
+        default=None,
+        help="Base seed for keyed_full_path; defaults to --seed",
+    )
+    parser.add_argument(
+        "--ancestral-member-offset",
+        type=int,
+        default=0,
+        help=(
+            "Global member-block offset used in keyed noise identities. The CRN "
+            "Tail100 run uses 400 to match Raw members 401-500."
+        ),
+    )
+    parser.add_argument(
         "--allow-oracle-event-hypothesis",
         action="store_true",
         help=(
@@ -313,6 +337,17 @@ def main() -> None:
     )
     if n_samples <= 0 or issue_batch_size <= 0 or member_chunk_size <= 0:
         raise ValueError("n_samples, issue_batch_size, and member_chunk_size must be positive")
+    keyed_ancestral_noise = args.ancestral_noise_mode == "keyed_full_path"
+    ancestral_noise_seed = int(
+        seed if args.ancestral_noise_seed is None else args.ancestral_noise_seed
+    )
+    if int(args.ancestral_member_offset) < 0:
+        raise ValueError("ancestral-member-offset must be nonnegative")
+    if keyed_ancestral_noise and auto_tune_member_chunk:
+        raise ValueError(
+            "keyed_full_path requires a fixed member chunk; pass "
+            "--no-auto-tune-member-chunk"
+        )
     forecast_guidance_scale = float(args.forecast_guidance_scale)
     if not 0.0 <= forecast_guidance_scale <= 1.0:
         raise ValueError("forecast-guidance-scale must be in [0,1]")
@@ -583,6 +618,7 @@ def main() -> None:
         issue_event_memory_probability = None
         issue_jstd_segment_count_probability = None
         remaining = n_samples
+        generated_member_count = 0
         while remaining > 0:
             current = min(member_chunk_size, remaining)
             with torch.inference_mode():
@@ -592,6 +628,17 @@ def main() -> None:
                         forecast_guidance_scale=forecast_guidance_scale,
                         return_expert_audit=model.use_body_tail_experts,
                         tail_route_probability_override=tail_route_probability,
+                        ancestral_noise_seed=(
+                            ancestral_noise_seed if keyed_ancestral_noise else None
+                        ),
+                        ancestral_issue_indices=(
+                            raw_batch["sample_index"].to(device)
+                            if keyed_ancestral_noise
+                            else None
+                        ),
+                        ancestral_member_block_start=(
+                            int(args.ancestral_member_offset) + generated_member_count
+                        ),
                     )
                 if model.use_body_tail_experts:
                     samples, expert_audit = generated
@@ -647,6 +694,7 @@ def main() -> None:
                 else:
                     chunks.append(generated.cpu())
             remaining -= current
+            generated_member_count += current
         stochastic_standardized = torch.cat(chunks, dim=1).numpy()  # [B,K,S,T]
         scale_tensor = raw_batch["residual_scale"].numpy()  # [B,S,T]
         stochastic_residual = (
@@ -1281,6 +1329,22 @@ def main() -> None:
         "split": args.split,
         "n_samples": n_samples,
         "generation_seed": seed,
+        "ancestral_noise_mode": args.ancestral_noise_mode,
+        "ancestral_noise_seed": (
+            ancestral_noise_seed if keyed_ancestral_noise else None
+        ),
+        "ancestral_noise_scheme": (
+            "splitmix64_keyed_torch_randn_per_issue_member_block_and_reverse_stage_v1"
+            if keyed_ancestral_noise
+            else "historical_global_torch_rng"
+        ),
+        "ancestral_member_offset": int(args.ancestral_member_offset),
+        "ancestral_member_block_size": (
+            member_chunk_size if keyed_ancestral_noise else None
+        ),
+        "ancestral_noise_controls_initial_and_all_reverse_steps": bool(
+            keyed_ancestral_noise
+        ),
         "evaluation_member_count": n_samples,
         "energy_score_member_count": int(
             metrics["joint"]["energy_score_member_count"]
