@@ -4,9 +4,11 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import yaml
 
 from tools.materialize_station24_s5_crn_single_seed import build_pairings
+from tools.summarize_station24_s5_crn_single_seed import pair_delta_row
 from tools.validate_station24_s5_crn_stage2 import validate, validate_gate
 
 
@@ -81,6 +83,26 @@ class Station24S5CRNStage2Tests(unittest.TestCase):
             "checkpoint_validation_objective",
         ):
             self.assertIn(f'"{key}"', source)
+
+    def test_pair_delta_summary_accepts_numpy_arrays(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "raw_n500").mkdir()
+            (root / "tail_n100").mkdir()
+            (root / "couplings" / "crn_identity").mkdir(parents=True)
+            raw = np.zeros((1, 500, 3, 2), dtype=np.float32)
+            tail = np.ones((1, 100, 3, 2), dtype=np.float32)
+            np.save(root / "raw_n500" / "actual_scenarios_normalized.npy", raw)
+            np.save(root / "tail_n100" / "actual_scenarios_normalized.npy", tail)
+            np.save(
+                root / "couplings" / "crn_identity" / "paired_raw_background_index.npy",
+                np.arange(400, 500, dtype=np.int64)[None],
+            )
+            stations = pd.DataFrame(
+                {"data_type": ["wind", "solar"], "capacity_mw": [2.0, 1.0]}
+            )
+            row = pair_delta_row("crn_identity", root, stations)
+            self.assertAlmostEqual(row["delta_rms_all"], 1.0)
 
 
 if __name__ == "__main__":

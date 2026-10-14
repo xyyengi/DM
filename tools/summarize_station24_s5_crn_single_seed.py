@@ -74,7 +74,7 @@ def pair_delta_row(name: str, root: Path, stations: pd.DataFrame) -> dict:
     return {
         "arm": name,
         "delta_variance_all": float(np.var(delta)),
-        "delta_rms_all": float(np.sqrt(np.mean(delta.square()))),
+        "delta_rms_all": float(np.sqrt(np.mean(np.square(delta)))),
         "joint_capacity_energy_mean": float(np.mean(np.abs(wind) + np.abs(solar))),
         "joint_capacity_energy_q95": float(np.quantile(np.abs(wind) + np.abs(solar), 0.95)),
     }
