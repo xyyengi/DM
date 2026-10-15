@@ -29,10 +29,21 @@ git diff --cached --quiet
 
 PHASE=cuda_amp_preflight
 write_status running
+if [[ -e "$ROOT/preflight_cuda" ]]; then
+  if python -c 'import json,sys; p=sys.argv[1]; r=json.load(open(p)); bad={k:v for k,v in r["checks"].items() if v["status"]!="PASS"}; assert not bad,bad' "$ROOT/preflight_cuda/preflight.json" 2>/dev/null; then
+    echo "CUDA_AMP_PREFLIGHT_REUSED output=$ROOT/preflight_cuda"
+  else
+    SAVED="$ROOT/preflight_cuda_incomplete_$(date +%Y%m%d_%H%M%S)"
+    mv "$ROOT/preflight_cuda" "$SAVED"
+    echo "INCOMPLETE_PREFLIGHT_PRESERVED saved=$SAVED"
+  fi
+fi
+if [[ ! -f "$ROOT/preflight_cuda/preflight.json" ]]; then
 python -m tools.audit_station24_lightweight_joint_tail --config "$CONFIG" --checkpoint "$RAW_CHECKPOINT" \
   --secondary-adjacency "$SECONDARY_GRAPH" --data-path diffusion_input_station --device cuda \
   --skip-historical-member-reference --wrapper run_station24_patent_unified_formal.sh \
   --output "$ROOT/preflight_cuda"
+fi
 python -c 'import json,sys; r=json.load(open(sys.argv[1])); bad={k:v for k,v in r["checks"].items() if v["status"]!="PASS"}; assert not bad,bad' "$ROOT/preflight_cuda/preflight.json"
 
 PHASE=training
