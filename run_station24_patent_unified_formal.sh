@@ -30,7 +30,9 @@ git diff --cached --quiet
 PHASE=cuda_amp_preflight
 write_status running
 python -m tools.audit_station24_lightweight_joint_tail --config "$CONFIG" --checkpoint "$RAW_CHECKPOINT" \
-  --secondary-adjacency "$SECONDARY_GRAPH" --data-path diffusion_input_station --device cuda --output "$ROOT/preflight_cuda"
+  --secondary-adjacency "$SECONDARY_GRAPH" --data-path diffusion_input_station --device cuda \
+  --skip-historical-member-reference --wrapper run_station24_patent_unified_formal.sh \
+  --output "$ROOT/preflight_cuda"
 python -c 'import json,sys; r=json.load(open(sys.argv[1])); bad={k:v for k,v in r["checks"].items() if v["status"]!="PASS"}; assert not bad,bad' "$ROOT/preflight_cuda/preflight.json"
 
 PHASE=training

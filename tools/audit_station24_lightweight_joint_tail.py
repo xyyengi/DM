@@ -180,6 +180,16 @@ def main():
     p.add_argument("--data-path", default="diffusion_input_station")
     p.add_argument("--body-results", default="outputs_shandong/station24/body_tail_moe_raw_inference_20260824_224151/validation_results/geo_history_actual_body_tail_moe_raw_val_n500_seed424242")
     p.add_argument("--v2-mixture", default="outputs_shandong/station24/independent_joint_tail_v2_event_balanced_20260910_200653/mixture_body400_tail100_n500")
+    p.add_argument(
+        "--skip-historical-member-reference",
+        action="store_true",
+        help=(
+            "Skip the legacy assertion that Raw members 1-400 match a deleted "
+            "Full-V2 archive. This does not skip model, gradient, freeze, AMP, "
+            "or generation-path checks."
+        ),
+    )
+    p.add_argument("--wrapper", default=None)
     p.add_argument("--device", choices=("cpu", "cuda"), required=True)
     p.add_argument("--output", required=True)
     args = p.parse_args()
@@ -209,7 +219,7 @@ def main():
         (out / "config_used.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
         report["config_sha256"] = sha(args.config)
         report["config_used_sha256"] = sha(out / "config_used.yaml")
-        wrapper_name = (
+        wrapper_name = args.wrapper or (
             "run_station24_auxiliary_alpha_stage1a.sh"
             if "auxiliary_strength_alpha" in config["model"]
             else
@@ -259,16 +269,25 @@ def main():
         source = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         report["checkpoint_sha256"] = sha(args.checkpoint)
         report["secondary_graph_sha256"] = sha(args.secondary_adjacency)
-        from tools.merge_station24_independent_tail_members import MEMBER_ARRAYS
-        body_hashes = {}
-        for name in MEMBER_ARRAYS:
-            body = np.load(Path(args.body_results) / name, mmap_mode="r")
-            reference = np.load(Path(args.v2_mixture) / name, mmap_mode="r")
-            check("same_V2_body400_" + name, body.shape == (23, 500, 168, 24)
-                  and np.array_equal(body[:, :400], reference[:, :400]))
-            body_hashes[name] = hashlib.sha256(np.ascontiguousarray(body[:, :400]).tobytes()).hexdigest()
-        report["frozen_body400_hashes"] = body_hashes
-        report["body_results"] = args.body_results
+        if args.skip_historical_member_reference:
+            check(
+                "historical_member_reference_not_required",
+                True,
+                "This pipeline regenerates Raw500 and Tail100 from the same "
+                "frozen checkpoint; deleted Full-V2 member arrays are not an input.",
+            )
+            report["historical_member_reference"] = "NOT USED"
+        else:
+            from tools.merge_station24_independent_tail_members import MEMBER_ARRAYS
+            body_hashes = {}
+            for name in MEMBER_ARRAYS:
+                body = np.load(Path(args.body_results) / name, mmap_mode="r")
+                reference = np.load(Path(args.v2_mixture) / name, mmap_mode="r")
+                check("same_V2_body400_" + name, body.shape == (23, 500, 168, 24)
+                      and np.array_equal(body[:, :400], reference[:, :400]))
+                body_hashes[name] = hashlib.sha256(np.ascontiguousarray(body[:, :400]).tobytes()).hexdigest()
+            report["frozen_body400_hashes"] = body_hashes
+            report["body_results"] = args.body_results
 
         def construct(c):
             return Station24DiffusionModel(c, static["station_features"], static["station_adjacency"],
