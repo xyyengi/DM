@@ -68,7 +68,10 @@ merge_once 400 100 "$MIX20" patent_unified_raw400_tail100
 merge_once 450 50 "$MIX10" patent_unified_raw450_tail50
 
 evaluate_one() {
-  local candidate=$1 tag=$2 label=$3 post="$ROOT/evaluation_${tag}"
+  local candidate=$1
+  local tag=$2
+  local label=$3
+  local post="$ROOT/evaluation_${tag}"
   mkdir -p "$post"
   if [[ ! -f "$post/continuous_event_evaluation/report.md" ]]; then
     [[ ! -e "$post/continuous_event_evaluation" ]] || mv "$post/continuous_event_evaluation" "$post/events_incomplete_${JOB}"
